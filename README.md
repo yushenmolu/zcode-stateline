@@ -117,7 +117,7 @@
 ```
 
 - **数据库只读**：所有 SQL 经 `sqlite3.connect("file:...?mode=ro")` + `PRAGMA query_only=ON`，绝不写 ZCode 数据库。
-- **统计口径**：请求数对全部行计数；token/耗时聚合仅 `status='completed'` 行；缓存命中率 = `cache_read / (input + cache_read)`（输入侧口径）；行级排除子代理调用。
+- **统计口径**：请求数对全部行计数；token/耗时聚合仅 `status='completed'` 行；缓存命中率 = `cache_read / input`（db 的 input 已含 cache_read 部分）；行级排除子代理调用。
 - **幂等记录**：每会话独立时间戳游标（`state.json`），只聚合上次记录之后的调用，重复触发不产生重复行。
 - **当前会话判定**（fail-closed，绝不猜）：`current-session.json` 新鲜标记（30 秒内）→ 数据库 60 秒内活跃主会话 → jsonl 最新主会话（带「最近会话累计」标注）；子代理会话每步排除。
 

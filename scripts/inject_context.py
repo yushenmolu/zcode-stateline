@@ -280,7 +280,7 @@ def aggregate_session(rows, session_id):
 
 def _line_from_agg(agg, tag=None):
     """由聚合 dict 构建统计行文本。tag 非空时追加标注（如"（最近会话累计）"）。"""
-    denom = agg["inputTokens"] + agg["cacheReadTokens"]
+    denom = agg["inputTokens"]
     hit_rate = (agg["cacheReadTokens"] / denom if denom > 0 else 0.0) * 100.0
     line = (
         u"\u23f1%.1fs \u00b7 in %s \u00b7 out %s \u00b7 cache hit %.1f%%"
@@ -297,7 +297,7 @@ def _line_from_agg(agg, tag=None):
 def _jsonl_line(agg, last):
     """由 jsonl 聚合 dict + 最近一条记录构建统计行文本
     （avgDurationMs/avgTtftMs 取最近一条记录的值）。"""
-    denom = agg["inputTokens"] + agg["cacheReadTokens"]
+    denom = agg["inputTokens"]
     hit_rate = (agg["cacheReadTokens"] / denom if denom > 0 else 0.0) * 100.0
     return (
         u"\u23f1%.1fs \u00b7 in %s \u00b7 out %s \u00b7 cache hit %.1f%%"

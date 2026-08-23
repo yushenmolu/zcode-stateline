@@ -8,7 +8,7 @@ verify_against_sqlite.py — 对拍验证 db_stats.py 的聚合口径。
   - 逐字段与 db_stats.query_* 的输出对比；
   - 依赖相同的业务口径（completed 行聚 token/耗时，全部行计状态数；
     行级排除 query_source='subagent'；avg_duration 分母 = completed 行数；
-    cache_hit_rate = cache_read/(input+cache_read)）。
+    cache_hit_rate = cache_read/input，input 已含 cache_read 部分）。
 
 用法：
   python verify_against_sqlite.py --session-id <S> [--since <ms>] [--db <path>]
@@ -74,7 +74,7 @@ def ground_truth(db_path, session_id=None, since_ts=None):
         conn.close()
     (total, err, canc, run, done_cnt, tool, inp, outp, reas, cc, cr, dur,
      ttft) = row
-    denom = (inp or 0) + (cr or 0)
+    denom = (inp or 0)
     hit = round((cr or 0) / denom, 4) if denom > 0 else 0.0
     return {
         "model_request_count": int(total),

@@ -11,8 +11,8 @@ db_stats.py — 只读查询 ZCode 的 db.sqlite，输出 token / 缓存 / 速�
   - input/output/reasoning/cache_creation/cache_read/duration 等聚合只对
     status='completed' 的行统计；
   - 行级一律排除子代理调用：COALESCE(query_source,'') <> 'subagent'；
-  - cache_hit_rate = cache_read_input_tokens / (input_tokens + cache_read_input_tokens)，
-    仅看输入侧，排除 cache_creation；
+  - cache_hit_rate = cache_read_input_tokens / input_tokens
+    （db 的 input_tokens 已含 cache_read 部分），仅看输入侧，排除 cache_creation；
   - avg_ttft_ms = AVG(time_to_first_token_ms) over completed rows；
   - avg_duration_ms = SUM(duration_ms over completed) / completed 行数
     （分子分母同口径，不用全状态行数当分母）；
@@ -86,7 +86,7 @@ def _aggregate(db_path, session_id=None, since_ts=None, strict=False):
         done_cnt, tool_calls, inp, outp, reas, cache_cre, cache_rd, dur, ttft = conn.execute(q2, args_done).fetchone()
     finally:
         conn.close()
-    denom = inp + cache_rd
+    denom = inp
     hit = round(cache_rd / denom, 4) if denom > 0 else 0.0
     return {
         "model_request_count": int(total),
@@ -167,7 +167,7 @@ def query_model_stats(db_path, since_ts=None):
     out = []
     for r in rows:
         inp, outp, cache_rd, cache_cre = r[3], r[4], r[5], r[6]
-        denom = (inp or 0) + (cache_rd or 0)
+        denom = (inp or 0)
         hit = round((cache_rd or 0) / denom, 4) if denom > 0 else 0.0
         out.append({
             "provider_id": r[0],

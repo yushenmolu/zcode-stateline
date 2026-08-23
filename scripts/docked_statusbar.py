@@ -455,8 +455,8 @@ def format_tokens(n):
 
 
 def _hit_rate(stats):
-    """缓存命中率 = cacheRead / (input + cacheRead)（输入侧口径，与 inject 一致）。"""
-    denom = stats.get("inputTokens", 0) + stats.get("cacheReadTokens", 0)
+    """缓存命中率 = cacheRead / input（db 的 input_tokens 已含 cacheRead 部分）。"""
+    denom = stats.get("inputTokens", 0)
     return (stats.get("cacheReadTokens", 0) / denom if denom > 0 else 0.0) * 100.0
 
 
@@ -941,7 +941,7 @@ def stats_to_text(stats, cfg):
 TIP_DUR = u"\u5e73\u5747\u8017\u65f6\uff1a\u5f53\u524d\u5bf9\u8bdd\u5e73\u5747\u6bcf\u6b21\u6a21\u578b\u8c03\u7528\u7684\u65f6\u957f\uff08\u4e0d\u542b\u5b50\u4ee3\u7406\uff09"
 TIP_IN = u"in\uff1a\u8f93\u5165 token \u7d2f\u8ba1\uff08\u542b\u7f13\u5b58\u8bfb\u53d6\u90e8\u5206\uff09"
 TIP_OUT = u"out\uff1a\u8f93\u51fa token \u7d2f\u8ba1"
-TIP_HIT = u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = \u7f13\u5b58\u8bfb\u53d6 \u00f7 \uff08\u8f93\u5165 + \u7f13\u5b58\u8bfb\u53d6\uff09\uff1b\u6570\u503c\u8d8a\u9ad8\u8d8a\u7701\u94b1"
+TIP_HIT = u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = \u7f13\u5b58\u8bfb\u53d6 \u00f7 \u8f93\u5165\u603b\u91cf\uff08\u8f93\u5165\u5df2\u542b\u7f13\u5b58\u8bfb\u53d6\u90e8\u5206\uff09\uff0c\u8d8a\u9ad8\u8d8a\u7701\u94b1"
 TIP_CRD = u"cache read\uff1a\u7f13\u5b58\u8bfb\u53d6 token \u7d2f\u8ba1\uff08\u547d\u4e2d\u90e8\u5206\uff09"
 TIP_RSN = u"reasoning\uff1a\u601d\u8003\uff08reasoning\uff09token \u7d2f\u8ba1"
 
