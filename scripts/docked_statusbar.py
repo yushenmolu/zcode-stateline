@@ -65,16 +65,26 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
       同一 Canvas 上，按 tag 分组绑定事件。
   - 显示项可配置：data_dir/statusbar-config.json（缺省自动生成默认配置）。
     show_model / show_session / show_avg_duration / show_input / show_output /
-    show_cache_read / show_cache_hit / show_reasoning 决定第一/二行拼哪些项；
-    右键菜单「显示项」子菜单可直接勾选切换（切换即重画并原子写回配置，
-    无需手改 JSON）；手改文件也会在下一拍热加载生效。
+    show_cache_read / show_cache_hit / show_speed / show_reasoning 决定第一/
+    二行拼哪些项；右键菜单「显示项」子菜单可直接勾选切换（切换即重画并
+    原子写回配置，无需手改 JSON）；手改文件也会在下一拍热加载生效。
     refresh_ms 覆盖 --interval-ms 默认（数据刷新间隔，默认 1000ms）。
     坏 JSON / 缺字段一律回退默认值并写一条日志到 docked-statusbar-err.log。
     --config <path> 覆盖配置文件路径。
+  - 速度块（⚡ tok/s，橙黄 #e8b33f，cache read 之后）：最近一次 completed
+    请求的 output_tokens/(duration_ms/1000)；tooltip 顺带会话平均 =
+    SUM(output)/SUM(duration)。仅 db 行级可算（jsonl 无单次耗时），无数据
+    不画。--once 额外输出 speedTokPerSec / speedAvgTokPerSec（可 null）。
+  - 靠边收起（collapsed）：双击状态条任意区域 / 右键「收起到边缘」-> 收成
+    ~72x18 底部小把手（◐ 缓存命中率绿字，贴屏幕底缘、ZCode 底部中心 x
+    附近）；把手悬停 ~0.5s（Move 刷新计时）或单击 -> 展开回完整状态条
+    （重新贴边）。collapsed 字段持久化（save_config_keys 原子写），重启
+    恢复原状态；收起态显隐同样只随 ZCode 前台，把手可拖动且钳制工作区。
   - 防多开：数据目录 statusbar.pid 记录本进程 pid；已有存活实例直接退出；
     退出时若 pid 仍是自己的则删除。
   - CLI：--once 读一次打印统计 JSON 后退出（不建窗口、不进 GUI）。
-    输出结构：{ok, line, source, sessionId, model, sessionLabel, line1}；
+    输出结构：{ok, line, source, sessionId, model, sessionLabel, line1,
+    speedTokPerSec, speedAvgTokPerSec}；
     line 按 show_* 配置裁剪（与状态条第二行实际渲染一致）。
 
 调用：
@@ -131,6 +141,7 @@ FG_DIM = "#9aa1aa"      # 次要文字 / 标签（~5.8:1，过 AA）
 ACCENT_BLUE = "#4f9cf7" # 强调色（模型名 / 第一行小圆点）
 ACCENT_GREEN = "#3fb68b"# 命中率 / 省钱（绿）
 ACCENT_PURPLE = "#b08cf7"  # reasoning 标识紫
+ACCENT_ORANGE = "#e8b33f"  # 速度 tok/s 标识橙黄
 SEP_COLOR = "#3a4048"   # 分隔线 / `·` 灰
 EDGE_LINE = "#2a2f38"   # 顶部 1px 分隔线（提质感）
 CLOSE_HOVER_BG = "#e5534b"  # close 悬停红
@@ -167,6 +178,14 @@ ICON_OUT = u"\u25c2"     # ◂ out
 ICON_HIT = u"\u25d0"     # ◐ 缓存命中
 ICON_CRD = u"\u21bb"     # ↻ cache read
 ICON_RSN = u"\u2726"     # ✦ reasoning
+ICON_SPD = u"\u26a1"     # ⚡ 速度 tok/s
+
+# ---- 靠边收起（collapsed 把手）----
+HANDLE_H = 18            # 收起把手高度（小条 ~72x18）
+HANDLE_HOVER_MS = 500    # 把手悬停多久自动展开（毫秒）
+HANDLE_TIP = (u"\u5df2\u6536\u8d77\u2014\u2014"
+              u"\u60ac\u505c\u6216\u5355\u51fb\u5c55\u5f00\u5b8c\u6574\u7edf\u8ba1")
+              # 已收起——悬停或单击展开完整统计
 
 # 默认显示项配置（写 statusbar-config.json 用）
 DEFAULT_CONFIG = {
@@ -177,7 +196,9 @@ DEFAULT_CONFIG = {
     "show_output": True,
     "show_cache_read": True,
     "show_cache_hit": True,
+    "show_speed": True,
     "show_reasoning": False,
+    "collapsed": False,
     "refresh_ms": 1000,
     "theme": "dark",
 }
@@ -251,7 +272,8 @@ def load_config(config_path):
 def _apply_raw_config(cfg, raw):
     """把已解析的 raw dict 按 schema 原地合并进 cfg（load_config 与热加载共用）。"""
     for key in ("show_model", "show_session", "show_avg_duration", "show_input",
-                "show_output", "show_cache_read", "show_cache_hit", "show_reasoning"):
+                "show_output", "show_cache_read", "show_cache_hit", "show_speed",
+                "show_reasoning", "collapsed"):
         if key in raw:
             v = raw[key]
             if isinstance(v, bool):
@@ -307,14 +329,15 @@ SHOW_MENU_ITEMS = (
     (u"\u8f93\u51fa", "show_output"),              # 输出
     (u"\u7f13\u5b58\u547d\u4e2d", "show_cache_hit"),   # 缓存命中
     (u"\u7f13\u5b58\u8bfb\u53d6", "show_cache_read"),  # 缓存读取
+    (u"\u901f\u5ea6 tok/s", "show_speed"),         # 速度 tok/s
     (u"\u63a8\u7406", "show_reasoning"),           # 推理
 )
 
 
-def save_config_show_keys(config_path, cfg, data_dir):
-    """把 cfg 中 8 个 show_* 开关原子写回 statusbar-config.json（右键菜单用）。
+def save_config_keys(config_path, cfg, data_dir, keys):
+    """把 cfg 中指定 keys 原子写回 statusbar-config.json（右键菜单 / 收起展开用）。
 
-    - 文件里其它字段（含未知键、refresh_ms、theme）原样保留；
+    - 文件里其它字段（含未知键、refresh_ms、theme、collapsed）原样保留；
     - 原子写：先写 .tmp 再 os.replace；
     - 任何失败只记 err 日志、返回 False，绝不抛出（菜单点击不能崩小条）。
     """
@@ -328,7 +351,7 @@ def save_config_show_keys(config_path, cfg, data_dir):
                     raw = obj
             except Exception:
                 raw = {}
-        for _label, key in SHOW_MENU_ITEMS:
+        for key in keys:
             raw[key] = bool(cfg.get(key))
         os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
         tmp = config_path + ".tmp"
@@ -342,6 +365,12 @@ def save_config_show_keys(config_path, cfg, data_dir):
         except Exception:
             pass
         return False
+
+
+def save_config_show_keys(config_path, cfg, data_dir):
+    """兼容包装：写回全部显示项开关（show_*）。"""
+    return save_config_keys(config_path, cfg, data_dir,
+                            [k for _label, k in SHOW_MENU_ITEMS])
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +732,51 @@ def db_aggregate_session(db_path, session_id):
             pass
 
 
+def db_session_speed(db_path, session_id):
+    """当前会话的输出速度（tok/s，只读 db；jsonl 无行级数据故仅此一路）。
+
+    - recent = 最近一条 completed 非 subagent 行的 output_tokens/(duration_ms/1000)
+      （ORDER BY started_at DESC LIMIT 1；该行 duration_ms 为 NULL/0 时无速度）；
+    - avg = SUM(output_tokens)/SUM(duration_ms)*1000（会话平均，completed 行）。
+    返回 (recent, avg)，各自可为 None（无 db / 无会话 / 无有效数据）。
+    """
+    if not session_id or _is_subagent_sid(session_id):
+        return None, None
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None, None
+    try:
+        recent = None
+        row = conn.execute(
+            "SELECT output_tokens, duration_ms FROM model_usage "
+            "WHERE session_id = ? AND status='completed' "
+            "AND COALESCE(query_source,'') <> 'subagent' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is not None and row[0] and row[1]:
+            dur = _num(row[1])
+            if dur > 0:
+                recent = row[0] / (dur / 1000.0)
+        avg = None
+        row2 = conn.execute(
+            "SELECT COALESCE(SUM(output_tokens),0), COALESCE(SUM(duration_ms),0) "
+            "FROM model_usage WHERE session_id = ? AND status='completed' "
+            "AND COALESCE(query_source,'') <> 'subagent'",
+            (session_id,),
+        ).fetchone()
+        if row2 is not None and row2[0] and row2[1]:
+            avg = row2[0] / row2[1] * 1000.0
+        return recent, avg
+    except Exception:
+        return None, None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def build_stats_line(rows, db_path=None, session_id=None):
     """
     聚合统计。**数据源优先级改为 db 优先**：db 行级聚合（模型调用完成即
@@ -806,6 +880,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None):
         "line1": None,
         "line2": None,
         "stats": None,
+        "speed_recent": None,
+        "speed_avg": None,
         "recent_note": False,
         "error": None,
     }
@@ -851,6 +927,14 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None):
         info["text"] = text
         info["line2"] = text
         info["stats"] = stats
+        # 速度（tok/s）：db 行级（jsonl 无单次 duration，速度仅 db 有数据）；
+        # 附到 stats dict 供指标块渲染，同时平铺到 info 顶层供 --once 输出。
+        spd_recent, spd_avg = db_session_speed(db_path, sid)
+        info["speed_recent"] = spd_recent
+        info["speed_avg"] = spd_avg
+        if stats is not None:
+            stats["speedTokPerSec"] = spd_recent
+            stats["speedAvgTokPerSec"] = spd_avg
         if used_sid is not None:
             info["session_id"] = used_sid
     except Exception as e:
@@ -951,6 +1035,9 @@ TIP_OUT = u"out\uff1a\u8f93\u51fa token \u7d2f\u8ba1"
 TIP_HIT = u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = \u7f13\u5b58\u8bfb\u53d6 \u00f7 \u8f93\u5165\u603b\u91cf\uff08\u8f93\u5165\u5df2\u542b\u7f13\u5b58\u8bfb\u53d6\u90e8\u5206\uff09\uff0c\u8d8a\u9ad8\u8d8a\u7701\u94b1"
 TIP_CRD = u"cache read\uff1a\u7f13\u5b58\u8bfb\u53d6 token \u7d2f\u8ba1\uff08\u547d\u4e2d\u90e8\u5206\uff09"
 TIP_RSN = u"reasoning\uff1a\u601d\u8003\uff08reasoning\uff09token \u7d2f\u8ba1"
+TIP_SPD = (u"\u901f\u5ea6\uff1a\u6700\u8fd1\u4e00\u6b21\u8bf7\u6c42\u7684\u8f93\u51fa\u901f\u5ea6"
+           u" = \u8f93\u51fa token \u00f7 \u8be5\u6b21\u8017\u65f6")
+           # 速度：最近一次请求的输出速度 = 输出 token ÷ 该次耗时
 
 
 def build_metric_blocks(stats, cfg):
@@ -999,6 +1086,20 @@ def build_metric_blocks(stats, cfg):
             "label": "cache read",
             "value": format_tokens(stats.get("cacheReadTokens", 0)),
             "value_color": FG, "tip": TIP_CRD, "progress": None,
+        })
+    spd = stats.get("speedTokPerSec")
+    if cfg.get("show_speed", True) and spd is not None:
+        # 速度块：⚡ 32.4 tok/s（标识/数值橙黄；无 db 行级数据时不画、不留空位）。
+        # tooltip 顺带展示会话平均（有数据时）。
+        tip_spd = TIP_SPD
+        spd_avg = stats.get("speedAvgTokPerSec")
+        if spd_avg is not None:
+            tip_spd = tip_spd + u"\uff1b\u4f1a\u8bdd\u5e73\u5747\uff1a%.1f tok/s" % spd_avg
+        blocks.append({
+            "kind": "speed", "icon": ICON_SPD, "icon_color": ACCENT_ORANGE,
+            "label": "",
+            "value": u"%.1f tok/s" % spd,
+            "value_color": ACCENT_ORANGE, "tip": tip_spd, "progress": None,
         })
     if cfg.get("show_reasoning", False) and stats.get("reasoningTokens", 0):
         blocks.append({
@@ -1134,6 +1235,28 @@ def clamp_to_work_area(xy, bar_w, bar_h, zrect, margin=MARGIN):
             wl, wt, wr, wb = wa
             x = min(max(x, wl + margin), max(wl, wr - bar_w - margin))
             y = min(max(y, wt + margin), max(wt, wb - bar_h - margin))
+    return x, y
+
+
+def collapsed_dock_xy(zrect, handle_w, handle_h=HANDLE_H, margin=MARGIN):
+    """
+    收起把手的停靠位（纯计算，可独立单测）：贴所在显示器**屏幕底部边缘**、
+    水平对齐 ZCode 窗口底部中心 x 附近（ZCode 底部中心减半把手宽），并钳制
+    在工作区内（不盖任务栏、不出屏）。zrect 无效 / 工作区取不到返回 None。
+    """
+    if not zrect or len(zrect) != 4:
+        return None
+    wa = work_area_of_rect(zrect)
+    if wa is None:
+        return None
+    wl, wt, wr, wb = wa
+    if wr <= wl or wb <= wt:
+        return None
+    cx = (zrect[0] + zrect[2]) // 2
+    x = min(max(cx - handle_w // 2, wl + margin),
+            max(wl, wr - handle_w - margin))
+    y = wb - handle_h - margin
+    y = min(max(y, wt + margin), max(wt, wb - handle_h - margin))
     return x, y
 
 
@@ -1383,6 +1506,7 @@ def read_stats_once(data_dir, db_path, cfg=None):
             line = info.get("text")
         if line is None:
             line = STATS_PENDING
+        st = info.get("stats") or {}
         return {
             "ok": True,
             "line": line,
@@ -1391,6 +1515,8 @@ def read_stats_once(data_dir, db_path, cfg=None):
             "model": info.get("model"),
             "sessionLabel": info.get("session_label"),
             "line1": info.get("line1") or SESSION_UNKNOWN,
+            "speedTokPerSec": st.get("speedTokPerSec"),
+            "speedAvgTokPerSec": st.get("speedAvgTokPerSec"),
         }
     except Exception as e:
         return {"ok": False, "line": STATS_PENDING, "source": "error", "error": str(e)}
@@ -1490,6 +1616,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
     menu = tk.Menu(root, tearoff=0, bd=0, bg=MENU_BG, fg=FG,
                    activebackground=MENU_ACTIVE, activeforeground=FG)
     menu.add_command(label=u"\u91cd\u65b0\u8d34\u8fb9", command=lambda: re_dock())
+    menu.add_command(label=u"\u6536\u8d77\u5230\u8fb9\u7f18",
+                     command=lambda: collapse_bar())
     menu.add_separator()
 
     # 「显示项」子菜单：每个 show_* 一项，checkbutton 勾选态绑定当前配置；
@@ -1574,7 +1702,11 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "manual_position": False, # 拖动过 -> poll 跳过吸回
         "manual_xy": None,        # 拖动后的稳定位置（供 re_dock 前保持）
         "close_box": None,        # close 小块的 Canvas 坐标（拖动按下时排除）
+        # ---- 靠边收起（collapsed 把手）----
+        "collapsed": bool(cfg.get("collapsed", False)),  # 启动按配置进收起/展开态
+        "press_xy": None,         # 按下时指针屏幕坐标（区分「单击展开」与「拖动把手」）
     }
+    hover_expand_id = None        # 把手悬停自动展开的 after 计时器（cancel 用）
 
     # 记录配置文件初始 mtime（热加载基线；文件暂不存在为 None）
     try:
@@ -1777,15 +1909,16 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
     def _apply_width(new_w):
         """窗口宽自适应落地（带 ±WIDTH_HYSTERESIS 防抖）：
         - 变化小于阈值 -> 保持当前宽（数字位数跳动不引起窗口频繁缩放闪烁）；
+        - cur_w 为 None（收起<->展开刚切换）-> 跳过防抖强制生效；
         - 拖动中 -> 不改尺寸（避免干扰拖动；释放后下一拍渲染补上）；
         - 生效时只改宽度、保持左上角不动（贴边模式 poll 下一拍按新宽重新居中，
           手动定位模式位置完全不受影响）。
         返回本帧实际生效宽度（防抖后可能与 new_w 不同，渲染以返回值为准）。"""
-        cur = state.get("cur_w") or WINDOW_W
-        if abs(new_w - cur) < WIDTH_HYSTERESIS:
+        cur = state.get("cur_w")
+        if cur is not None and abs(new_w - cur) < WIDTH_HYSTERESIS:
             return cur
         if state.get("dragging"):
-            return cur
+            return (cur if cur is not None else new_w)
         state["cur_w"] = new_w
         try:
             canvas.config(width=new_w)
@@ -1802,12 +1935,158 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             pass
         return new_w
 
+    # ---- 靠边收起：小把手（collapsed 模式）----
+    # 状态机：state["collapsed"] 单一事实源；收起入口 = 双击状态条任意区域 /
+    # 右键「收起到边缘」；展开 = 把手悬停 ~0.5s（Move 刷新计时）或单击；
+    # 切换即原子写回配置（save_config_keys），重启按 collapsed 字段恢复。
+
+    def _cancel_hover_expand():
+        """取消把手悬停自动展开的计时器（离开把手 / 已展开时调用）。"""
+        nonlocal hover_expand_id
+        try:
+            if hover_expand_id is not None:
+                root.after_cancel(hover_expand_id)
+        except Exception:
+            pass
+        hover_expand_id = None
+
+    def _schedule_hover_expand():
+        """（重新）启动悬停 0.5s 自动展开计时（Move 事件刷新 = 重置计时）。"""
+        nonlocal hover_expand_id
+        _cancel_hover_expand()
+        try:
+            hover_expand_id = root.after(HANDLE_HOVER_MS, expand_bar)
+        except Exception:
+            hover_expand_id = None
+
+    def _sync_cfg_mtime():
+        """写回配置后同步热加载基线 mtime，避免下一拍重读同值文件。"""
+        try:
+            state["cfg_mtime"] = os.path.getmtime(config_path)
+        except Exception:
+            pass
+
+    def collapse_bar():
+        """收起：完整状态条 -> 底部小把手。清手动定位（把手贴屏幕底部重新
+        停靠），持久化 collapsed=true，立即以把手尺寸重画。"""
+        if state.get("collapsed"):
+            return
+        state["collapsed"] = True
+        cfg["collapsed"] = True
+        save_config_keys(config_path, cfg, data_dir, ["collapsed"])
+        _sync_cfg_mtime()
+        hide_tooltip()
+        _cancel_hover_expand()
+        # 把手重新贴屏幕底部（收起态专用停靠），清掉旧贴边/手动位置记忆
+        state["manual_position"] = False
+        state["manual_xy"] = None
+        state["last_xy"] = None
+        state["close_box"] = None
+        try:
+            render_ui(state.get("last_info") or {
+                "text": None, "line1": None, "session_id": None,
+                "model": None, "session_label": None, "stats": None})
+        except Exception:
+            try:
+                _log_err(data_dir, "render after collapse error:\n%s"
+                         % traceback.format_exc())
+            except Exception:
+                pass
+
+    def expand_bar():
+        """展开：把手 -> 完整状态条（取简单：重新贴边 ZCode 底部，不还原
+        收起前的手动位置）。持久化 collapsed=false，恢复完整条高度并强制
+        宽度生效（cur_w=None 绕过防抖）。"""
+        if not state.get("collapsed"):
+            return
+        state["collapsed"] = False
+        cfg["collapsed"] = False
+        save_config_keys(config_path, cfg, data_dir, ["collapsed"])
+        _sync_cfg_mtime()
+        hide_tooltip()
+        _cancel_hover_expand()
+        state["manual_position"] = False
+        state["manual_xy"] = None
+        state["last_xy"] = None
+        state["cur_w"] = None      # 绕过宽度防抖：72 -> ~620 必须立刻生效
+        try:
+            canvas.config(height=WINDOW_H)  # 恢复完整条高度（把手态是 HANDLE_H）
+        except Exception:
+            pass
+        try:
+            render_ui(state.get("last_info") or {
+                "text": None, "line1": None, "session_id": None,
+                "model": None, "session_label": None, "stats": None})
+        except Exception:
+            try:
+                _log_err(data_dir, "render after expand error:\n%s"
+                         % traceback.format_exc())
+            except Exception:
+                pass
+
+    def _apply_handle_geometry(new_w):
+        """收起把手尺寸落地：cur_w 直接生效（把手宽稳定，无需防抖），窗口
+        高度切到 HANDLE_H；位置本函数不动（poll 下一拍按 collapsed 停靠位
+        贴屏幕底部），仅保持当前左上角。"""
+        state["cur_w"] = new_w
+        try:
+            canvas.config(width=new_w, height=HANDLE_H)
+        except Exception:
+            pass
+        try:
+            if hwnd:
+                xy = current_window_xy()
+                if xy:
+                    win().move_window(hwnd, xy[0], xy[1], new_w, HANDLE_H, True)
+            else:
+                root.geometry("%dx%d+0+0" % (new_w, HANDLE_H))
+        except Exception:
+            pass
+
+    def _render_handle(info):
+        """收起态渲染（render_ui 的 collapsed 分支调用；canvas 已清空）：
+        ~72x18 深底小把手 + 顶部 1px 分隔线 + 「◐ 84.9%」浓缩缓存命中率
+        （绿字）；悬停 0.5s / 单击展开（单击经 drag_stop 位移判定走 expand）。"""
+        stats = (info or {}).get("stats")
+        hit_txt = (u"%.1f%%" % _hit_rate(stats)) if stats else u"\u2014"
+        w = BLOCK_PAD * 2 + f_icon.measure(ICON_HIT) + 5 + f_num.measure(hit_txt)
+        _apply_handle_geometry(w)
+        canvas.create_rectangle(0, 0, w, 1, fill=EDGE_LINE, outline="")
+        tx = BLOCK_PAD
+        cy = HANDLE_H / 2.0
+        canvas.create_text(tx, cy, text=ICON_HIT, font=ICON_FONT,
+                           fill=ACCENT_GREEN, anchor="w", tags=("hdl",))
+        tx += f_icon.measure(ICON_HIT) + 5
+        canvas.create_text(tx, cy, text=hit_txt, font=FONT_NUM,
+                           fill=ACCENT_GREEN, anchor="w", tags=("hdl",))
+
+        def _enter(_e):
+            _schedule_hover_expand()          # 悬停 0.5s 自动展开
+            tooltip_enter(HANDLE_TIP)         # 「已收起——悬停或单击展开」
+
+        def _motion(e):
+            _schedule_hover_expand()          # Move 刷新（重置）展开计时
+            if _tip_visible():
+                show_tooltip(HANDLE_TIP, e.x_root, e.y_root)
+
+        def _leave(_e):
+            _cancel_hover_expand()
+            tooltip_leave()
+
+        canvas.tag_bind("hdl", "<Enter>", _enter)
+        canvas.tag_bind("hdl", "<Motion>", _motion)
+        canvas.tag_bind("hdl", "<Leave>", _leave)
+
     def render_ui(info):
         """整幅重画（同一回调内 delete+create，Tk 单次刷帧无闪烁）：
         顶部 1px 分隔线 + 第一行（●模型 会话）+ close 小块 + 第二行彩色指标块。
         窗口宽按内容自适应（plan_statusbar_layout）：指标块（含 cache read）
         永不因宽度丢块，超上限时依次收标题 -> 缩间距 -> 省累计标注。"""
         canvas.delete("all")
+        if state.get("collapsed"):
+            # 收起态：只画底部小把手（◐ 命中率），几何走 HANDLE_H 分支
+            _render_handle(info)
+            return
         show_m = cfg.get("show_model", True)
         show_s = cfg.get("show_session", True)
         model = info.get("model")
@@ -1936,7 +2215,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         """按下：记录指针与窗口左上角固定偏移，进入拖动状态。"""
         if state.get("dragging"):
             return
-        # close 小块上的按下走退出逻辑，不进入拖动
+        # close 小块上的按下走退出逻辑，不进入拖动（把手态无 close，恒 None）
         cb = state.get("close_box")
         if cb and cb[0] <= event.x <= cb[2] and cb[1] <= event.y <= cb[3]:
             return
@@ -1944,6 +2223,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         if xy is None:
             return
         state["dragging"] = True
+        state["press_xy"] = (event.x_root, event.y_root)
         state["drag_offset"] = (event.x_root - xy[0], event.y_root - xy[1])
 
     def drag_move(event):
@@ -1951,6 +2231,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
         目标坐标先经 clamp_to_work_area 钳到所在显示器工作区内
         （以目标位置构造伪矩形定显示器），防止拖出屏幕无法自救。
+        收起态按把手尺寸（HANDLE_H）钳制与移动。
         """
         if not state.get("dragging"):
             return
@@ -1961,23 +2242,44 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         new_x = event.x_root - ox
         new_y = event.y_root - oy
         bar_w = state.get("cur_w") or WINDOW_W
-        pseudo = (new_x, new_y, new_x + bar_w, new_y + WINDOW_H)
-        clamped = clamp_to_work_area((new_x, new_y), bar_w, WINDOW_H, pseudo)
+        bar_h = HANDLE_H if state.get("collapsed") else WINDOW_H
+        pseudo = (new_x, new_y, new_x + bar_w, new_y + bar_h)
+        clamped = clamp_to_work_area((new_x, new_y), bar_w, bar_h, pseudo)
         if clamped:
             new_x, new_y = clamped
         try:
             if hwnd:
-                win().move_window(hwnd, new_x, new_y, bar_w, WINDOW_H, True)
+                win().move_window(hwnd, new_x, new_y, bar_w, bar_h, True)
         except Exception:
             return
         state["manual_xy"] = (new_x, new_y)
 
     def drag_stop(event):
-        """释放：结束拖动，标记手动定位（poll 不再吸回），记录稳定位置。"""
+        """释放：结束拖动。收起态下「没怎么动就松开」视为单击把手 -> 展开；
+        其余情况标记手动定位（poll 不再吸回），记录稳定位置。"""
         if not state.get("dragging"):
             return
         state["dragging"] = False
         state["drag_offset"] = None
+        press = state.get("press_xy")
+        state["press_xy"] = None
+        moved = False
+        if press:
+            moved = (abs(event.x_root - press[0]) > 4
+                     or abs(event.y_root - press[1]) > 4)
+        if state.get("collapsed"):
+            if not moved:
+                expand_bar()   # 单击把手 -> 展开（未发生拖动）
+                return
+            # 把手被拖到新位置：停在该处（poll 跳过收起停靠）
+            state["manual_position"] = True
+            try:
+                xy = current_window_xy()
+                if xy is not None:
+                    state["manual_xy"] = xy
+            except Exception:
+                pass
+            return
         state["manual_position"] = True
         try:
             xy = current_window_xy()
@@ -2022,6 +2324,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
     canvas.bind("<ButtonPress-1>", drag_start)
     canvas.bind("<B1-Motion>", drag_move)
     canvas.bind("<ButtonRelease-1>", drag_stop)
+    # 双击状态条任意区域 -> 收起到边缘（collapsed 把手）
+    canvas.bind("<Double-Button-1>",
+                lambda _e: collapse_bar() if not state.get("collapsed") else None)
 
     def refresh_stats():
         line_fallback = STATS_PENDING
@@ -2109,6 +2414,19 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回
             # （仍受前台/最小化显示逻辑控制）。
             if state.get("manual_position"):
+                set_visible(True)
+                return
+            # 收起态：把手贴**屏幕底部边缘**（ZCode 底部中心 x 附近），同样
+            # 受上面前台/最小化显隐判定管辖（ZCode 非前台时把手也隐藏）。
+            if state.get("collapsed"):
+                bar_w = state.get("cur_w") or WINDOW_W
+                xy = collapsed_dock_xy(zrect, bar_w, HANDLE_H)
+                if xy is None:
+                    set_visible(False)
+                    return
+                if xy != state["last_xy"]:
+                    win().move_window(hwnd, xy[0], xy[1], bar_w, HANDLE_H, True)
+                    state["last_xy"] = xy
                 set_visible(True)
                 return
             bar_w = state.get("cur_w") or WINDOW_W
