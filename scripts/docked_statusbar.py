@@ -182,7 +182,9 @@ ICON_SPD = u"\u26a1"     # ⚡ 速度 tok/s
 
 # ---- 靠边收起（collapsed 把手）----
 HANDLE_H = 18            # 收起把手高度（小条 ~72x18）
+HANDLE_W_DEFAULT = 72    # 收起把手宽度估算（内容自适应渲染；记忆位置/越界回退用）
 HANDLE_HOVER_MS = 500    # 把手悬停多久自动展开（毫秒）
+HANDLE_FALLBACK_MARGIN = 8  # 越界回退右下角时距工作区右/下缘的留白
 HANDLE_TIP = (u"\u5df2\u6536\u8d77\u2014\u2014"
               u"\u60ac\u505c\u6216\u5355\u51fb\u5c55\u5f00\u5b8c\u6574\u7edf\u8ba1")
               # 已收起——悬停或单击展开完整统计
@@ -199,6 +201,8 @@ DEFAULT_CONFIG = {
     "show_speed": True,
     "show_reasoning": False,
     "collapsed": False,
+    "handle_x": None,
+    "handle_y": None,
     "refresh_ms": 1000,
     "theme": "dark",
 }
@@ -287,6 +291,19 @@ def _apply_raw_config(cfg, raw):
                 cfg["refresh_ms"] = min(max(rms, 250), 60000)
         except Exception:
             pass
+    for _hk in ("handle_x", "handle_y"):
+        if _hk in raw:
+            _hv = raw[_hk]
+            if isinstance(_hv, bool):
+                continue  # True/False 不是有效坐标
+            try:
+                _iv = int(_hv)
+            except Exception:
+                _iv = None
+            if _iv is not None:
+                cfg[_hk] = _iv
+            else:
+                cfg[_hk] = None
     if "theme" in raw and isinstance(raw.get("theme"), str) and raw["theme"]:
         cfg["theme"] = raw["theme"]
 
@@ -352,7 +369,11 @@ def save_config_keys(config_path, cfg, data_dir, keys):
             except Exception:
                 raw = {}
         for key in keys:
-            raw[key] = bool(cfg.get(key))
+            v = cfg.get(key)
+            if isinstance(v, bool):
+                raw[key] = v
+            else:
+                raw[key] = v
         os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
         tmp = config_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -371,6 +392,48 @@ def save_config_show_keys(config_path, cfg, data_dir):
     """兼容包装：写回全部显示项开关（show_*）。"""
     return save_config_keys(config_path, cfg, data_dir,
                             [k for _label, k in SHOW_MENU_ITEMS])
+
+
+def default_handle_xy(work_area, handle_w=HANDLE_W_DEFAULT, handle_h=HANDLE_H):
+    """默认把手位置 = 工作区底部水平居中（None 记忆 / 收起恢复的默认值）。
+    work_area 为 (left, top, right, bottom)；取不到返回 None。"""
+    if not work_area or len(work_area) != 4:
+        return None
+    wl, wt, wr, wb = work_area
+    if wr <= wl or wb <= wt:
+        return None
+    x = wl + (wr - wl - handle_w) // 2
+    x = max(x, wl + MARGIN)
+    y = wb - handle_h - MARGIN
+    return x, y
+
+
+def valid_and_clamped_handle_xy(xy, work_area,
+                                handle_w=HANDLE_W_DEFAULT, handle_h=HANDLE_H,
+                                margin=HANDLE_FALLBACK_MARGIN):
+    """把记忆的把手预设坐标 (x, y) 处理成可停靠坐标：
+
+    - 无记忆（None / 非二元组）-> 默认底部居中（default_handle_xy）；
+    - 坐标夹在 work_area 内可完整放下 -> 原样返回（已在区内的手工拖动值）；
+    - 越出工作区 / 工作区过小放不下 -> 回退默认**右下角**
+      (工作区宽-把手宽-margin, 工作区高-把手高-margin)。
+    work_area 取不到返回 None。"""
+    if not work_area or len(work_area) != 4:
+        return None
+    wl, wt, wr, wb = work_area
+    if wr <= wl or wb <= wt:
+        return None
+    if not xy or len(xy) != 2:
+        return default_handle_xy(work_area, handle_w, handle_h)
+    fx = int(xy[0])
+    fy = int(xy[1])
+    if (fx < wl or fy < wt or fx + handle_w > wr or fy + handle_h > wb
+            or wr - wl < handle_w + margin * 2
+            or wb - wt < handle_h + margin * 2):
+        dx = wr - handle_w - margin
+        dy = wb - handle_h - margin
+        return dx, dy
+    return fx, fy
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1552,128 @@ def work_area_of_rect(zrect):
 
 
 # ---------------------------------------------------------------------------
+# 手势状态机（收起把手的单击/双击/拖动裁决；纯逻辑层，可独立单测）
+# ---------------------------------------------------------------------------
+# 事件序列裁决规则（来自审查 P1，必须严格满足）：
+#   ButtonPress-1   记录按下坐标 + 时间，无动作；若 250ms 单击待定未决
+#                   （第二次按下到达）-> after_cancel 取消待定（防二次触发）。
+#   B1-Motion       位移 > CLICK_MOVE_PX -> 拖动态 dragging=True，只跟随移动 +
+#                   clamp_to_work_area（调用方），跳过单击/双击逻辑；
+#                   未达阈值不触发。
+#   ButtonRelease-1 拖动态 -> 结束拖动、on_persist 持久化把手坐标
+#                   （handle_x/handle_y，save_config_keys 原子写）；
+#                   双击第二次抬起 -> 不动作（收起态双击无意义）；
+#                   单击抬起 -> after(CLICK_RECOGNIZE_MS) 排 250ms 待定展开，
+#                   该时间内第二次按下到达则取消；单击只触发一次手势。
+#   after 返回值必须保存并 after_cancel；不依赖 sleep/绝对时间锚定，
+#   只依事件序列 + 250ms 相对延迟。
+
+CLICK_RECOGNIZE_MS = 250   # 单击待定期（第二次按下到达则取消）
+CLICK_MOVE_PX = 3          # 位移超过该像素视为拖动（>3px 才是拖动）
+
+E_ACTION_NONE = "none"           # 无动作
+E_ACTION_DRAG = "drag"           # 位移超阈值 -> 调用方跟随移动 + clamp
+E_ACTION_PERSIST = "persist"     # 拖动释放 -> 调用方持久化 handle_x/y
+E_ACTION_ARM_CLICK = "arm_click" # 单击抬起 -> 调用方排 250ms 待定展开
+
+
+class GestureState(object):
+    """收起把手的手势状态机（纯逻辑；gui 侧注入 after/after_cancel 与
+    副作用回调，测试注入可控假调度器/记录回调）。"""
+
+    def __init__(self, after=None, after_cancel=None, now=None,
+                 on_expand=None, on_persist=None):
+        self.dragging = False        # 拖动态（位移 >CLICK_MOVE_PX 后置 True）
+        self.press_xy = None         # 最近一次按下（x_root, y_root）
+        self.press_t = None          # 最近一次按下时间
+        self.click_pending = False   # 250ms 单击待定中
+        self.click_id = None         # root.after 返回值（after_cancel 用）
+        self.in_double_press = False # press 已取消待定（第二次按下到达）
+        self._after = after or (lambda ms, fn: None)
+        self._after_cancel = after_cancel or (lambda i: None)
+        self._now = now or (lambda: int(time.time() * 1000))
+        self.on_expand = on_expand or (lambda: None)     # 单击确认 -> 展开
+        self.on_persist = on_persist or (lambda x, y: None)  # 拖动结束 -> 存坐标
+
+    def press(self, x_root, y_root):
+        """ButtonPress-1：记录按下坐标 + 时间，返回 E_ACTION_NONE。
+        若存在未决单击待定（250ms 内第二次按下）-> 取消待定、置
+        in_double_press（双击的第二次抬起不再触发展开）。"""
+        self.press_xy = (int(x_root), int(y_root))
+        self.press_t = self._now()
+        if self.click_pending:
+            self._cancel_arm()
+            self.in_double_press = True
+        return E_ACTION_NONE
+
+    def motion(self, ev):
+        """B1-Motion：位移 >CLICK_MOVE_PX -> 进入拖动态并返回 E_ACTION_DRAG
+        （调用方跟随移动 + clamp_to_work_area）；已处拖动态则持续跟随；
+        未达阈值返回 E_ACTION_NONE（保持单击/双击待判）。"""
+        if not self.press_xy:
+            return E_ACTION_NONE
+        if self.dragging:
+            return E_ACTION_DRAG
+        dx = ev["x_root"] - self.press_xy[0]
+        dy = ev["y_root"] - self.press_xy[1]
+        if dx * dx + dy * dy > CLICK_MOVE_PX * CLICK_MOVE_PX:
+            self.dragging = True
+            return E_ACTION_DRAG
+        return E_ACTION_NONE
+
+    def release(self, ev, cur_xy=None):
+        """ButtonRelease-1（返回给调用方的裁决动作）：
+        - 拖动态 -> 结束拖动，on_persist(cur_xy) 持久化坐标，E_ACTION_PERSIST；
+        - 双击第二次抬起 -> 不动作（收起态双击无意义），E_ACTION_NONE；
+        - 单击抬起 -> 排 250ms 待定（_arm_click），E_ACTION_ARM_CLICK。"""
+        if self.dragging:
+            self.dragging = False
+            self.press_xy = None
+            was_double = self.in_double_press
+            self.in_double_press = False
+            if cur_xy is not None:
+                self.on_persist(cur_xy[0], cur_xy[1])
+            return E_ACTION_PERSIST  # was_double 仅记录（拖动手感照常持久化）
+        if self.in_double_press:
+            self.in_double_press = False
+            self.press_xy = None
+            return E_ACTION_NONE
+        self._arm_click()
+        self.press_xy = None
+        return E_ACTION_ARM_CLICK
+
+    def _arm_click(self):
+        self.click_pending = True
+        try:
+            self.click_id = self._after(CLICK_RECOGNIZE_MS, self._fire_click)
+        except Exception:
+            self.click_id = None
+
+    def _fire_click(self):
+        """250ms 待定到期：若仍 pending（未被第二次按下取消）才执行展开。"""
+        if not self.click_pending:
+            return
+        self.click_pending = False
+        self.click_id = None
+        self.on_expand()
+
+    def _cancel_arm(self):
+        self.click_pending = False
+        try:
+            if self.click_id is not None:
+                self._after_cancel(self.click_id)
+        except Exception:
+            pass
+        self.click_id = None
+
+    def cancel_click(self):
+        """收起/展开切换时清理未决状态：取消单击待定 + 拖动态 + 双击态。"""
+        self._cancel_arm()
+        self.dragging = False
+        self.in_double_press = False
+
+
+# ---------------------------------------------------------------------------
 # 一次性统计（--once）
 # ---------------------------------------------------------------------------
 
@@ -1704,9 +1889,56 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "close_box": None,        # close 小块的 Canvas 坐标（拖动按下时排除）
         # ---- 靠边收起（collapsed 把手）----
         "collapsed": bool(cfg.get("collapsed", False)),  # 启动按配置进收起/展开态
-        "press_xy": None,         # 按下时指针屏幕坐标（区分「单击展开」与「拖动把手」）
+        "manual_handle": False,   # 收起态把手被手动拖过 -> poll 不再吸回（直到展开）
+        "press_xy": None,         # 完整态按下时指针屏幕坐标（区分「单击」与「拖动」）
+        "last_drag_xy": None,     # 收起态拖动最近一次被 clamp 后的目标坐标
     }
     hover_expand_id = None        # 把手悬停自动展开的 after 计时器（cancel 用）
+
+    # ---- 收起把手手势状态机（单击/双击/拖动裁决）----
+    # 注入 GUI 的 after / after_cancel / 副作用回调；函数体在调用期解析
+    # （expand_bar 等定义在下方，闭包捕获变量名即可）。
+
+    def _gesture_after(ms, fn):
+        def _wrapped():
+            try:
+                fn()
+            except Exception:
+                try:
+                    _log_err(data_dir, "handle gesture callback error:\n%s"
+                             % traceback.format_exc())
+                except Exception:
+                    pass
+        try:
+            return root.after(ms, _wrapped)
+        except Exception:
+            return None
+
+    def _gesture_expand():
+        try:
+            expand_bar()
+        except Exception:
+            try:
+                _log_err(data_dir, "handle gesture expand error:\n%s"
+                         % traceback.format_exc())
+            except Exception:
+                pass
+
+    def _gesture_persist(x, y):
+        # 拖动结束 -> 持久化把手坐标（原子写），poll 不再吸回直到展开
+        cfg["handle_x"] = int(x)
+        cfg["handle_y"] = int(y)
+        state["manual_handle"] = True
+        save_config_keys(config_path, cfg, data_dir, ["handle_x", "handle_y"])
+        _sync_cfg_mtime()
+
+    hand_gesture = GestureState(
+        after=_gesture_after,
+        after_cancel=lambda i: root.after_cancel(i),
+        now=time_ms,
+        on_expand=_gesture_expand,
+        on_persist=_gesture_persist,
+    )
 
     # 记录配置文件初始 mtime（热加载基线；文件暂不存在为 None）
     try:
@@ -1951,8 +2183,12 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         hover_expand_id = None
 
     def _schedule_hover_expand():
-        """（重新）启动悬停 0.5s 自动展开计时（Move 事件刷新 = 重置计时）。"""
+        """（重新）启动悬停 0.5s 自动展开计时（Move 事件刷新 = 重置计时）。
+        手势按压/拖动进行中不排悬停展开（按下即取消悬停，避免悬停展开与
+        单击/双击/拖动裁决冲突）；悬停计时只在未被按压时运行。"""
         nonlocal hover_expand_id
+        if hand_gesture.press_xy is not None or hand_gesture.dragging:
+            return
         _cancel_hover_expand()
         try:
             hover_expand_id = root.after(HANDLE_HOVER_MS, expand_bar)
@@ -1967,8 +2203,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             pass
 
     def collapse_bar():
-        """收起：完整状态条 -> 底部小把手。清手动定位（把手贴屏幕底部重新
-        停靠），持久化 collapsed=true，立即以把手尺寸重画。"""
+        """收起：完整状态条 -> 小把手。清完整态手动定位/清理把手手势待定，
+        持久化 collapsed=true，立即以把手尺寸重画。把手停靠位由 poll 决定：
+        无记忆 -> 工作区底部居中；有记忆 -> 记忆位置（越界回退右下角）。"""
         if state.get("collapsed"):
             return
         state["collapsed"] = True
@@ -1977,7 +2214,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         _sync_cfg_mtime()
         hide_tooltip()
         _cancel_hover_expand()
-        # 把手重新贴屏幕底部（收起态专用停靠），清掉旧贴边/手动位置记忆
+        hand_gesture.cancel_click()          # 收起瞬间清理未决单击待定/拖动态
+        # 完整态默认贴边（manual_position 是完整态拖动记忆；收起态不沿用）
         state["manual_position"] = False
         state["manual_xy"] = None
         state["last_xy"] = None
@@ -1995,8 +2233,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
     def expand_bar():
         """展开：把手 -> 完整状态条（取简单：重新贴边 ZCode 底部，不还原
-        收起前的手动位置）。持久化 collapsed=false，恢复完整条高度并强制
-        宽度生效（cur_w=None 绕过防抖）。"""
+        收起前的手动位置）。持久化 collapsed=false，清掉把手手动记忆（下次
+        收起按记忆位置重新出现；本次展开后把手坐标记忆保留在配置文件）。
+        恢复完整条高度并强制宽度生效（cur_w=None 绕过防抖）。"""
         if not state.get("collapsed"):
             return
         state["collapsed"] = False
@@ -2005,6 +2244,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         _sync_cfg_mtime()
         hide_tooltip()
         _cancel_hover_expand()
+        hand_gesture.cancel_click()
+        state["manual_handle"] = False   # 展开后清标志：下次收起重新按记忆位置
         state["manual_position"] = False
         state["manual_xy"] = None
         state["last_xy"] = None
@@ -2212,12 +2453,18 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         return None
 
     def drag_start(event):
-        """按下：记录指针与窗口左上角固定偏移，进入拖动状态。"""
-        if state.get("dragging"):
+        """按下：完整态（未收起）延用偏移拖动；收起态走手势状态机 press
+        （记录坐标+时间，无动作；250ms 内第二次按下到达会取消单击待定）。
+        close 小块上的按下走退出逻辑，不进入任何拖动。"""
+        if state.get("dragging") or hand_gesture.dragging:
             return
-        # close 小块上的按下走退出逻辑，不进入拖动（把手态无 close，恒 None）
+        # close 小块上的按下走退出逻辑（把手态无 close，恒 None）
         cb = state.get("close_box")
         if cb and cb[0] <= event.x <= cb[2] and cb[1] <= event.y <= cb[3]:
+            return
+        if state.get("collapsed"):
+            _cancel_hover_expand()   # 按下即取消悬停展开，交手势裁决
+            hand_gesture.press(event.x_root, event.y_root)
             return
         xy = current_window_xy()
         if xy is None:
@@ -2227,12 +2474,37 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         state["drag_offset"] = (event.x_root - xy[0], event.y_root - xy[1])
 
     def drag_move(event):
-        """按住左键拖动：窗口 geometry 跟随指针（保持按下时偏移）。
-
-        目标坐标先经 clamp_to_work_area 钳到所在显示器工作区内
-        （以目标位置构造伪矩形定显示器），防止拖出屏幕无法自救。
-        收起态按把手尺寸（HANDLE_H）钳制与移动。
-        """
+        """按住左键移动：
+        - 收起态 -> 手势状态机裁决：位移 >3px 才进入拖动态跟随移动
+          （仍 clamp_to_work_area；未达阈值不触发，保持单击/双击待判）；
+        - 完整态 -> 原偏移拖动跟随（不受手势状态机约束）。"""
+        if state.get("collapsed"):
+            act = hand_gesture.motion({"x_root": event.x_root,
+                                       "y_root": event.y_root})
+            if act != E_ACTION_DRAG:
+                return
+            # 拖动态：目标坐标 clamp_to_work_area（以目标位置构造伪矩形
+            # 定显示器），防止拖出屏幕无法自救，移动后记录把手位置。
+            xy = current_window_xy()
+            if xy is None:
+                return
+            ox = event.x_root - xy[0]
+            oy = event.y_root - xy[1]
+            new_x = event.x_root - ox
+            new_y = event.y_root - oy
+            bar_w = state.get("cur_w") or HANDLE_W_DEFAULT
+            bar_h = HANDLE_H
+            pseudo = (new_x, new_y, new_x + bar_w, new_y + bar_h)
+            clamped = clamp_to_work_area((new_x, new_y), bar_w, bar_h, pseudo)
+            if clamped:
+                new_x, new_y = clamped
+            try:
+                if hwnd:
+                    win().move_window(hwnd, new_x, new_y, bar_w, bar_h, True)
+            except Exception:
+                return
+            state["last_drag_xy"] = (new_x, new_y)
+            return
         if not state.get("dragging"):
             return
         off = state.get("drag_offset")
@@ -2242,7 +2514,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         new_x = event.x_root - ox
         new_y = event.y_root - oy
         bar_w = state.get("cur_w") or WINDOW_W
-        bar_h = HANDLE_H if state.get("collapsed") else WINDOW_H
+        bar_h = WINDOW_H
         pseudo = (new_x, new_y, new_x + bar_w, new_y + bar_h)
         clamped = clamp_to_work_area((new_x, new_y), bar_w, bar_h, pseudo)
         if clamped:
@@ -2255,31 +2527,25 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         state["manual_xy"] = (new_x, new_y)
 
     def drag_stop(event):
-        """释放：结束拖动。收起态下「没怎么动就松开」视为单击把手 -> 展开；
-        其余情况标记手动定位（poll 不再吸回），记录稳定位置。"""
+        """释放：
+        - 收起态 -> 手势状态机裁决：拖动态 -> on_persist 持久化把手坐标
+          （handle_x/handle_y，原子写，poll 不再吸回）；双击第二次 -> 不动作；
+          单击 -> 排 250ms 待定展开（第二次按下到来前），时间到才展开一次。
+        - 完整态 -> 结束拖动、标记手动定位（poll 不再吸回），记录稳定位置。"""
+        if state.get("collapsed"):
+            cur_xy = state.get("last_drag_xy")
+            act = hand_gesture.release({"x_root": event.x_root,
+                                        "y_root": event.y_root}, cur_xy)
+            state["last_drag_xy"] = None
+            if act == E_ACTION_PERSIST:
+                # on_persist 已写配置 + manual_handle；此处补记真实当前位置
+                pass
+            return
         if not state.get("dragging"):
             return
         state["dragging"] = False
         state["drag_offset"] = None
-        press = state.get("press_xy")
         state["press_xy"] = None
-        moved = False
-        if press:
-            moved = (abs(event.x_root - press[0]) > 4
-                     or abs(event.y_root - press[1]) > 4)
-        if state.get("collapsed"):
-            if not moved:
-                expand_bar()   # 单击把手 -> 展开（未发生拖动）
-                return
-            # 把手被拖到新位置：停在该处（poll 跳过收起停靠）
-            state["manual_position"] = True
-            try:
-                xy = current_window_xy()
-                if xy is not None:
-                    state["manual_xy"] = xy
-            except Exception:
-                pass
-            return
         state["manual_position"] = True
         try:
             xy = current_window_xy()
@@ -2289,10 +2555,12 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             pass
 
     def re_dock():
-        """重新贴边：清除手动定位标志，让 poll 下一拍把小条吸回 ZCode 底部。"""
+        """重新贴边：清除手动定位标志（完整态 manual_position 与收起态
+        manual_handle），让 poll 下一拍恢复停靠/记忆位置。"""
         state["manual_position"] = False
         state["manual_xy"] = None
         state["last_xy"] = None
+        state["manual_handle"] = False
 
     def toggle_show(key):
         """右键「显示项」开关：更新内存配置 -> 立即重画 -> 原子写回配置文件。
@@ -2324,7 +2592,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
     canvas.bind("<ButtonPress-1>", drag_start)
     canvas.bind("<B1-Motion>", drag_move)
     canvas.bind("<ButtonRelease-1>", drag_stop)
-    # 双击状态条任意区域 -> 收起到边缘（collapsed 把手）
+    # 双击状态条任意区域 -> 收起到边缘（collapsed 把手）；收起态双击由手势
+    # 状态机裁决（第二次抬起不作任何展开/收起，双击收起态无意义）
     canvas.bind("<Double-Button-1>",
                 lambda _e: collapse_bar() if not state.get("collapsed") else None)
 
@@ -2416,17 +2685,29 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if state.get("manual_position"):
                 set_visible(True)
                 return
-            # 收起态：把手贴**屏幕底部边缘**（ZCode 底部中心 x 附近），同样
-            # 受上面前台/最小化显隐判定管辖（ZCode 非前台时把手也隐藏）。
+            # 收起态：把手停在用户上次拖动留下的位置（manual_handle，poll
+            # 不再吸回），直到展开清标志；启动/未拖过 -> 按记忆位置
+            # （handle_x/y，越界回退右下角）或默认底部居中停靠。同样受
+            # 上面前台/最小化显隐判定管辖（ZCode 非前台时把手也隐藏）。
             if state.get("collapsed"):
-                bar_w = state.get("cur_w") or WINDOW_W
-                xy = collapsed_dock_xy(zrect, bar_w, HANDLE_H)
+                bar_w = state.get("cur_w") or HANDLE_W_DEFAULT
+                if state.get("manual_handle"):
+                    set_visible(True)
+                    return
+                xy = current_window_xy()
                 if xy is None:
                     set_visible(False)
                     return
-                if xy != state["last_xy"]:
-                    win().move_window(hwnd, xy[0], xy[1], bar_w, HANDLE_H, True)
-                    state["last_xy"] = xy
+                wa = work_area_of_rect((xy[0], xy[1],
+                                        xy[0] + bar_w, xy[1] + HANDLE_H))
+                hxy = valid_and_clamped_handle_xy(
+                    (cfg.get("handle_x"), cfg.get("handle_y")), wa, bar_w)
+                if hxy is None:
+                    set_visible(False)
+                    return
+                if hxy != state["last_xy"]:
+                    win().move_window(hwnd, hxy[0], hxy[1], bar_w, HANDLE_H, True)
+                    state["last_xy"] = hxy
                 set_visible(True)
                 return
             bar_w = state.get("cur_w") or WINDOW_W
