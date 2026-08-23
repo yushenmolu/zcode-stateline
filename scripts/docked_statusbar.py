@@ -1,0 +1,2082 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（两行：模型/会话 + 统计）。
+
+作用：ZCode 没有官方 UI 槽位，本脚本用一个无边框置顶的 tkinter 小条
+「智能贴边」到 ZCode 主窗口底部外沿（水平居中）。仅当 ZCode 在前台且
+未最小化时显示；每 ~1 秒刷新两行：第一行显示当前模型名与当前会话标题，
+第二行显示该会话自己的 token 统计（`⏱<秒> · in <k/M> · out <k/M> ·
+cache hit <%>`）。
+
+「当前会话」判定优先级（fail-closed：判定不充分显示占位，绝不猜；
+data_dir/current-session.json 由 scripts/mark_session.py 在
+SessionStart/UserPromptSubmit 时写入真实会话 ID）：
+  1. current-session.json 存在且 updated_at 距今 < 30 秒 -> 用其 session_id；
+  2. 否则 db 兜底（限 60 秒窗口）：最近 60 秒内有模型调用的最新主会话
+     （model_usage started_at DESC 第一条、非 subagent）；
+  3. 否则 token-stats.jsonl ts 最大主会话记录——行尾标注「（最近会话累计）」；
+  4. 都没有 -> 「（会话未识别，待首轮活动）」占位。
+
+数据源（本轮改进）：
+  - **主数据源 = db.sqlite（model_usage 行级）**：模型调用完成即落库，比
+    jsonl（要等 Stop 钩子 record_usage.py 聚合写盘）早一轮，延迟更低。
+    按当前会话聚合 status='completed' 且非 subagent 的行（规避 subagent
+    会话 id 与 query_source='subagent'，双保险），avgDuration = 行级平均耗时。
+  - jsonl（token-stats.jsonl）仅作兜底：db 读不到 / db 聚合无 completed 行 /
+    db 打不开时才回退，避免冷启动显示「—」。
+  - db 全程只读：`sqlite3.connect("file:...?mode=ro", uri=True)` +
+    `PRAGMA query_only=ON`，绝不写库。
+
+设计要点：
+  - 纯标准库：tkinter（GUI）+ ctypes（Win32 窗口跟踪/贴边）+ sqlite3（只读）。
+  - 64 位句柄安全：所有 Win32 函数设 argtypes，hwnd 一律 c_void_p；
+    SetWindowPos 的 HWND_TOPMOST 必须传 ctypes.c_void_p(-1)。
+  - 绝不抢焦点：只用 ShowWindow(SW_SHOWNOACTIVATE) / MoveWindow /
+    SetWindowPos(SWP_NOACTIVATE)，从不调用 SetForegroundWindow；
+    任何异常只隐藏或保持现状，绝不弹错。
+  - 前台判定：GetForegroundWindow() 的 pid 与 ZCode 主窗口 pid 一致，
+    再用 QueryFullProcessImageNameW 比对 exe 名（双保险）。
+    FindWindowW 用精确标题 "ZCode"（非子串），避免含 zcode 的窗口误命中。
+  - 拖动：按住状态条任意区域（Canvas 全区域，含两行文字与各指标块；
+    右上 close 小块除外）左键拖动，按下记录 (event.x_root - winfo_rootx,
+    event.y_root - winfo_rooty)，移动时 geometry 跟随；释放后置
+    manual_position=True，poll 的贴边分支若 manual_position 为真则**跳过
+    MoveWindow 吸回**（前台显隐判定照常）。右键菜单「重新贴边」清除
+    manual_position，恢复智能自动贴边。拖动中（dragging=True）poll 也不吸
+    回，避免拖到一半被抢。
+  - 悬停提示（tooltip）：鼠标悬停在第二行各指标块（或第一行模型/会话）上
+    ~400ms 后显示一个无边框置顶小气泡，跟随鼠标；移开即隐藏。气泡复用
+    单一全局 toplevel，只改文本，避免反复建窗口。指标块悬停同时高亮块
+    背景（#1b1e24 -> #262b33）。
+  - UI 主题（彩色指标块风，暗色，AA/WCAG 对比度）：
+      窗口 620x56，底色 #14161a + 顶部 1px 分隔线 #2a2f38。
+      第一行（信息行，~20px）：左侧蓝色小圆点（#4f9cf7）+ 模型名（亮蓝
+      #4f9cf7）+ 会话标题（灰 #9aa1aa），右端「×」close 小块（hover 红
+      #e5534b + 白字）。
+      第二行（指标行，~30px）：一排圆角指标块（tkinter 无原生圆角，用
+      create_polygon + smooth=True 近似；底色 #1b1e24，块间 8px），每块 =
+      「彩色小标识 + 标签 + 数值」：◷耗时（灰白 #9aa1aa）/ ▸in ◂out（白
+      #e6e8eb）/ ◐缓存命中（绿 #3fb68b，块内附 60x4 微型进度条：槽
+      #2a2f38、填充 #3fb68b、命中率 >70% 变亮绿 #5dd6a8）/ ↻cache read
+      （灰）/ ✦reasoning（紫 #b08cf7，仅 show_reasoning=true 时画）。
+      数值用 Consolas 等宽防跳字；每块悬停高亮 #262b33 + tooltip 解释；
+      每块对应一个 show_* 开关，关掉的块不画、不留空位。文本/进度条画在
+      同一 Canvas 上，按 tag 分组绑定事件。
+  - 显示项可配置：data_dir/statusbar-config.json（缺省自动生成默认配置）。
+    show_model / show_session / show_avg_duration / show_input / show_output /
+    show_cache_read / show_cache_hit / show_reasoning 决定第一/二行拼哪些项；
+    右键菜单「显示项」子菜单可直接勾选切换（切换即重画并原子写回配置，
+    无需手改 JSON）；手改文件也会在下一拍热加载生效。
+    refresh_ms 覆盖 --interval-ms 默认（数据刷新间隔，默认 1000ms）。
+    坏 JSON / 缺字段一律回退默认值并写一条日志到 docked-statusbar-err.log。
+    --config <path> 覆盖配置文件路径。
+  - 防多开：数据目录 statusbar.pid 记录本进程 pid；已有存活实例直接退出；
+    退出时若 pid 仍是自己的则删除。
+  - CLI：--once 读一次打印统计 JSON 后退出（不建窗口、不进 GUI）。
+    输出结构：{ok, line, source, sessionId, model, sessionLabel, line1}；
+    line 按 show_* 配置裁剪（与状态条第二行实际渲染一致）。
+
+调用：
+  pythonw.exe docked_statusbar.py [--data-dir DIR] [--db-path PATH]
+                                  [--interval-ms MS] [--once] [--config PATH]
+
+验收说明：本脚本完成脚本级自测（py_compile / --once / 配置开关渲染 /
+拖动绑定与 tooltip 的绑定逻辑自查）。「真实 GUI 拖动不吸回 / tooltip 悬停 /
+视觉主题」需 ZCode 重启后由用户实测确认——本脚本不制造该结论。
+"""
+import argparse
+import ctypes
+import ctypes.wintypes as wintypes
+import json
+import os
+import sqlite3
+import sys
+import time
+import traceback
+
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR_DEFAULT = os.path.join(
+    os.path.expanduser(r"~/.zcode/cli/plugins/data"),
+    "local", "zcode-token-stats",
+)
+DB_DEFAULT = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "db", "db.sqlite")
+JSONL_NAME = "token-stats.jsonl"
+PID_NAME = "statusbar.pid"
+MARK_FILE_NAME = "current-session.json"
+CONFIG_FILE_NAME = "statusbar-config.json"
+MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（30 秒）
+DB_ACTIVE_WINDOW_MS = 60 * 1000  # db 兜底判定窗口：最近 60 秒内有模型调用才算活跃
+DB_READ_INTERVAL = 5        # 每 N 次刷新才重读一次 db（model/title 不频繁变化）
+STATS_PENDING = u"\uff08\u672c\u8f6e\u7ed3\u675f\u540e\u66f4\u65b0\uff09"  # （本轮结束后更新）
+SESSION_UNKNOWN = u"\uff08\u4f1a\u8bdd\u672a\u8bc6\u522b\uff0c\u5f85\u9996\u8f6e\u6d3b\u52a8\uff09"  # （会话未识别，待首轮活动）
+SESSION_RECENT_NOTE = u"\uff08\u6700\u8fd1\u4f1a\u8bdd\u7d2f\u8ba1\uff09"  # （最近会话累计）——jsonl 兜底判定时的标注
+
+WINDOW_W = 620        # 状态条宽度（固定；指标块从左排布，放不下的尾部块不画）
+WINDOW_H = 56         # 状态条高度（1px 顶线 + 信息行 ~20px + 指标行 ~30px）
+MARGIN = 6            # 贴边留白
+REFRESH_MS_DEFAULT = 1000  # 数据刷新 / 贴边/前台轮询（用户要求默认 1000ms）
+
+# ---- 暗色主题（AA 对比度）----
+BG = "#14161a"          # 窗口背景（比纯黑有层次）
+BG_SECOND = "#1b1e24"   # 次要背景（tooltip 底 / close 小块底）
+FG = "#e6e8eb"          # 主文字（对 BG 对比度 ~13:1，过 AA）
+FG_DIM = "#9aa1aa"      # 次要文字 / 标签（~5.8:1，过 AA）
+ACCENT_BLUE = "#4f9cf7" # 强调色（模型名 / 第一行小圆点）
+ACCENT_GREEN = "#3fb68b"# 命中率 / 省钱（绿）
+ACCENT_PURPLE = "#b08cf7"  # reasoning 标识紫
+SEP_COLOR = "#3a4048"   # 分隔线 / `·` 灰
+EDGE_LINE = "#2a2f38"   # 顶部 1px 分隔线（提质感）
+CLOSE_HOVER_BG = "#e5534b"  # close 悬停红
+CLOSE_HOVER_FG = "#ffffff"
+MENU_BG = "#1b1e24"
+MENU_ACTIVE = "#2f3a4a"
+FONT_DIM = ("Microsoft YaHei UI", 9)      # 第一行（会话·模型）小字
+FONT_MAIN = ("Microsoft YaHei UI", 10)    # 指标块中文标签
+FONT_NUM = ("Consolas", 10, "bold")       # 指标块数字（等宽防跳字）
+FONT_CLOSE = ("Microsoft YaHei UI", 9, "bold")
+
+# ---- 彩色指标块（Canvas 绘制）----
+BLOCK_BG = "#1b1e24"     # 指标块底色
+BLOCK_HOVER = "#262b33"  # 指标块悬停高亮
+BLOCK_GAP = 8            # 块间水平间距
+BLOCK_H = 27             # 块高
+BLOCK_PAD = 9            # 块内左右留白
+ROW1_CY = 13             # 第一行（模型/会话）文字垂直中心
+ROW2_Y = 26              # 第二行（指标块）顶部 y
+BAR_W, BAR_H = 60, 4     # 命中率微型进度条尺寸
+BAR_SLOT = "#2a2f38"     # 进度条槽色
+BAR_FILL = "#3fb68b"     # 进度条填充色（命中率 <=70%）
+BAR_FILL_HI = "#5dd6a8"  # 进度条填充色（命中率 >70%，更亮绿）
+ICON_FONT = ("Segoe UI Symbol", 10)  # 块左侧彩色标识字形（Windows 自带符号字体）
+ICON_DUR = u"\u25f7"     # ◷ 耗时
+ICON_IN = u"\u25b8"      # ▸ in
+ICON_OUT = u"\u25c2"     # ◂ out
+ICON_HIT = u"\u25d0"     # ◐ 缓存命中
+ICON_CRD = u"\u21bb"     # ↻ cache read
+ICON_RSN = u"\u2726"     # ✦ reasoning
+
+# 默认显示项配置（写 statusbar-config.json 用）
+DEFAULT_CONFIG = {
+    "show_model": True,
+    "show_session": True,
+    "show_avg_duration": True,
+    "show_input": True,
+    "show_output": True,
+    "show_cache_read": True,
+    "show_cache_hit": True,
+    "show_reasoning": False,
+    "refresh_ms": 1000,
+    "theme": "dark",
+}
+
+HWND_TOPMOST = ctypes.c_void_p(-1)
+GWL_EXSTYLE = -20
+WS_EX_NOACTIVATE = 0x08000000  # 点击不激活（不抢前台焦点）
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_NOOWNERZORDER = 0x0200
+SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
+MONITOR_DEFAULTTONEAREST = 2
+
+
+# ---------------------------------------------------------------------------
+# 配置读取（容错：坏 JSON / 缺字段 -> 默认值 + err 日志，不崩）
+# ---------------------------------------------------------------------------
+
+def _log_err(data_dir, msg):
+    """写一条调试/错误日志到数据目录 docked-statusbar-err.log；失败忽略。"""
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "docked-statusbar-err.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def load_config(config_path):
+    """
+    读取状态条显示配置。返回 (config_dict, source_path)。
+    容错规则：
+      - 文件不存在 -> 自动生成默认配置文件（DEFAULT_CONFIG）并返回默认值；
+      - 坏 JSON / 值类型不对 / 未知键 -> 回退默认值并写一条日志（不崩）；
+      - refresh_ms 截断极性、clamp 到 [250, 60000]。
+    """
+    cfg = dict(DEFAULT_CONFIG)
+    if not config_path or not os.path.exists(config_path):
+        # 缺省：自动生成默认配置文件，供用户在数据目录手改
+        if config_path:
+            try:
+                os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+                if not os.path.exists(config_path):
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+        return cfg, config_path
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        _log_err(os.path.dirname(config_path) or DATA_DIR_DEFAULT,
+                 "statusbar-config.json parse error, using defaults: %r" % (e,))
+        return cfg, config_path
+    if not isinstance(raw, dict):
+        _log_err(os.path.dirname(config_path) or DATA_DIR_DEFAULT,
+                 "statusbar-config.json not an object, using defaults")
+        return cfg, config_path
+
+    _apply_raw_config(cfg, raw)
+    return cfg, config_path
+
+
+def _apply_raw_config(cfg, raw):
+    """把已解析的 raw dict 按 schema 原地合并进 cfg（load_config 与热加载共用）。"""
+    for key in ("show_model", "show_session", "show_avg_duration", "show_input",
+                "show_output", "show_cache_read", "show_cache_hit", "show_reasoning"):
+        if key in raw:
+            v = raw[key]
+            if isinstance(v, bool):
+                cfg[key] = v
+            elif isinstance(v, int) and v in (0, 1):
+                cfg[key] = bool(v)
+    if "refresh_ms" in raw:
+        try:
+            rms = int(raw["refresh_ms"])
+            if rms > 0:
+                cfg["refresh_ms"] = min(max(rms, 250), 60000)
+        except Exception:
+            pass
+    if "theme" in raw and isinstance(raw.get("theme"), str) and raw["theme"]:
+        cfg["theme"] = raw["theme"]
+
+
+def hot_reload_config(cfg, config_path, data_dir, prev_mtime):
+    """配置热加载：mtime 变化则重读并合并进 cfg（原地改，调用方持有的引用不换）。
+
+    返回最新 mtime（供调用方下次比对）：
+      - 文件不存在 / mtime 未变 -> 原样返回 prev_mtime；
+      - 坏 JSON / 非 object -> 写一行 err 日志、**保留当前配置**，
+        但返回新 mtime（避免每帧重读坏文件刷日志；用户再保存才重试）；
+      - 正常 -> 合并生效（refresh_ms 变化由调用方从 cfg 读取应用）。
+    """
+    if not config_path:
+        return prev_mtime
+    try:
+        mtime = os.path.getmtime(config_path)
+    except Exception:
+        return prev_mtime
+    if mtime == prev_mtime:
+        return prev_mtime
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("config root is not an object")
+    except Exception as e:
+        _log_err(data_dir, "config hot-reload failed, keep current config: %r" % (e,))
+        return mtime
+    _apply_raw_config(cfg, raw)
+    return mtime
+
+
+# 右键「显示项」子菜单的开关项：(中文标签, 配置键)，顺序即菜单顺序
+SHOW_MENU_ITEMS = (
+    (u"\u6a21\u578b", "show_model"),               # 模型
+    (u"\u4f1a\u8bdd", "show_session"),             # 会话
+    (u"\u8017\u65f6", "show_avg_duration"),        # 耗时
+    (u"\u8f93\u5165", "show_input"),               # 输入
+    (u"\u8f93\u51fa", "show_output"),              # 输出
+    (u"\u7f13\u5b58\u547d\u4e2d", "show_cache_hit"),   # 缓存命中
+    (u"\u7f13\u5b58\u8bfb\u53d6", "show_cache_read"),  # 缓存读取
+    (u"\u63a8\u7406", "show_reasoning"),           # 推理
+)
+
+
+def save_config_show_keys(config_path, cfg, data_dir):
+    """把 cfg 中 8 个 show_* 开关原子写回 statusbar-config.json（右键菜单用）。
+
+    - 文件里其它字段（含未知键、refresh_ms、theme）原样保留；
+    - 原子写：先写 .tmp 再 os.replace；
+    - 任何失败只记 err 日志、返回 False，绝不抛出（菜单点击不能崩小条）。
+    """
+    try:
+        raw = {}
+        if config_path and os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                if isinstance(obj, dict):
+                    raw = obj
+            except Exception:
+                raw = {}
+        for _label, key in SHOW_MENU_ITEMS:
+            raw[key] = bool(cfg.get(key))
+        os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+        tmp = config_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, config_path)
+        return True
+    except Exception as e:
+        try:
+            _log_err(data_dir, "save statusbar-config.json failed: %r" % (e,))
+        except Exception:
+            pass
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 纯数据 / 统计口径（与 inject_context.py 一致，自包含、可独立测试）
+# ---------------------------------------------------------------------------
+
+def _num(v):
+    """安全转数字；失败返回 0。"""
+    if v is None:
+        return 0
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+
+def time_ms():
+    """当前 epoch 毫秒（通用时钟，只用于 freshness 判断与展示）。"""
+    return int(time.time() * 1000)
+
+
+def _is_subagent_sid(sid):
+    """session id 是否属于 subagent 会话（ZCode 给子代理开的独立会话）。
+
+    子代理（subagent）会被 ZCode 以独立 session_id 运行（形如
+    ``sess_subagent_*``），它们的 Stop / UserPromptSubmit 也会触发本插件钩子。
+    状态条 / 注入行应当展示**用户正在主会话**的统计，所以凡是 subagent
+    会话一律排除（既不做当前会话，也不参与聚合）。
+    """
+    if not sid or not isinstance(sid, str):
+        return False
+    s = sid.strip().lower()
+    return s.startswith("sess_subagent_") or "subagent" in s
+
+
+def read_jsonl(path):
+    """读取 jsonl 全部行；坏行/空行/非 JSON 跳过。返回 (rows, error)。"""
+    rows = []
+    error = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+    except Exception as e:
+        error = str(e)
+    return rows, error
+
+
+def current_session(rows):
+    """取 ts 最大记录的**主会话** id（subagent 会话一律跳过；sessionId 为空退 slug）。"""
+    candidates = [r for r in rows if not _is_subagent_sid(r.get("sessionId"))]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda r: _num(r.get("ts")))
+    sid = latest.get("sessionId")
+    if not sid:
+        sid = latest.get("slug")
+    return sid or None
+
+
+def aggregate_session(rows, session_id):
+    """对当前会话全部行累计求和（subagent 会话 id 不参与聚合）。返回 (agg, last_record)。"""
+    if _is_subagent_sid(session_id):
+        return _empty_stats(), None
+    agg = {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "reasoningTokens": 0,
+    }
+    last = None
+    for r in rows:
+        if r.get("sessionId") == session_id or (
+            not r.get("sessionId") and r.get("slug") == session_id
+        ):
+            agg["inputTokens"] += int(_num(r.get("inputTokens")))
+            agg["outputTokens"] += int(_num(r.get("outputTokens")))
+            agg["cacheCreationTokens"] += int(_num(r.get("cacheCreationTokens")))
+            agg["cacheReadTokens"] += int(_num(r.get("cacheReadTokens")))
+            agg["reasoningTokens"] += int(_num(r.get("reasoningTokens")))
+            if last is None or r.get("ts", 0) >= last.get("ts", 0):
+                last = r
+    return agg, last
+
+
+def _empty_stats():
+    """标准空 stats dict（所有指标键始终存在）。"""
+    return {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+        "reasoningTokens": 0,
+        "avgDurationMs": 0.0,
+    }
+
+
+def format_tokens(n):
+    """>=1_000_000 -> x.xM（1 位小数）；>=1_000 -> x.xk（1 位小数）；否则原值。"""
+    n = int(n)
+    if n >= 1_000_000:
+        return "%.1fM" % (n / 1_000_000.0)
+    if n >= 1_000:
+        return "%.1fk" % (n / 1_000.0)
+    return str(n)
+
+
+def _hit_rate(stats):
+    """缓存命中率 = cacheRead / (input + cacheRead)（输入侧口径，与 inject 一致）。"""
+    denom = stats.get("inputTokens", 0) + stats.get("cacheReadTokens", 0)
+    return (stats.get("cacheReadTokens", 0) / denom if denom > 0 else 0.0) * 100.0
+
+
+def _line_from_stats(stats):
+    """由标准 stats dict 生成完整统计行文本（含全部指标）。"""
+    return (u"\u23f1%.1fs \u00b7 in %s \u00b7 out %s \u00b7 cache hit %.1f%%"
+            % (stats["avgDurationMs"] / 1000.0,
+               format_tokens(stats["inputTokens"]),
+               format_tokens(stats["outputTokens"]),
+               _hit_rate(stats)))
+
+
+def _db_connect(db_path):
+    """只读打开 db.sqlite；失败返回 None。"""
+    if not db_path or not os.path.exists(db_path):
+        return None
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db_path.replace("\\", "/"), uri=True)
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+    except Exception:
+        return None
+
+
+def _truncate(s, n):
+    """截断到 n 个字符（保留首尾所见），失败返回原文。"""
+    if s is None:
+        return None
+    s_out = str(s).strip()
+    if len(s_out) <= n:
+        return s_out
+    return s_out[:n]
+
+
+def read_mark_file(data_dir):
+    """读取 current-session.json 标记；返回 session_id 或 None（文件不存在/坏/超龄）。"""
+    path = os.path.join(data_dir, MARK_FILE_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return None
+    sid = None
+    try:
+        sid = obj.get("session_id")
+    except Exception:
+        sid = None
+    if not sid or not isinstance(sid, str):
+        return None
+    try:
+        updated = int(obj.get("updated_at") or 0)
+    except Exception:
+        updated = 0
+    if not updated or (time_ms() - updated) > MARK_FRESH_MS:
+        return None
+    return sid
+
+
+def resolve_current_session(rows, data_dir, db_path):
+    """
+    综合确定「当前会话」id（fail-closed：判定不充分宁可返回 None 占位，绝不猜）。
+    优先级：
+      1. data_dir/current-session.json 新鲜标记（< 30 秒，非 subagent）-> "mark"；
+      2. db 最近 DB_ACTIVE_WINDOW_MS（60 秒）内有模型调用的最新主会话
+         （model_usage started_at DESC 第一条、非 subagent）-> "db"；
+      3. token-stats.jsonl ts 最大主会话记录 -> "jsonl"（调用方需标注
+         「（最近会话累计）」，因为这只是「最近有记录的会话」而非确切当前会话）；
+      4. 都没有 -> (None, "none")，调用方显示占位文案。
+    """
+    sid = read_mark_file(data_dir)
+    if sid and not _is_subagent_sid(sid):
+        return sid, "mark"
+    if db_path:
+        db_sid = db_recent_session_id(db_path, DB_ACTIVE_WINDOW_MS)
+        if db_sid:
+            return db_sid, "db"
+    sid = current_session(rows)
+    if sid:
+        return sid, "jsonl"
+    return None, "none"
+
+
+def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
+    """db 侧「最近活跃」判定：window_ms 毫秒内有 model_usage 行的最新主会话 id。
+
+    只把**最近 60 秒内确有模型调用**的主会话当作当前会话（非 subagent），
+    无时间窗的「最新一条」不再作为兜底（那是猜测，fail-closed 不猜）。
+    started_at 为 epoch 毫秒（与 record_usage 游标同口径）。失败返回 None。
+    """
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        since = time_ms() - int(window_ms)
+        row = conn.execute(
+            "SELECT session_id FROM model_usage "
+            "WHERE session_id NOT LIKE 'sess_subagent_%' "
+            "AND started_at >= ? "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (since,),
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_latest_session_id(db_path):
+    """db 侧确定当前活跃主会话：最新 model_usage 的 session_id（跳过 subagent），
+    兜底最新 session（同样跳过 subagent）。"""
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None, "db access failed"
+    try:
+        row = conn.execute(
+            "SELECT session_id FROM model_usage "
+            "WHERE session_id NOT LIKE 'sess_subagent_%' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if row and row[0]:
+            return row[0], None
+        row = conn.execute(
+            "SELECT id FROM session "
+            "WHERE id NOT LIKE 'sess_subagent_%' "
+            "ORDER BY time_updated DESC LIMIT 1"
+        ).fetchone()
+        if row and row[0]:
+            return row[0], None
+        return None, None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_latest_model_id(db_path, session_id):
+    """会话最新 model_usage 行的 model_id（ORDER BY started_at DESC）；无则 None。
+    subagent 会话不参与展示。"""
+    if not session_id or _is_subagent_sid(session_id):
+        return None
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT model_id FROM model_usage WHERE session_id = ? "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return (row[0] if row and row[0] else None)
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_session_title(db_path, session_id):
+    """session 表按 session_id 取 title（去首尾空白）；subagent / 无则 ''。"""
+    if not session_id or _is_subagent_sid(session_id):
+        return ""
+    conn = _db_connect(db_path)
+    if conn is None:
+        return ""
+    try:
+        row = conn.execute(
+            "SELECT title FROM session WHERE id = ? LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row and row[0]:
+            return str(row[0]).strip()
+        return ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_aggregate_session(db_path, session_id):
+    """只读聚合某**主会话**的 completed 行（subagent 会话返回 None，不参与统计）。
+    主数据源行级聚合：avgDuration = AVG(completed 行 duration_ms)。
+    返回标准 stats dict 或 None（会话无数据/读取失败）。"""
+    if _is_subagent_sid(session_id):
+        return None
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+            "COALESCE(SUM(cache_read_input_tokens),0), "
+            "COALESCE(SUM(cache_creation_input_tokens),0), "
+            "COALESCE(SUM(reasoning_tokens),0), "
+            "COALESCE(AVG(duration_ms),0) "
+            "FROM model_usage WHERE session_id = ? AND status='completed' "
+            "AND COALESCE(query_source,'') <> 'subagent'",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        inp, outp, cache_rd, cache_cre, reas, avg_dur = row
+        inp = int(inp or 0)
+        outp = int(outp or 0)
+        cache_rd = int(cache_rd or 0)
+        cache_cre = int(cache_cre or 0)
+        reas = int(reas or 0)
+        if inp == 0 and outp == 0 and cache_rd == 0 and cache_cre == 0:
+            return None
+        return {
+            "inputTokens": inp,
+            "outputTokens": outp,
+            "cacheReadTokens": cache_rd,
+            "cacheCreationTokens": cache_cre,
+            "reasoningTokens": reas,
+            "avgDurationMs": float(avg_dur or 0.0),
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def build_stats_line(rows, db_path=None, session_id=None):
+    """
+    聚合统计。**数据源优先级改为 db 优先**：db 行级聚合（模型调用完成即
+    落库，快一轮）-> jsonl 该会话累计（兜底，避免冷启动显示「—」）->
+    「本轮结束后更新」。
+
+    session_id 为 None 时：先 jsonl ts 最大主会话，再 db 最新活跃主会话。
+
+    返回 (text, source, used_sid, stats)：
+      - text  完整统计行文本（含全部指标，未按配置裁剪）；
+      - source 'db' | 'jsonl' | 'jsonl-latest' | 'pending' | 'none'；
+      - used_sid 实际参与聚合的会话 id（可能为 None）；
+      - stats  标准 stats dict；text 为 STATS_PENDING / 无数据时为 None。
+    """
+    def _db_or_jsonl(sid):
+        """db 主源 -> jsonl 兜底；返回 (text, source, stats) 或 None(无数据)。"""
+        if db_path:
+            st = db_aggregate_session(db_path, sid)
+            if st is not None:
+                return _line_from_stats(st), "db", st
+        agg, last = aggregate_session(rows, sid)
+        if last is not None:
+            st = {
+                "inputTokens": agg["inputTokens"],
+                "outputTokens": agg["outputTokens"],
+                "cacheCreationTokens": agg["cacheCreationTokens"],
+                "cacheReadTokens": agg["cacheReadTokens"],
+                "reasoningTokens": agg["reasoningTokens"],
+                "avgDurationMs": _num(last.get("avgDurationMs")),
+            }
+            return _line_from_stats(st), "jsonl", st
+        return None
+
+    if session_id is not None:
+        got = _db_or_jsonl(session_id)
+        if got is None:
+            return STATS_PENDING, "pending", session_id, None
+        text, src, stats = got
+        return text, src, session_id, stats
+
+    sid = current_session(rows)
+    if sid is not None:
+        got = _db_or_jsonl(sid)
+        if got is None:
+            return STATS_PENDING, "pending", sid, None
+        text, src, stats = got
+        return text, src, sid, stats
+
+    if db_path:
+        cur_sid, _err = db_latest_session_id(db_path)
+        if cur_sid:
+            got = _db_or_jsonl(cur_sid)
+            if got is None:
+                return STATS_PENDING, "pending", cur_sid, None
+            text, src, stats = got
+            return text, src, cur_sid, stats
+
+    last_row = next((r for r in reversed(rows)
+                     if not _is_subagent_sid(r.get("sessionId"))), None)
+    if last_row is not None:
+        st = {
+            "inputTokens": int(_num(last_row.get("inputTokens"))),
+            "outputTokens": int(_num(last_row.get("outputTokens"))),
+            "cacheCreationTokens": int(_num(last_row.get("cacheCreationTokens"))),
+            "cacheReadTokens": int(_num(last_row.get("cacheReadTokens"))),
+            "reasoningTokens": int(_num(last_row.get("reasoningTokens"))),
+            "avgDurationMs": _num(last_row.get("avgDurationMs")),
+        }
+        return _line_from_stats(st), "jsonl-latest", last_row.get("sessionId"), st
+    return None, "none", None, None
+
+
+def session_label(db_path, session_id):
+    """会话显示标识：session.title 截断 ~16 字符；无 title -> (未命名会话)。"""
+    if not session_id:
+        return u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"  # （未命名会话）
+    title = db_session_title(db_path, session_id)
+    if title:
+        return _truncate(title, 16) or u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"
+    return u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"
+
+
+def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None):
+    """
+    每帧（GUI / --once）统一解析展示信息，返回 dict：
+      {text, source, session_id, model, session_label, line1, line2, stats}
+    其中：
+      - session 判定走 resolve_current_session（mark -> db -> jsonl）；
+      - 统计按该会话 db 优先聚合（build_stats_line）；stats 为标准 dict；
+      - model / title 读 db（会话判定为新会话时才重读，否则沿用 cur 缓存）；
+      - line1 按配置 show_model/show_session 裁剪；model 保留完整值（tooltip）。
+    任何异常兜底为 None / 「—」，绝不外抛。
+    """
+    cfg = cfg or dict(DEFAULT_CONFIG)
+    info = {
+        "text": None,
+        "source": "none",
+        "session_id": None,
+        "model": None,
+        "session_label": None,
+        "line1": None,
+        "line2": None,
+        "stats": None,
+        "recent_note": False,
+        "error": None,
+    }
+    try:
+        sid, source = resolve_current_session(rows, data_dir, db_path)
+        info["session_id"] = sid
+        info["source"] = source
+        if sid is None:
+            # fail-closed：判定不充分时显示占位，绝不猜一个会话
+            info["line1"] = SESSION_UNKNOWN
+            info["line2"] = SESSION_UNKNOWN
+            info["text"] = SESSION_UNKNOWN
+            return info
+
+        # model / title：会话变化（或缺省）才重读 db（model/title 不频繁变化）
+        reuse = bool(cur and cur.get("session_id") == sid
+                     and cur.get("model") is not None
+                     and cur.get("session_label") is not None)
+        if reuse:
+            model = cur.get("model")
+            label = cur.get("session_label")
+        else:
+            model = db_latest_model_id(db_path, sid)
+            label = session_label(db_path, sid)
+            if not model:
+                model = "model?"
+            if not label:
+                label = u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"
+        info["model"] = model
+        info["session_label"] = label
+        # line1 文本版（按配置裁剪；model 保留完整值供 tooltip）
+        parts1 = []
+        if cfg.get("show_model", True):
+            parts1.append(_truncate(model, 20) or "model?")
+        if cfg.get("show_session", True):
+            parts1.append(label)
+        info["line1"] = u" \u00b7 ".join(parts1) if parts1 else u"\u2014"
+
+        text, _src, used_sid, stats = build_stats_line(rows, db_path, sid)
+        info["recent_note"] = (source == "jsonl" and stats is not None)
+        if info["recent_note"] and text:
+            text = text + u" " + SESSION_RECENT_NOTE
+        info["text"] = text
+        info["line2"] = text
+        info["stats"] = stats
+        if used_sid is not None:
+            info["session_id"] = used_sid
+    except Exception as e:
+        info["error"] = str(e)
+        for k in ("line1", "line2", "text"):
+            if info.get(k) is None:
+                info[k] = STATS_PENDING
+    return info
+
+
+# ---------------------------------------------------------------------------
+# 显示项拼接（按配置 show_* 决定第二行拼哪些指标）
+# ---------------------------------------------------------------------------
+
+def build_line2_parts(stats, cfg):
+    """
+    按配置把 stats 拆成带样式的片段列表，用于第二行渲染 + tooltip 悬停热区。
+    返回 [ (kind, text, font, fg, tooltip_text), ... ]
+      kind: 'duration' | 'label' | 'in' | 'out' | 'cache' | 'cache_read' |
+            'reasoning' | 'sep' | 'text'
+    stats 为 None（无数据）时返回 [('text', STATS_PENDING)]（与 --once 文案统一）。
+    全关则返回 [('text', STATS_PENDING)]。
+    """
+    if not stats:
+        return [("text", STATS_PENDING, FONT_MAIN, FG, None)]
+    show_dur = cfg.get("show_avg_duration", True)
+    show_in = cfg.get("show_input", True)
+    show_out = cfg.get("show_output", True)
+    show_cache_read = cfg.get("show_cache_read", True)
+    show_cache_hit = cfg.get("show_cache_hit", True)
+    show_reasoning = cfg.get("show_reasoning", False)
+
+    dur_s = stats.get("avgDurationMs", 0) / 1000.0
+    inp = stats.get("inputTokens", 0)
+    outp = stats.get("outputTokens", 0)
+    cache_rd = stats.get("cacheReadTokens", 0)
+    hit = _hit_rate(stats)
+    reas = stats.get("reasoningTokens", 0)
+
+    parts = []
+
+    def _add_sep():
+        if parts and parts[-1][0] != "sep":
+            parts.append(("sep", u" \u00b7 ", FONT_MAIN, SEP_COLOR, None))
+
+    if show_dur:
+        parts.append(("duration", u"\u23f1%.1fs" % dur_s, FONT_NUM, FG,
+                      u"\u5e73\u5747\u8017\u65f6\uff1a\u5f53\u524d\u5bf9\u8bdd\u5e73\u5747\u6bcf\u6b21\u6a21\u578b\u8c03\u7528\u7684\u65f6\u957f\uff08\u4e0d\u542b\u5b50\u4ee3\u7406\uff09"))
+    if show_in:
+        _add_sep()
+        parts.append(("label", u"in ", FONT_MAIN, FG_DIM,
+                      u"in\uff1a\u8f93\u5165 token \u7d2f\u8ba1\uff08\u542b\u7f13\u5b58\u8bfb\u53d6\u90e8\u5206\uff09"))
+        parts.append(("in", format_tokens(inp), FONT_NUM, FG, None))
+    if show_out:
+        _add_sep()
+        parts.append(("label", u"out ", FONT_MAIN, FG_DIM,
+                      u"out\uff1a\u8f93\u51fa token \u7d2f\u8ba1"))
+        parts.append(("out", format_tokens(outp), FONT_NUM, FG, None))
+    if show_cache_hit:
+        _add_sep()
+        parts.append(("label", u"cache ", FONT_MAIN, FG_DIM,
+                      u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = \u7f13\u5b58\u8bfb\u53d6 \u00f7 \uff08\u8f93\u5165 + \u7f13\u5b58\u8bfb\u53d6\uff09\uff1b\u6570\u503c\u8d8a\u9ad8\u8d8a\u7701\u94b1"))
+        parts.append(("cache", u"hit %.1f%%" % hit, FONT_NUM, ACCENT_GREEN, None))
+    if show_cache_read:
+        # cache read 与 cache hit 独立开关：两者都开时分开显示（红/蓝数字），
+        # 均符合"关键数字等宽 + 主题色"规范。
+        _add_sep()
+        parts.append(("label", u"cache read ", FONT_MAIN, FG_DIM,
+                      u"cache read\uff1a\u7f13\u5b58\u8bfb\u53d6 token \u7d2f\u8ba1\uff08\u547d\u4e2d\u90e8\u5206\uff09"))
+        parts.append(("cache_read", format_tokens(cache_rd), FONT_NUM, FG, None))
+    if show_reasoning and reas:
+        _add_sep()
+        parts.append(("label", u"reasoning ", FONT_MAIN, FG_DIM,
+                      u"reasoning\uff1a\u601d\u8003\uff08reasoning\uff09token \u7d2f\u8ba1"))
+        parts.append(("reasoning", format_tokens(reas), FONT_NUM, FG, None))
+
+    if not parts:
+        return [("text", STATS_PENDING, FONT_MAIN, FG, None)]
+    return parts
+
+
+def stats_to_text(stats, cfg):
+    """按配置把 stats 渲染成一行文本（--once 的 line 输出；GUI 侧改为指标块渲染）。"""
+    if stats is None:
+        return STATS_PENDING
+    parts = build_line2_parts(stats, cfg)
+    return "".join(p[1] for p in parts)
+
+
+# ---------------------------------------------------------------------------
+# 彩色指标块（GUI 第二行 Canvas 渲染的纯数据层；--once 不经过这里）
+# ---------------------------------------------------------------------------
+
+# 各指标块 tooltip 文案（与旧 build_line2_parts 保持同文）
+TIP_DUR = u"\u5e73\u5747\u8017\u65f6\uff1a\u5f53\u524d\u5bf9\u8bdd\u5e73\u5747\u6bcf\u6b21\u6a21\u578b\u8c03\u7528\u7684\u65f6\u957f\uff08\u4e0d\u542b\u5b50\u4ee3\u7406\uff09"
+TIP_IN = u"in\uff1a\u8f93\u5165 token \u7d2f\u8ba1\uff08\u542b\u7f13\u5b58\u8bfb\u53d6\u90e8\u5206\uff09"
+TIP_OUT = u"out\uff1a\u8f93\u51fa token \u7d2f\u8ba1"
+TIP_HIT = u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = \u7f13\u5b58\u8bfb\u53d6 \u00f7 \uff08\u8f93\u5165 + \u7f13\u5b58\u8bfb\u53d6\uff09\uff1b\u6570\u503c\u8d8a\u9ad8\u8d8a\u7701\u94b1"
+TIP_CRD = u"cache read\uff1a\u7f13\u5b58\u8bfb\u53d6 token \u7d2f\u8ba1\uff08\u547d\u4e2d\u90e8\u5206\uff09"
+TIP_RSN = u"reasoning\uff1a\u601d\u8003\uff08reasoning\uff09token \u7d2f\u8ba1"
+
+
+def build_metric_blocks(stats, cfg):
+    """
+    按配置把 stats 拆成「彩色指标块」描述列表（纯数据；块宽由渲染层按字体实测）。
+    返回 [ {kind, icon, icon_color, label, value, value_color, tip, progress}, ... ]：
+      - progress 仅缓存命中块非 None（0-100 的命中率数值，用于微型进度条）；
+      - stats 为 None / 显示项全关 -> 单个占位块 {kind:'pending', text:...}，
+        文案与 fail-closed 口径一致（「（本轮结束后更新）」）。
+    """
+    if not stats:
+        return [{"kind": "pending", "text": STATS_PENDING, "tip": None}]
+    blocks = []
+    if cfg.get("show_avg_duration", True):
+        blocks.append({
+            "kind": "duration", "icon": ICON_DUR, "icon_color": FG_DIM,
+            "label": u"\u8017\u65f6",
+            "value": u"%.1fs" % (stats.get("avgDurationMs", 0) / 1000.0),
+            "value_color": FG, "tip": TIP_DUR, "progress": None,
+        })
+    if cfg.get("show_input", True):
+        blocks.append({
+            "kind": "input", "icon": ICON_IN, "icon_color": FG,
+            "label": "in",
+            "value": format_tokens(stats.get("inputTokens", 0)),
+            "value_color": FG, "tip": TIP_IN, "progress": None,
+        })
+    if cfg.get("show_output", True):
+        blocks.append({
+            "kind": "output", "icon": ICON_OUT, "icon_color": FG,
+            "label": "out",
+            "value": format_tokens(stats.get("outputTokens", 0)),
+            "value_color": FG, "tip": TIP_OUT, "progress": None,
+        })
+    if cfg.get("show_cache_hit", True):
+        blocks.append({
+            "kind": "cache_hit", "icon": ICON_HIT, "icon_color": ACCENT_GREEN,
+            "label": u"\u7f13\u5b58\u547d\u4e2d",
+            "value": u"%.1f%%" % _hit_rate(stats),
+            "value_color": ACCENT_GREEN, "tip": TIP_HIT,
+            "progress": _hit_rate(stats),
+        })
+    if cfg.get("show_cache_read", True):
+        blocks.append({
+            "kind": "cache_read", "icon": ICON_CRD, "icon_color": FG_DIM,
+            "label": "cache read",
+            "value": format_tokens(stats.get("cacheReadTokens", 0)),
+            "value_color": FG, "tip": TIP_CRD, "progress": None,
+        })
+    if cfg.get("show_reasoning", False) and stats.get("reasoningTokens", 0):
+        blocks.append({
+            "kind": "reasoning", "icon": ICON_RSN, "icon_color": ACCENT_PURPLE,
+            "label": "reasoning",
+            "value": format_tokens(stats.get("reasoningTokens", 0)),
+            "value_color": FG, "tip": TIP_RSN, "progress": None,
+        })
+    if not blocks:
+        return [{"kind": "pending", "text": STATS_PENDING, "tip": None}]
+    return blocks
+
+
+def round_rect(cv, x0, y0, x1, y1, radius=6, **kwargs):
+    """近似圆角矩形（tkinter 无原生圆角：create_polygon + smooth=True）。"""
+    r = min(radius, (x1 - x0) / 2.0, (y1 - y0) / 2.0)
+    pts = [
+        x0 + r, y0, x1 - r, y0,
+        x1, y0, x1, y0 + r,
+        x1, y1 - r, x1, y1,
+        x1 - r, y1, x0 + r, y1,
+        x0, y1, x0, y1 - r,
+        x0, y0 + r, x0, y0,
+    ]
+    return cv.create_polygon(pts, smooth=True, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 贴边计算（纯函数，可独立单测；zrect = (left, top, right, bottom) 像素）
+# ---------------------------------------------------------------------------
+
+def dock_rect(zrect, bar_w, bar_h, margin=MARGIN, mode="below"):
+    """
+    计算状态条左上角 (x, y) 贴到 ZCode 窗口的位置。
+
+    mode="below": 贴窗口底部外沿下方（y = bottom + margin，默认）；
+    mode="inside": 贴窗口底部内侧（y = bottom - bar_h - margin）。
+    水平居中；窗口过窄时退回左侧留白。窗口矩形无效返回 None。
+    """
+    left, top, right, bottom = zrect
+    zc_w = right - left
+    zc_h = bottom - top
+    if zc_w <= 0 or zc_h <= 0:
+        return None
+    x = left + max((zc_w - bar_w) // 2, margin)
+    if mode == "inside":
+        y = max(top, bottom - bar_h - margin)
+    else:
+        y = bottom + margin
+    return max(x, 0), max(y, 0)
+
+
+def clamp_to_work_area(xy, bar_w, bar_h, zrect, margin=MARGIN):
+    """
+    用 zrect 所在显示器的工作区把 (x,y) 夹回来（防止盖到任务栏 / 移出屏幕）。
+    纯函数：work_area 由 zrect 计算。
+    """
+    if xy is None:
+        return None
+    x, y = xy
+    if zrect is not None and len(zrect) == 4:
+        wa = work_area_of_rect(zrect)
+        if wa is not None:
+            wl, wt, wr, wb = wa
+            x = min(max(x, wl + margin), max(wl, wr - bar_w - margin))
+            y = min(max(y, wt + margin), max(wt, wb - bar_h - margin))
+    return x, y
+
+
+# ---------------------------------------------------------------------------
+# Win32 包装（懒加载，仅在 GUI 路径初始化；--once 不依赖 Windows API）
+# ---------------------------------------------------------------------------
+
+_WIN = None
+
+
+def win():
+    global _WIN
+    if _WIN is None:
+        _WIN = _WinApi()
+    return _WIN
+
+
+class _WinApi(object):
+    def __init__(self):
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        # FindWindowW(None, 'ZCode') 精确标题
+        user32.FindWindowW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        self.find_window = user32.FindWindowW
+
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        self.get_window_rect = user32.GetWindowRect
+
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        self.is_iconic = user32.IsIconic
+
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        self.get_foreground_window = user32.GetForegroundWindow
+
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        self.get_window_thread_process_id = user32.GetWindowThreadProcessId
+
+        user32.MoveWindow.argtypes = [
+            wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.BOOL,
+        ]
+        user32.MoveWindow.restype = wintypes.BOOL
+        self.move_window = user32.MoveWindow
+
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        self.show_window = user32.ShowWindow
+
+        # 64 位：HWND_TOPMOST 必须以 c_void_p(-1) 传入
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        self.set_window_pos = user32.SetWindowPos
+
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        self.get_parent = user32.GetParent
+
+        # 64 位安全读写扩展样式（WS_EX_NOACTIVATE 用）。
+        # 64 位进程用 *LongPtrW；老 32 位进程无该符号时退回 *LongW。
+        try:
+            glp = user32.GetWindowLongPtrW
+            slp = user32.SetWindowLongPtrW
+            glp.argtypes = [wintypes.HWND, ctypes.c_int]
+            glp.restype = ctypes.c_ssize_t
+            slp.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            slp.restype = ctypes.c_ssize_t
+        except AttributeError:
+            glp = user32.GetWindowLongW
+            slp = user32.SetWindowLongW
+            glp.argtypes = [wintypes.HWND, ctypes.c_int]
+            glp.restype = ctypes.c_long
+            slp.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+            slp.restype = ctypes.c_long
+        self.get_window_long = glp
+        self.set_window_long = slp
+
+        user32.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
+        user32.MonitorFromRect.restype = wintypes.HMONITOR
+        self.monitor_from_rect = user32.MonitorFromRect
+
+        user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+        self.get_monitor_info = user32.GetMonitorInfoW
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD,
+            wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        self.open_process = kernel32.OpenProcess
+        self.get_exit_code_process = kernel32.GetExitCodeProcess
+        self.close_handle = kernel32.CloseHandle
+        self.query_full_process_image_name = kernel32.QueryFullProcessImageNameW
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def find_zcode_window():
+    """FindWindowW(None, 'ZCode') 精确标题匹配。未找到返回 0。"""
+    try:
+        return win().find_window(None, u"ZCode") or 0
+    except Exception:
+        return 0
+
+
+def window_rect_of(hwnd):
+    """返回 (left, top, right, bottom) 或 None。"""
+    try:
+        rect = wintypes.RECT()
+        if win().get_window_rect(hwnd, ctypes.byref(rect)):
+            return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception:
+        pass
+    return None
+
+
+def pid_of(hwnd):
+    """窗口所属进程 pid；失败返回 None。"""
+    try:
+        pid = wintypes.DWORD()
+        win().get_window_thread_process_id(hwnd, ctypes.byref(pid))
+        return pid.value or None
+    except Exception:
+        return None
+
+
+def process_alive(pid):
+    """pid 进程是否存活。OpenProcess 失败视为死亡（可自愈陈旧 pid 文件）。"""
+    if not pid:
+        return False
+    try:
+        h = win().open_process(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
+        if not h:
+            return False
+        code = wintypes.DWORD()
+        alive = False
+        if win().get_exit_code_process(h, ctypes.byref(code)):
+            alive = (code.value == STILL_ACTIVE)
+        win().close_handle(h)
+        return alive
+    except Exception:
+        return False
+
+
+def process_exe_path(pid):
+    """pid 进程 exe 绝对路径；失败返回 ''。"""
+    if not pid:
+        return ""
+    try:
+        h = win().open_process(PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid))
+        if not h:
+            return ""
+        buf = ctypes.create_unicode_buffer(4096)
+        size = wintypes.DWORD(len(buf))
+        win().query_full_process_image_name(h, 0, buf, ctypes.byref(size))
+        win().close_handle(h)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def is_foreground_zcode():
+    """前台窗口是否属于 ZCode 进程（pid 一致 或 exe 名匹配 ZCode.exe）。"""
+    try:
+        hz = find_zcode_window()
+        if not hz:
+            return False
+        zpid = pid_of(hz)
+        fg = win().get_foreground_window()
+        if not fg:
+            return False
+        fpid = pid_of(fg)
+        if zpid and fpid and fpid == zpid:
+            return True
+        exe = process_exe_path(fpid).replace("\\", "/").lower()
+        if exe.endswith("zcode.exe"):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_zcode_minimized():
+    try:
+        hz = find_zcode_window()
+        if not hz:
+            return False
+        return bool(win().is_iconic(hz))
+    except Exception:
+        return False
+
+
+def work_area_of_rect(zrect):
+    """zrect 所在显示器工作区 (left,top,right,bottom)；失败返回 None。"""
+    try:
+        rect = wintypes.RECT(*zrect)
+        hm = win().monitor_from_rect(ctypes.byref(rect), MONITOR_DEFAULTTONEAREST)
+        if not hm:
+            return None
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if win().get_monitor_info(hm, ctypes.byref(info)):
+            w = info.rcWork
+            return (w.left, w.top, w.right, w.bottom)
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 一次性统计（--once）
+# ---------------------------------------------------------------------------
+
+def read_stats_once(data_dir, db_path, cfg=None):
+    """读一次统计，返回 {'ok','line','source','sessionId','model','sessionLabel','line1'}；任何异常不抛。
+    line 按 cfg 的 show_* 裁剪（与状态条实际渲染一致）。"""
+    try:
+        rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
+        info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=None)
+        if info.get("stats") is not None:
+            line = stats_to_text(info["stats"], cfg or dict(DEFAULT_CONFIG))
+            if info.get("recent_note"):
+                line = line + u" " + SESSION_RECENT_NOTE
+        else:
+            line = info.get("text")
+        if line is None:
+            line = STATS_PENDING
+        return {
+            "ok": True,
+            "line": line,
+            "source": info.get("source"),
+            "sessionId": info.get("session_id"),
+            "model": info.get("model"),
+            "sessionLabel": info.get("session_label"),
+            "line1": info.get("line1") or SESSION_UNKNOWN,
+        }
+    except Exception as e:
+        return {"ok": False, "line": STATS_PENDING, "source": "error", "error": str(e)}
+
+
+def _print_utf8_line(s):
+    """强制 UTF-8 输出单行（避免 cp936 控制台编不出 ⏱/·）。"""
+    try:
+        sys.stdout.buffer.write((s + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+    except Exception:
+        try:
+            print(s)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# GUI（tkinter 懒加载；仅在非 --once 路径使用）
+# ---------------------------------------------------------------------------
+
+def _pid_file(data_dir):
+    return os.path.join(data_dir, PID_NAME)
+
+
+def _ensure_single_instance(data_dir):
+    """防多开：已有存活 pid -> SystemExit(0)；否则写入自身 pid。"""
+    os.makedirs(data_dir, exist_ok=True)
+    pidfile = _pid_file(data_dir)
+    old = None
+    try:
+        with open(pidfile, "r", encoding="ascii") as f:
+            old = f.read().strip()
+    except Exception:
+        pass
+    if old:
+        try:
+            old = int(old)
+        except Exception:
+            old = None
+        if old is not None and process_alive(old):
+            raise SystemExit(0)
+    tmp = pidfile + ".tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+        os.replace(tmp, pidfile)
+    except Exception:
+        pass
+
+
+def _cleanup_pid(data_dir):
+    pidfile = _pid_file(data_dir)
+    try:
+        with open(pidfile, "r", encoding="ascii") as f:
+            cur = f.read().strip()
+        if cur and int(cur) == os.getpid():
+            os.remove(pidfile)
+    except Exception:
+        pass
+
+
+def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
+            interval_fixed=False):
+    """interval_fixed=True 表示 refresh_ms 来自 --interval-ms 显式指定，
+    此时配置热加载的 refresh_ms 变化不再覆盖它（CLI 显式参数优先）。"""
+    import tkinter as tk  # 懒加载：GUI 路径才依赖桌面
+    import tkinter.font as tkfont  # 指标块宽度按字体实测
+
+    root = tk.Tk()
+    root.withdraw()
+    root.overrideredirect(True)
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        root.attributes("-toolwindow", True)
+    except Exception:
+        pass
+    root.configure(bg=BG)
+    root.resizable(False, False)
+    root.geometry("%dx%d+0+0" % (WINDOW_W, WINDOW_H))
+
+    # ---- 单 Canvas 绘制层（彩色指标块风：圆角块/文字/进度条全画在 Canvas 上）----
+    canvas = tk.Canvas(root, bg=BG, highlightthickness=0,
+                       width=WINDOW_W, height=WINDOW_H)
+    canvas.pack(fill="both", expand=True)
+
+    # 字体实测对象（块宽按文本实测，不拍脑袋定宽）
+    f_dim = tkfont.Font(root=root, font=FONT_DIM)
+    f_main = tkfont.Font(root=root, font=FONT_MAIN)
+    f_num = tkfont.Font(root=root, font=FONT_NUM)
+    f_icon = tkfont.Font(root=root, font=ICON_FONT)
+
+    # ---- 右键菜单 ----
+    menu = tk.Menu(root, tearoff=0, bd=0, bg=MENU_BG, fg=FG,
+                   activebackground=MENU_ACTIVE, activeforeground=FG)
+    menu.add_command(label=u"\u91cd\u65b0\u8d34\u8fb9", command=lambda: re_dock())
+    menu.add_separator()
+
+    # 「显示项」子菜单：每个 show_* 一项，checkbutton 勾选态绑定当前配置；
+    # 点击即切换 -> 立即重画 -> 原子写回 statusbar-config.json（失败只记 err 日志）。
+    show_vars = {}
+    display_menu = tk.Menu(menu, tearoff=0, bd=0, bg=MENU_BG, fg=FG,
+                           activebackground=MENU_ACTIVE, activeforeground=FG)
+    for _lbl, _key in SHOW_MENU_ITEMS:
+        _var = tk.BooleanVar(value=bool(cfg.get(_key, False)))
+        show_vars[_key] = _var
+        display_menu.add_checkbutton(
+            label=_lbl, variable=_var,
+            command=(lambda k: lambda: toggle_show(k))(_key))
+    menu.add_cascade(label=u"\u663e\u793a\u9879", menu=display_menu)
+    menu.add_separator()
+    menu.add_command(label=u"\u9000\u51fa statusbar", command=lambda: quit_app())
+
+    def on_right_click(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # 右键菜单绑到 Canvas（全区域可呼出）
+    canvas.bind("<Button-3>", on_right_click)
+
+    def quit_app():
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        _cleanup_pid(data_dir)
+        sys.exit(0)
+
+    def on_close():
+        quit_app()
+
+    # close「×」小块改由 Canvas 绘制并按 tag 绑定（见 _draw_close）
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    try:
+        root.update_idletasks()
+    except Exception:
+        pass
+
+    # 取窗口原生 hwnd：tk 顶层由 winfo_id 的父级承载（已核实）
+    try:
+        wid = root.winfo_id()
+        hwnd = win().get_parent(wid) or wid
+    except Exception:
+        hwnd = None
+
+    if hwnd:
+        # 不抢焦点：加 WS_EX_NOACTIVATE，鼠标点击小条不会把前台抢成
+        # pythonw（否则前台判定误判 -> 小条自隐藏/拖动被打断）。
+        try:
+            style = win().get_window_long(hwnd, GWL_EXSTYLE)
+            win().set_window_long(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+        except Exception:
+            pass
+        try:
+            win().set_window_pos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+        except Exception:
+            pass
+
+    state = {
+        "shown": False,
+        "last_xy": None,          # 最近一次贴边 MoveWindow 的目标（仅贴边用）
+        "last_info": None,
+        "db_read_count": 0,
+        "last_mark_sid": None,
+        # ---- 配置热加载 ----
+        "cfg_mtime": None,        # statusbar-config.json 上次读取的 mtime
+        "refresh_ms": refresh_ms, # 当前生效刷新间隔（热加载可更新）
+        # ---- 拖动状态（与贴边 last_xy 互相独立，互不污染）----
+        "dragging": False,        # 正在拖动（按下->释放）
+        "drag_offset": None,      # (x_root - winfo_rootx, y_root - winfo_rooty)
+        "manual_position": False, # 拖动过 -> poll 跳过吸回
+        "manual_xy": None,        # 拖动后的稳定位置（供 re_dock 前保持）
+        "close_box": None,        # close 小块的 Canvas 坐标（拖动按下时排除）
+    }
+
+    # 记录配置文件初始 mtime（热加载基线；文件暂不存在为 None）
+    try:
+        state["cfg_mtime"] = os.path.getmtime(config_path)
+    except Exception:
+        state["cfg_mtime"] = None
+
+    def _after(ms, fn):
+        """root.after 包装：回调异常写 err 日志后继续，绝不断刷新/轮询循环。"""
+        def _wrapped():
+            try:
+                fn()
+            except Exception:
+                try:
+                    _log_err(data_dir, "statusbar after-callback error:\n%s"
+                             % traceback.format_exc())
+                except Exception:
+                    pass
+        try:
+            root.after(ms, _wrapped)
+        except Exception:
+            pass
+
+    # ---- tooltip（单一全局 toplevel 复用，跟随鼠标）----
+    tip = None
+    tip_after_id = None
+
+    def _ensure_tip():
+        nonlocal tip
+        if tip is None:
+            try:
+                tip = tk.Toplevel(root)
+                tip.withdraw()
+                tip.overrideredirect(True)
+                try:
+                    tip.attributes("-topmost", True)
+                except Exception:
+                    pass
+                tip.configure(bg=BG_SECOND)
+                tip_lbl = tk.Label(
+                    tip, text="", bg=BG_SECOND, fg=FG, font=FONT_DIM,
+                    anchor="w", justify="left",
+                    padx=8, pady=5, wraplength=380,
+                )
+                tip_lbl.pack()
+                tip.tip_lbl = tip_lbl
+            except Exception:
+                tip = None
+        return tip
+
+    def _tip_visible():
+        try:
+            return tip is not None and tip.winfo_ismapped()
+        except Exception:
+            return False
+
+    def show_tooltip(text, x, y):
+        """在 (x, y) 附近显示 tooltip（按小条所在显示器工作区夹紧；失败退回主屏）。"""
+        t = _ensure_tip()
+        if t is None:
+            return
+        try:
+            t.tip_lbl.config(text=text)
+            t.update_idletasks()
+            tw = t.winfo_reqwidth()
+            th = t.winfo_reqheight()
+            wl = wt = 0
+            wr = t.winfo_screenwidth()
+            wb = t.winfo_screenheight()
+            if hwnd:
+                rect = window_rect_of(hwnd)
+                if rect:
+                    wa = work_area_of_rect(rect)
+                    if wa:
+                        wl, wt, wr, wb = wa
+            tx = min(x + 12, max(wl, wr - tw - 4))
+            ty = min(y + 14, max(wt, wb - th - 4))
+            t.geometry("+%d+%d" % (tx, ty))
+            t.deiconify()
+            t.lift()
+        except Exception:
+            pass
+
+    def hide_tooltip():
+        try:
+            if tip is not None:
+                tip.withdraw()
+        except Exception:
+            pass
+
+    def tooltip_enter(text):
+        """悬停进入：延时 ~400ms 后显示（避免乱闪）。"""
+        nonlocal tip_after_id
+        try:
+            if tip_after_id is not None:
+                root.after_cancel(tip_after_id)
+        except Exception:
+            pass
+        try:
+            tip_after_id = root.after(400, lambda: _show_tip_at_pointer(text))
+        except Exception:
+            tip_after_id = None
+
+    def _show_tip_at_pointer(text):
+        try:
+            show_tooltip(text, root.winfo_pointerx(), root.winfo_pointery())
+        except Exception:
+            pass
+
+    def tooltip_leave():
+        """悬停离开：立即隐藏并取消延时任务。"""
+        nonlocal tip_after_id
+        try:
+            if tip_after_id is not None:
+                root.after_cancel(tip_after_id)
+                tip_after_id = None
+        except Exception:
+            pass
+        hide_tooltip()
+
+    def bind_hover(tag, tip_text, rect_id=None, base_fill=None, hover_fill=None):
+        """Canvas tag 级悬停：块背景高亮 + tooltip（延时显示/跟随/离开隐藏）。"""
+        def enter(_e):
+            if rect_id is not None and hover_fill is not None:
+                try:
+                    canvas.itemconfigure(rect_id, fill=hover_fill)
+                except Exception:
+                    pass
+            if tip_text:
+                tooltip_enter(tip_text)
+
+        def leave(_e):
+            if rect_id is not None and base_fill is not None:
+                try:
+                    canvas.itemconfigure(rect_id, fill=base_fill)
+                except Exception:
+                    pass
+            tooltip_leave()
+
+        def motion(e):
+            if tip_text and _tip_visible():
+                show_tooltip(tip_text, e.x_root, e.y_root)
+
+        canvas.tag_bind(tag, "<Enter>", enter)
+        canvas.tag_bind(tag, "<Leave>", leave)
+        canvas.tag_bind(tag, "<Motion>", motion)
+
+    def _draw_close():
+        """右上「×」close 小块（圆角底 + hover 红 + 点击退出；每次重画时重建）。"""
+        cw, ch = 24, 16
+        x1 = WINDOW_W - 10
+        x0 = x1 - cw
+        y0, y1 = 4, 4 + ch
+        rect = round_rect(canvas, x0, y0, x1, y1, 5, fill=BG_SECOND, outline="")
+        ctxt = canvas.create_text((x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                                  text=u"\u00d7", font=FONT_CLOSE,
+                                  fill=FG_DIM, tags=("close",))
+        state["close_box"] = (x0, y0, x1, y1)
+
+        def enter(_e):
+            try:
+                canvas.itemconfigure(rect, fill=CLOSE_HOVER_BG)
+                canvas.itemconfigure(ctxt, fill=CLOSE_HOVER_FG)
+            except Exception:
+                pass
+
+        def leave(_e):
+            try:
+                canvas.itemconfigure(rect, fill=BG_SECOND)
+                canvas.itemconfigure(ctxt, fill=FG_DIM)
+            except Exception:
+                pass
+
+        canvas.tag_bind("close", "<Enter>", enter)
+        canvas.tag_bind("close", "<Leave>", leave)
+
+        def on_click(_e):
+            quit_app()
+            return "break"   # 阻断 Canvas 级拖动绑定
+
+        canvas.tag_bind("close", "<Button-1>", on_click)
+
+    def render_ui(info):
+        """整幅重画（同一回调内 delete+create，Tk 单次刷帧无闪烁）：
+        顶部 1px 分隔线 + 第一行（●模型 会话）+ close 小块 + 第二行彩色指标块。"""
+        canvas.delete("all")
+        # 顶部 1px 分隔线（提质感）
+        canvas.create_rectangle(0, 0, WINDOW_W, 1, fill=EDGE_LINE, outline="")
+
+        # ---- 第一行：● 模型（蓝）+ 会话标题（灰）----
+        show_m = cfg.get("show_model", True)
+        show_s = cfg.get("show_session", True)
+        model = info.get("model")
+        label = info.get("session_label")
+        x = 12
+        has_any = False
+        if show_m and model:
+            has_any = True
+            canvas.create_oval(x, ROW1_CY - 3, x + 6, ROW1_CY + 3,
+                               fill=ACCENT_BLUE, outline="")
+            x += 10
+            mtxt = _truncate(model, 20) or "model?"
+            canvas.create_text(x, ROW1_CY, text=mtxt, font=FONT_DIM,
+                               fill=ACCENT_BLUE, anchor="w", tags=("m_model",))
+            x += f_dim.measure(mtxt) + 8
+        if show_s and label:
+            has_any = True
+            canvas.create_text(x, ROW1_CY, text=label, font=FONT_DIM,
+                               fill=FG_DIM, anchor="w", tags=("m_sess",))
+        if not has_any:
+            # fail-closed：第一行无内容 -> 会话未识别占位（与旧口径一致）
+            canvas.create_text(12, ROW1_CY, text=SESSION_UNKNOWN,
+                               font=FONT_DIM, fill=FG_DIM, anchor="w")
+        if show_m and model:
+            bind_hover("m_model", u"\u6a21\u578b\uff1a%s" % model)
+        if show_s and label:
+            bind_hover("m_sess", u"\u4f1a\u8bdd\uff1a%s" % label)
+
+        # ---- 右上 close 小块 ----
+        _draw_close()
+
+        # ---- 第二行：彩色指标块（关掉的块不画、不留空位）----
+        blocks = build_metric_blocks(info.get("stats"), cfg)
+        x = 10
+        avail = WINDOW_W - 44   # 右侧给 close 小块留位
+        for blk in blocks:
+            if blk["kind"] == "pending":
+                # 无数据 / 显示项全关：单块灰字占位（fail-closed 文案）
+                txt = blk["text"]
+                w = f_main.measure(txt) + BLOCK_PAD * 2
+                round_rect(canvas, x, ROW2_Y, x + w, ROW2_Y + BLOCK_H, 6,
+                           fill=BLOCK_BG, outline="")
+                canvas.create_text(x + BLOCK_PAD, ROW2_Y + BLOCK_H / 2.0,
+                                   text=txt, font=FONT_MAIN, fill=FG_DIM,
+                                   anchor="w")
+                x += w + BLOCK_GAP
+                continue
+            icon_w = f_icon.measure(blk["icon"])
+            label_w = f_main.measure(blk["label"])
+            value_w = f_num.measure(blk["value"])
+            w = BLOCK_PAD * 2 + icon_w + 5 + label_w + 5 + value_w
+            if x + w > avail:
+                break   # 窗口固定宽：放不下的尾部块整块不画
+            y0, y1 = ROW2_Y, ROW2_Y + BLOCK_H
+            tag = "blk_" + blk["kind"]
+            rect = round_rect(canvas, x, y0, x + w, y1, 6,
+                              fill=BLOCK_BG, outline="")
+            has_bar = blk.get("progress") is not None
+            ty = y0 + 11 if has_bar else (y0 + y1) / 2.0
+            tx = x + BLOCK_PAD
+            canvas.create_text(tx, ty, text=blk["icon"], font=ICON_FONT,
+                               fill=blk["icon_color"], anchor="w", tags=(tag,))
+            tx += icon_w + 5
+            canvas.create_text(tx, ty, text=blk["label"], font=FONT_MAIN,
+                               fill=FG_DIM, anchor="w", tags=(tag,))
+            tx += label_w + 5
+            canvas.create_text(tx, ty, text=blk["value"], font=FONT_NUM,
+                               fill=blk["value_color"], anchor="w", tags=(tag,))
+            if has_bar:
+                pct = max(0.0, min(100.0, float(blk["progress"])))
+                bx, by = x + BLOCK_PAD, y0 + 19
+                canvas.create_rectangle(bx, by, bx + BAR_W, by + BAR_H,
+                                        fill=BAR_SLOT, outline="", tags=(tag,))
+                fillw = int(round(BAR_W * pct / 100.0))
+                if fillw >= 1:
+                    bar_color = BAR_FILL_HI if pct > 70.0 else BAR_FILL
+                    canvas.create_rectangle(bx, by, bx + fillw, by + BAR_H,
+                                            fill=bar_color, outline="",
+                                            tags=(tag,))
+            bind_hover(tag, blk.get("tip"), rect, BLOCK_BG, BLOCK_HOVER)
+            x += w + BLOCK_GAP
+        # jsonl 兜底判定的会话：块行尾灰字标注（与 --once 一致）
+        if info.get("stats") and info.get("recent_note"):
+            canvas.create_text(x + 2, ROW2_Y + BLOCK_H / 2.0,
+                               text=SESSION_RECENT_NOTE, font=FONT_DIM,
+                               fill=FG_DIM, anchor="w")
+
+    def current_window_xy():
+        """取小条当前屏幕坐标 (x, y)；失败返回 None。"""
+        try:
+            if not hwnd:
+                return None
+            wid = root.winfo_id()
+            child_hwnd = win().get_parent(wid) or wid
+            if not child_hwnd:
+                return None
+            rect = wintypes.RECT()
+            if win().get_window_rect(child_hwnd, ctypes.byref(rect)):
+                return rect.left, rect.top
+        except Exception:
+            pass
+        return None
+
+    def drag_start(event):
+        """按下：记录指针与窗口左上角固定偏移，进入拖动状态。"""
+        if state.get("dragging"):
+            return
+        # close 小块上的按下走退出逻辑，不进入拖动
+        cb = state.get("close_box")
+        if cb and cb[0] <= event.x <= cb[2] and cb[1] <= event.y <= cb[3]:
+            return
+        xy = current_window_xy()
+        if xy is None:
+            return
+        state["dragging"] = True
+        state["drag_offset"] = (event.x_root - xy[0], event.y_root - xy[1])
+
+    def drag_move(event):
+        """按住左键拖动：窗口 geometry 跟随指针（保持按下时偏移）。
+
+        目标坐标先经 clamp_to_work_area 钳到所在显示器工作区内
+        （以目标位置构造伪矩形定显示器），防止拖出屏幕无法自救。
+        """
+        if not state.get("dragging"):
+            return
+        off = state.get("drag_offset")
+        if not off:
+            return
+        ox, oy = off
+        new_x = event.x_root - ox
+        new_y = event.y_root - oy
+        pseudo = (new_x, new_y, new_x + WINDOW_W, new_y + WINDOW_H)
+        clamped = clamp_to_work_area((new_x, new_y), WINDOW_W, WINDOW_H, pseudo)
+        if clamped:
+            new_x, new_y = clamped
+        try:
+            if hwnd:
+                win().move_window(hwnd, new_x, new_y, WINDOW_W, WINDOW_H, True)
+        except Exception:
+            return
+        state["manual_xy"] = (new_x, new_y)
+
+    def drag_stop(event):
+        """释放：结束拖动，标记手动定位（poll 不再吸回），记录稳定位置。"""
+        if not state.get("dragging"):
+            return
+        state["dragging"] = False
+        state["drag_offset"] = None
+        state["manual_position"] = True
+        try:
+            xy = current_window_xy()
+            if xy is not None:
+                state["manual_xy"] = xy
+        except Exception:
+            pass
+
+    def re_dock():
+        """重新贴边：清除手动定位标志，让 poll 下一拍把小条吸回 ZCode 底部。"""
+        state["manual_position"] = False
+        state["manual_xy"] = None
+        state["last_xy"] = None
+
+    def toggle_show(key):
+        """右键「显示项」开关：更新内存配置 -> 立即重画 -> 原子写回配置文件。
+        写回失败不崩（save_config_show_keys 内已记 err 日志）；重画失败也只记日志。"""
+        try:
+            val = bool(show_vars[key].get())
+        except Exception:
+            return
+        cfg[key] = val
+        save_config_show_keys(config_path, cfg, data_dir)
+        # 立即重画（不等下一拍刷新）；启动早期 last_info 可能仍是全 None dict
+        try:
+            render_ui(state.get("last_info") or {
+                "text": None, "line1": None, "session_id": None,
+                "model": None, "session_label": None, "stats": None})
+        except Exception:
+            try:
+                _log_err(data_dir, "render after toggle_show error:\n%s"
+                         % traceback.format_exc())
+            except Exception:
+                pass
+        # 写回后 mtime 已变：同步热加载基线，避免下一拍重读同值文件
+        try:
+            state["cfg_mtime"] = os.path.getmtime(config_path)
+        except Exception:
+            pass
+
+    # 拖动绑到 Canvas 全区域（含两行文字与各指标块；close 小块在 drag_start 内排除）
+    canvas.bind("<ButtonPress-1>", drag_start)
+    canvas.bind("<B1-Motion>", drag_move)
+    canvas.bind("<ButtonRelease-1>", drag_stop)
+
+    def refresh_stats():
+        line_fallback = STATS_PENDING
+        info = {"text": None, "line1": None, "session_id": None,
+                "model": None, "session_label": None, "stats": None}
+        try:
+            # 配置热加载：mtime 变化则重读（坏 JSON 保留当前配置 + err 日志一行）
+            state["cfg_mtime"] = hot_reload_config(
+                cfg, config_path, data_dir, state.get("cfg_mtime"))
+            if not interval_fixed:
+                try:
+                    state["refresh_ms"] = max(
+                        int(cfg.get("refresh_ms", REFRESH_MS_DEFAULT)), 200)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
+            mark_sid = read_mark_file(data_dir)
+            mark_changed = state.get("last_mark_sid") != mark_sid
+            state["last_mark_sid"] = mark_sid
+            force_db = (state["last_info"] is None
+                        or mark_changed
+                        or state["db_read_count"] == 0)
+            cur_cache = None if force_db else state["last_info"]
+            info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=cur_cache)
+            if info.get("line2") is not None:
+                line_fallback = info["line2"]
+        except Exception:
+            pass
+        state["last_info"] = info
+        state["db_read_count"] += 1
+        if state["db_read_count"] >= DB_READ_INTERVAL:
+            state["db_read_count"] = 0
+        try:
+            render_ui(info)
+        except Exception:
+            # 渲染层异常落 err 日志（pythonw 无 console，静默空白无法诊断）
+            try:
+                _log_err(data_dir, "render_ui error:\n%s" % traceback.format_exc())
+            except Exception:
+                pass
+        _after(state.get("refresh_ms", refresh_ms), refresh_stats)
+
+    def set_visible(show):
+        if not hwnd:
+            return
+        if show == state["shown"]:
+            return
+        state["shown"] = show
+        try:
+            if show:
+                win().show_window(hwnd, SW_SHOWNOACTIVATE)
+            else:
+                win().show_window(hwnd, SW_HIDE)
+        except Exception:
+            pass
+
+    def poll():
+        if not hwnd:
+            _after(state.get("refresh_ms", refresh_ms), poll)
+            return
+        try:
+            # 正在拖动：跳过前台/最小化/找窗等全部隐藏判定（拖动中绝不
+            # withdraw，否则拖动会被自隐藏打断），也不贴边 MoveWindow；
+            # 释放后恢复完整显隐判定 + manual_position 接管停靠位置。
+            if state.get("dragging"):
+                set_visible(True)
+                return
+            hz = find_zcode_window()
+            if not hz:
+                set_visible(False)
+                return
+            if win().is_iconic(hz):          # 最小化 -> 隐藏
+                set_visible(False)
+                return
+            if not is_foreground_zcode():    # 前台非 ZCode -> 隐藏
+                set_visible(False)
+                return
+            zrect = window_rect_of(hz)
+            if zrect is None:
+                set_visible(False)
+                return
+            # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回
+            # （仍受前台/最小化显示逻辑控制）。
+            if state.get("manual_position"):
+                set_visible(True)
+                return
+            xy = dock_rect(zrect, WINDOW_W, WINDOW_H)
+            xy = clamp_to_work_area(xy, WINDOW_W, WINDOW_H, zrect)
+            if xy is None:
+                set_visible(False)
+                return
+            if xy != state["last_xy"]:
+                win().move_window(hwnd, xy[0], xy[1], WINDOW_W, WINDOW_H, True)
+                state["last_xy"] = xy
+            set_visible(True)
+        except Exception:
+            # 任何异常只隐藏或保持现状，绝不让小条抢焦点、绝不弹错
+            try:
+                set_visible(False)
+            except Exception:
+                pass
+        finally:
+            _after(state.get("refresh_ms", refresh_ms), poll)
+
+    try:
+        refresh_stats()       # 启动即有一行内容，不干等 1 秒
+    except Exception:
+        pass
+    try:
+        _after(state.get("refresh_ms", refresh_ms), poll)
+    except Exception:
+        pass
+    try:
+        root.mainloop()
+    finally:
+        _cleanup_pid(data_dir)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="ZCode token-stats 智能贴边底部状态条",
+    )
+    ap.add_argument("--data-dir", default=None,
+                    help="override data dir (default plugin data dir)")
+    ap.add_argument("--db-path", default=None,
+                    help="override db.sqlite path (default cli/db/db.sqlite)")
+    ap.add_argument("--interval-ms", type=int, default=None,
+                    help="refresh/poll interval in ms (default: config refresh_ms, else 1000)")
+    ap.add_argument("--config", default=None,
+                    help="override statusbar-config.json path "
+                         "(default <data-dir>/statusbar-config.json)")
+    ap.add_argument("--once", action="store_true",
+                    help="read stats once, print one JSON line, exit; no window")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    data_dir = args.data_dir or DATA_DIR_DEFAULT
+    # 注：ZCODE_PLUGIN_DATA 不参与解析——钩子环境下该变量指向另一套空目录
+    # （data/zcode-token-stats@local/），曾导致与钩子读写分叉。
+    db_path = args.db_path or DB_DEFAULT
+
+    # 配置读取（--config 覆盖；默认 <data-dir>/statusbar-config.json，缺省自动生成）
+    config_path = args.config
+    if not config_path:
+        config_path = os.path.join(data_dir, CONFIG_FILE_NAME)
+    cfg, _cfg_src = load_config(config_path)
+
+    # 刷新间隔优先级：--interval-ms 显式 > 配置 refresh_ms > 默认 1000
+    if args.interval_ms is not None:
+        refresh_ms = max(int(args.interval_ms), 200)
+    else:
+        refresh_ms = max(int(cfg.get("refresh_ms", REFRESH_MS_DEFAULT)), 200)
+
+    if args.once:
+        payload = read_stats_once(data_dir, db_path, cfg=cfg)
+        _print_utf8_line(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    if not os.path.isdir(data_dir):
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+        except Exception:
+            pass
+    # 防多开（已有存活实例 -> 直接退出）
+    try:
+        _ensure_single_instance(data_dir)
+    except SystemExit:
+        return 0
+    try:
+        return run_gui(data_dir, db_path, refresh_ms, cfg,
+                       config_path=config_path,
+                       interval_fixed=(args.interval_ms is not None))
+    except Exception as e:
+        # GUI 初始化失败（无桌面/tkinter 缺失等）：绝不让钩子失败，
+        # 清 pid 并把 traceback 落到数据目录 err 日志（pythonw 无 console，
+        # 静默退出曾让崩溃无法诊断），再退出 0。
+        try:
+            _cleanup_pid(data_dir)
+        except Exception:
+            pass
+        try:
+            _log_err(data_dir, "docked_statusbar GUI init failed: %r\n%s"
+                     % (e, traceback.format_exc()))
+        except Exception:
+            pass
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

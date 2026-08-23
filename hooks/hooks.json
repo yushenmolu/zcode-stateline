@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/on-stop.cmd\" \"${CLAUDE_SESSION_ID}\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/mark-session.cmd\" \"${CLAUDE_SESSION_ID}\"",
+            "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/inject-context.cmd\" session-start",
+            "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/ensure-docked-statusbar.cmd\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/mark-session.cmd\" \"${CLAUDE_SESSION_ID}\"",
+            "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/inject-context.cmd\" user-prompt-submit \"${CLAUDE_SESSION_ID}\"",
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

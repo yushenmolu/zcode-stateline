@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plugin runtime data (generated on the user's machine; never commit)
+token-stats.jsonl
+current-session.json
+state.json
+statusbar.pid
+statusbar-config.json
+env.json
+
+# Local install backups made by install.cmd / uninstall.cmd
+*.bak-*
+
+# Misc test artifacts
+ab-open.log
