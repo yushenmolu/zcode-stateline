@@ -50,7 +50,7 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
     单一全局 toplevel，只改文本，避免反复建窗口。指标块悬停同时高亮块
     背景（#1b1e24 -> #262b33）。
   - UI 主题（彩色指标块风，暗色，AA/WCAG 对比度）：
-      窗口 620x56，底色 #14161a + 顶部 1px 分隔线 #2a2f38。
+      窗口宽自适应内容（基准 620，见 plan_statusbar_layout），底色 #14161a + 顶部 1px 分隔线 #2a2f38。
       第一行（信息行，~20px）：左侧蓝色小圆点（#4f9cf7）+ 模型名（亮蓝
       #4f9cf7）+ 会话标题（灰 #9aa1aa），右端「×」close 小块（hover 红
       #e5534b + 白字）。
@@ -117,7 +117,8 @@ STATS_PENDING = u"\uff08\u672c\u8f6e\u7ed3\u675f\u540e\u66f4\u65b0\uff09"  # （
 SESSION_UNKNOWN = u"\uff08\u4f1a\u8bdd\u672a\u8bc6\u522b\uff0c\u5f85\u9996\u8f6e\u6d3b\u52a8\uff09"  # （会话未识别，待首轮活动）
 SESSION_RECENT_NOTE = u"\uff08\u6700\u8fd1\u4f1a\u8bdd\u7d2f\u8ba1\uff09"  # （最近会话累计）——jsonl 兜底判定时的标注
 
-WINDOW_W = 620        # 状态条宽度（固定；指标块从左排布，放不下的尾部块不画）
+WINDOW_W = 620        # 状态条基准宽度（初始 geometry；实际宽度按内容自适应，
+                      # 见 plan_statusbar_layout —— 指标块永不因宽度丢块）
 WINDOW_H = 56         # 状态条高度（1px 顶线 + 信息行 ~20px + 指标行 ~30px）
 MARGIN = 6            # 贴边留白
 REFRESH_MS_DEFAULT = 1000  # 数据刷新 / 贴边/前台轮询（用户要求默认 1000ms）
@@ -153,6 +154,12 @@ BAR_W, BAR_H = 60, 4     # 命中率微型进度条尺寸
 BAR_SLOT = "#2a2f38"     # 进度条槽色
 BAR_FILL = "#3fb68b"     # 进度条填充色（命中率 <=70%）
 BAR_FILL_HI = "#5dd6a8"  # 进度条填充色（命中率 >70%，更亮绿）
+
+# ---- 自适应宽度（窗口宽按内容实测伸缩；指标块永不因宽度丢块）----
+LABEL_MAX_STEPS = (16, 12, 10, 8, 6, 4)  # 会话标题截断上限档位（超宽时优先收紧）
+GAP_STEPS = (8, 6, 4)                    # 块间距收缩档位（其次；起步 8 = BLOCK_GAP）
+CLOSE_RESERVE_W = 34                     # 右上 close 小块预留宽（24 块宽 + 10 右边距）
+WIDTH_HYSTERESIS = 8                     # 宽度变化 <8px 不更新 geometry（防数字跳动闪烁）
 ICON_FONT = ("Segoe UI Symbol", 10)  # 块左侧彩色标识字形（Windows 自带符号字体）
 ICON_DUR = u"\u25f7"     # ◷ 耗时
 ICON_IN = u"\u25b8"      # ▸ in
@@ -1005,6 +1012,75 @@ def build_metric_blocks(stats, cfg):
     return blocks
 
 
+def compute_block_widths(blocks, measure_icon, measure_label, measure_value):
+    """
+    实测各指标块单块宽度（像素，不含块间 gap；纯数据层，可独立单测）。
+    measure_* 为 callable(text)->px：GUI 用 tkinter.font.Font.measure，
+    测试可用 lambda t: len(t)*N 桩。
+    """
+    ws = []
+    for blk in blocks:
+        if blk.get("kind") == "pending":
+            ws.append(measure_label(blk["text"]) + BLOCK_PAD * 2)
+        else:
+            ws.append(BLOCK_PAD * 2 + measure_icon(blk["icon"]) + 5
+                      + measure_label(blk["label"]) + 5
+                      + measure_value(blk["value"]))
+    return ws
+
+
+def plan_statusbar_layout(block_ws, row1_w_fn, note_w, work_w,
+                          close_w=CLOSE_RESERVE_W, pad_l=12, pad_r=10):
+    """
+    决定状态条自适应布局（纯函数；宽度全部由调用方实测后传入，可独立单测）。
+
+    入参：
+      block_ws:  第二行各指标块单块宽度列表（顺序即渲染顺序；长度 = 块数）
+      row1_w_fn: row1_w_fn(label_max) -> 第一行内容宽（按「标题截到
+                 label_max」实测；label_max 取 LABEL_MAX_STEPS 档位）
+      note_w:    「（最近会话累计）」标注宽（无标注传 0）
+      work_w:    窗口宽上限（所在显示器工作区宽 - 16px）
+
+    返回 {win_w, label_max, gap, show_note, n_blocks, blocks_row_w}。
+
+    不变量（优先级高于美观，绝不违反）：
+      - n_blocks 恒等于 len(block_ws)：指标块（含 cache read）任何情况都
+        完整渲染，布局层永不因宽度丢块（旧版「放不下整块不画」已废除）；
+      - 超上限时的收缩优先级：截短会话标题 -> 缩块间距（8/6/4）->
+        省略「（最近会话累计）」标注（最后手段）；
+      - win_w 恒 <= work_w（极端小屏全档位仍超时钳到上限，块仍全部渲染）。
+    """
+    n = len(block_ws)
+    blocks_base = sum(block_ws)
+    # 收缩候选序列（妥协程度递增；第一个放得下的即胜出）：
+    # 1) 优先截短标题（16→12→10→8→6→4，间距/标注不动）；
+    # 2) 再缩块间距（6→4，标题保持最短档）；
+    # 3) 最后省略「（最近会话累计）」标注。
+    candidates = [(lm, GAP_STEPS[0], True) for lm in LABEL_MAX_STEPS]
+    candidates += [(LABEL_MAX_STEPS[-1], gap, True) for gap in GAP_STEPS[1:]]
+    candidates.append((LABEL_MAX_STEPS[-1], GAP_STEPS[-1], False))
+    for lm, gap, show_note in candidates:
+        if show_note and note_w <= 0:
+            continue
+        blocks_row_w = blocks_base + gap * max(n - 1, 0)
+        note_extra = (gap + 2 + note_w) if show_note else 0
+        row2_w = pad_l + blocks_row_w + note_extra + pad_r
+        win_w = max(row1_w_fn(lm), row2_w) + close_w
+        if win_w <= work_w:
+            return {"win_w": win_w, "label_max": lm, "gap": gap,
+                    "show_note": show_note, "n_blocks": n,
+                    "blocks_row_w": blocks_row_w}
+    # 全档位仍超上限（极端小屏）：最紧凑档（最短标题 + 最小间距 + 省标注），
+    # win_w 钳到上限；块仍全部渲染（物理上才可能溢出，逻辑上永不丢块）。
+    gap = GAP_STEPS[-1]
+    lm = LABEL_MAX_STEPS[-1]
+    blocks_row_w = blocks_base + gap * max(n - 1, 0)
+    row2_w = pad_l + blocks_row_w + pad_r
+    win_w = min(max(row1_w_fn(lm), row2_w) + close_w, work_w)
+    return {"win_w": win_w, "label_max": lm, "gap": gap,
+            "show_note": False, "n_blocks": n, "blocks_row_w": blocks_row_w}
+
+
 def round_rect(cv, x0, y0, x1, y1, radius=6, **kwargs):
     """近似圆角矩形（tkinter 无原生圆角：create_polygon + smooth=True）。"""
     r = min(radius, (x1 - x0) / 2.0, (y1 - y0) / 2.0)
@@ -1488,6 +1564,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "last_info": None,
         "db_read_count": 0,
         "last_mark_sid": None,
+        "cur_w": WINDOW_W,        # 当前生效窗口宽（自适应 + 防抖后的值）
         # ---- 配置热加载 ----
         "cfg_mtime": None,        # statusbar-config.json 上次读取的 mtime
         "refresh_ms": refresh_ms, # 当前生效刷新间隔（热加载可更新）
@@ -1645,10 +1722,11 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         canvas.tag_bind(tag, "<Leave>", leave)
         canvas.tag_bind(tag, "<Motion>", motion)
 
-    def _draw_close():
-        """右上「×」close 小块（圆角底 + hover 红 + 点击退出；每次重画时重建）。"""
+    def _draw_close(win_w):
+        """右上「×」close 小块（圆角底 + hover 红 + 点击退出；每次重画时重建）。
+        win_w 为本帧生效窗口宽（自适应）。"""
         cw, ch = 24, 16
-        x1 = WINDOW_W - 10
+        x1 = win_w - 10
         x0 = x1 - cw
         y0, y1 = 4, 4 + ch
         rect = round_rect(canvas, x0, y0, x1, y1, 5, fill=BG_SECOND, outline="")
@@ -1680,33 +1758,104 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
         canvas.tag_bind("close", "<Button-1>", on_click)
 
+    def _avail_work_w():
+        """窗口宽上限 = 所在显示器工作区宽 - 16px；取不到工作区退回屏幕宽。"""
+        try:
+            if hwnd:
+                rect = window_rect_of(hwnd)
+                if rect:
+                    wa = work_area_of_rect(rect)
+                    if wa and wa[2] > wa[0]:
+                        return (wa[2] - wa[0]) - 16
+        except Exception:
+            pass
+        try:
+            return root.winfo_screenwidth() - 16
+        except Exception:
+            return WINDOW_W
+
+    def _apply_width(new_w):
+        """窗口宽自适应落地（带 ±WIDTH_HYSTERESIS 防抖）：
+        - 变化小于阈值 -> 保持当前宽（数字位数跳动不引起窗口频繁缩放闪烁）；
+        - 拖动中 -> 不改尺寸（避免干扰拖动；释放后下一拍渲染补上）；
+        - 生效时只改宽度、保持左上角不动（贴边模式 poll 下一拍按新宽重新居中，
+          手动定位模式位置完全不受影响）。
+        返回本帧实际生效宽度（防抖后可能与 new_w 不同，渲染以返回值为准）。"""
+        cur = state.get("cur_w") or WINDOW_W
+        if abs(new_w - cur) < WIDTH_HYSTERESIS:
+            return cur
+        if state.get("dragging"):
+            return cur
+        state["cur_w"] = new_w
+        try:
+            canvas.config(width=new_w)
+        except Exception:
+            pass
+        try:
+            if hwnd:
+                xy = current_window_xy()
+                if xy:
+                    win().move_window(hwnd, xy[0], xy[1], new_w, WINDOW_H, True)
+            else:
+                root.geometry("%dx%d+0+0" % (new_w, WINDOW_H))
+        except Exception:
+            pass
+        return new_w
+
     def render_ui(info):
         """整幅重画（同一回调内 delete+create，Tk 单次刷帧无闪烁）：
-        顶部 1px 分隔线 + 第一行（●模型 会话）+ close 小块 + 第二行彩色指标块。"""
+        顶部 1px 分隔线 + 第一行（●模型 会话）+ close 小块 + 第二行彩色指标块。
+        窗口宽按内容自适应（plan_statusbar_layout）：指标块（含 cache read）
+        永不因宽度丢块，超上限时依次收标题 -> 缩间距 -> 省累计标注。"""
         canvas.delete("all")
-        # 顶部 1px 分隔线（提质感）
-        canvas.create_rectangle(0, 0, WINDOW_W, 1, fill=EDGE_LINE, outline="")
-
-        # ---- 第一行：● 模型（蓝）+ 会话标题（灰）----
         show_m = cfg.get("show_model", True)
         show_s = cfg.get("show_session", True)
         model = info.get("model")
         label = info.get("session_label")
+        mtxt = (_truncate(model, 20) or "model?") if (show_m and model) else None
+
+        # ---- 先实测、后布局：块宽/标注宽/第一行宽（tkinter.font 实测）----
+        blocks = build_metric_blocks(info.get("stats"), cfg)
+        block_ws = compute_block_widths(
+            blocks,
+            lambda t: f_icon.measure(t),
+            lambda t: f_main.measure(t),
+            lambda t: f_num.measure(t))
+        has_note = bool(info.get("stats") and info.get("recent_note"))
+        note_w = f_dim.measure(SESSION_RECENT_NOTE) if has_note else 0
+
+        def _row1_w(lm):
+            w = 12
+            if mtxt:
+                w += 10 + f_dim.measure(mtxt) + 8
+            if show_s and label:
+                w += f_dim.measure(_truncate(label, lm) or u"")
+            return w
+
+        plan = plan_statusbar_layout(block_ws, _row1_w, note_w,
+                                     _avail_work_w())
+        win_w = _apply_width(plan["win_w"])
+        gap = plan["gap"]
+
+        # 顶部 1px 分隔线（提质感）
+        canvas.create_rectangle(0, 0, win_w, 1, fill=EDGE_LINE, outline="")
+
+        # ---- 第一行：● 模型（蓝）+ 会话标题（灰，按布局档位截断）----
         x = 12
         has_any = False
-        if show_m and model:
+        if mtxt:
             has_any = True
             canvas.create_oval(x, ROW1_CY - 3, x + 6, ROW1_CY + 3,
                                fill=ACCENT_BLUE, outline="")
             x += 10
-            mtxt = _truncate(model, 20) or "model?"
             canvas.create_text(x, ROW1_CY, text=mtxt, font=FONT_DIM,
                                fill=ACCENT_BLUE, anchor="w", tags=("m_model",))
             x += f_dim.measure(mtxt) + 8
         if show_s and label:
             has_any = True
-            canvas.create_text(x, ROW1_CY, text=label, font=FONT_DIM,
-                               fill=FG_DIM, anchor="w", tags=("m_sess",))
+            canvas.create_text(x, ROW1_CY, text=_truncate(label, plan["label_max"]),
+                               font=FONT_DIM, fill=FG_DIM, anchor="w",
+                               tags=("m_sess",))
         if not has_any:
             # fail-closed：第一行无内容 -> 会话未识别占位（与旧口径一致）
             canvas.create_text(12, ROW1_CY, text=SESSION_UNKNOWN,
@@ -1717,30 +1866,21 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             bind_hover("m_sess", u"\u4f1a\u8bdd\uff1a%s" % label)
 
         # ---- 右上 close 小块 ----
-        _draw_close()
+        _draw_close(win_w)
 
-        # ---- 第二行：彩色指标块（关掉的块不画、不留空位）----
-        blocks = build_metric_blocks(info.get("stats"), cfg)
+        # ---- 第二行：彩色指标块（全部渲染，永不因宽度丢块；关掉的块不画）----
         x = 10
-        avail = WINDOW_W - 44   # 右侧给 close 小块留位
-        for blk in blocks:
+        for blk, w in zip(blocks, block_ws):
             if blk["kind"] == "pending":
                 # 无数据 / 显示项全关：单块灰字占位（fail-closed 文案）
                 txt = blk["text"]
-                w = f_main.measure(txt) + BLOCK_PAD * 2
                 round_rect(canvas, x, ROW2_Y, x + w, ROW2_Y + BLOCK_H, 6,
                            fill=BLOCK_BG, outline="")
                 canvas.create_text(x + BLOCK_PAD, ROW2_Y + BLOCK_H / 2.0,
                                    text=txt, font=FONT_MAIN, fill=FG_DIM,
                                    anchor="w")
-                x += w + BLOCK_GAP
+                x += w + gap
                 continue
-            icon_w = f_icon.measure(blk["icon"])
-            label_w = f_main.measure(blk["label"])
-            value_w = f_num.measure(blk["value"])
-            w = BLOCK_PAD * 2 + icon_w + 5 + label_w + 5 + value_w
-            if x + w > avail:
-                break   # 窗口固定宽：放不下的尾部块整块不画
             y0, y1 = ROW2_Y, ROW2_Y + BLOCK_H
             tag = "blk_" + blk["kind"]
             rect = round_rect(canvas, x, y0, x + w, y1, 6,
@@ -1750,10 +1890,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             tx = x + BLOCK_PAD
             canvas.create_text(tx, ty, text=blk["icon"], font=ICON_FONT,
                                fill=blk["icon_color"], anchor="w", tags=(tag,))
-            tx += icon_w + 5
+            tx += f_icon.measure(blk["icon"]) + 5
             canvas.create_text(tx, ty, text=blk["label"], font=FONT_MAIN,
                                fill=FG_DIM, anchor="w", tags=(tag,))
-            tx += label_w + 5
+            tx += f_main.measure(blk["label"]) + 5
             canvas.create_text(tx, ty, text=blk["value"], font=FONT_NUM,
                                fill=blk["value_color"], anchor="w", tags=(tag,))
             if has_bar:
@@ -1768,10 +1908,11 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                                             fill=bar_color, outline="",
                                             tags=(tag,))
             bind_hover(tag, blk.get("tip"), rect, BLOCK_BG, BLOCK_HOVER)
-            x += w + BLOCK_GAP
-        # jsonl 兜底判定的会话：块行尾灰字标注（与 --once 一致）
-        if info.get("stats") and info.get("recent_note"):
-            canvas.create_text(x + 2, ROW2_Y + BLOCK_H / 2.0,
+            x += w + gap
+        # jsonl 兜底判定的会话：块行尾灰字标注（与 --once 一致；超宽时布局
+        # 收缩链的最后手段是省略本标注，指标块任何情况都保留）
+        if plan["show_note"]:
+            canvas.create_text(x - gap + 2, ROW2_Y + BLOCK_H / 2.0,
                                text=SESSION_RECENT_NOTE, font=FONT_DIM,
                                fill=FG_DIM, anchor="w")
 
@@ -1819,13 +1960,14 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         ox, oy = off
         new_x = event.x_root - ox
         new_y = event.y_root - oy
-        pseudo = (new_x, new_y, new_x + WINDOW_W, new_y + WINDOW_H)
-        clamped = clamp_to_work_area((new_x, new_y), WINDOW_W, WINDOW_H, pseudo)
+        bar_w = state.get("cur_w") or WINDOW_W
+        pseudo = (new_x, new_y, new_x + bar_w, new_y + WINDOW_H)
+        clamped = clamp_to_work_area((new_x, new_y), bar_w, WINDOW_H, pseudo)
         if clamped:
             new_x, new_y = clamped
         try:
             if hwnd:
-                win().move_window(hwnd, new_x, new_y, WINDOW_W, WINDOW_H, True)
+                win().move_window(hwnd, new_x, new_y, bar_w, WINDOW_H, True)
         except Exception:
             return
         state["manual_xy"] = (new_x, new_y)
@@ -1969,13 +2111,14 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if state.get("manual_position"):
                 set_visible(True)
                 return
-            xy = dock_rect(zrect, WINDOW_W, WINDOW_H)
-            xy = clamp_to_work_area(xy, WINDOW_W, WINDOW_H, zrect)
+            bar_w = state.get("cur_w") or WINDOW_W
+            xy = dock_rect(zrect, bar_w, WINDOW_H)
+            xy = clamp_to_work_area(xy, bar_w, WINDOW_H, zrect)
             if xy is None:
                 set_visible(False)
                 return
             if xy != state["last_xy"]:
-                win().move_window(hwnd, xy[0], xy[1], WINDOW_W, WINDOW_H, True)
+                win().move_window(hwnd, xy[0], xy[1], bar_w, WINDOW_H, True)
                 state["last_xy"] = xy
             set_visible(True)
         except Exception:
