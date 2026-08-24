@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.1.6-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.1.7-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -1451,11 +1451,57 @@ class MONITORINFO(ctypes.Structure):
 
 
 def find_zcode_window():
-    """FindWindowW(None, 'ZCode') 精确标题匹配。未找到返回 0。"""
+    """定位 ZCode 主窗口句柄；失败返回 0。
+
+    首选：FindWindowW(None, 'ZCode') 精确标题匹配（不子串，避免含 zcode
+    的窗口误命中）。命不中时兜底：按进程 exe 名 == ZCode.exe 枚举顶层
+    可见窗口（GetWindowThreadProcessId -> OpenProcess ->
+    QueryFullProcessImageNameW 比对 exe 名），返回第一个匹配主窗口——
+    覆盖用户 ZCode 标题是终端风格（如 "user@DESKTOP-..."）时找不到的
+    场景。仍找不到返回 0（poll 据此隐藏小条）。
+    """
     try:
-        return win().find_window(None, u"ZCode") or 0
+        hwnd = win().find_window(None, u"ZCode") or 0
+        if hwnd:
+            return hwnd
+    except Exception:
+        hwnd = 0
+    try:
+        return _find_zcode_window_by_exe() or 0
     except Exception:
         return 0
+
+
+def _find_zcode_window_by_exe():
+    """按 exe 名枚举兜底：遍历顶层可见窗口，进程 exe 匹配 ZCode.exe 即
+    返回其句柄；未找到返回 0（绝不抛——兜底失败等价找不到）。"""
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    result = {"hwnd": 0}
+
+    def _enum_cb(hwnd, _lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetParent(hwnd):
+                return True   # 只取顶层窗口
+            pid = pid_of(hwnd)
+            if not pid:
+                return True
+            exe = process_exe_path(pid).replace("\\", "/").lower()
+            if exe.endswith("zcode.exe"):
+                result["hwnd"] = hwnd
+                return False   # 找到即停
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+    except Exception:
+        return 0
+    return result["hwnd"]
 
 
 def window_rect_of(hwnd):
@@ -1930,9 +1976,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
     def _gesture_click_expand():
         """单击确认展开（手势状态机 _fire_click -> on_expand）：source
-        =="click"。与悬停/菜单一样受收起冷却窗拦截——双击收起的同桌手势
-        （第二次抬起残余 release）可能误触发单击待定后到期，冷却窗内一律
-        不展开（防自恢复），用户再单击一次即展开。"""
+        =="click"。**不受收起冷却窗拦截**——单击是用户主动明确意图，收起
+        冷却窗内点一下立即展开（0.1.6 把点击来源一并拦掉导致「小把手点
+        不开」）。防自恢复不改由手势机侧兜住：双击第二次抬起
+        （in_double_press）不武装单击待定，残余 release 不再走 click 路径。"""
         try:
             expand_bar(source="click")
         except Exception:
@@ -2272,22 +2319,21 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         收起按记忆位置重新出现；本次展开后把手坐标记忆保留在配置文件）。
         恢复完整条高度并强制宽度生效（cur_w=None 绕过防抖）。
 
-        source 区分展开路径（冷却守卫对任何来源一视同仁）：
+        source 区分展开路径（冷却守卫对点击来源豁免）：
           - 悬停计时（默认/None）与右键菜单（"menu"）：仍受收起冷却守卫——
             刚收起 COLLAPSE_HOVER_GRACE_MS 内不展开，避免双击收起的同桌
             手势（残留轻按把手）+ 把手恰在指针下 500ms 悬停自展开，把
             状态条又拉回完整态（防自恢复）。
           - 单击确认（_gesture_click_expand 经手势状态机 _fire_click ->
-            on_expand 传入 "click"）：单击是用户明确意图，但**同样**受冷却
-            拦截——双击收起的同桌手势（第二次抬起残余 release）落在把手上
-            会经手势机武装单击待定、250ms 后 _fire_click 到期展开；若不拦，
-            收起瞬间被误判为"确认双击"又弹回完整态（这正是「双击收起后自
-            弹回」的根因）。冷却窗内一律不展开（防自恢复）；用户冷却后或
-            再单击一次即可靠展开。"""
+            on_expand 传入 "click"）：**不受冷却拦截**——单击是用户主动明确
+            意图，收起冷却窗内点一下必须立即展开（0.1.6 把点击来源也一并
+            拦掉导致「收起后小把手怎么点都没反应」）；防自恢复的双击尾巴
+            由手势机侧守卫兜住：双击第二次抬起（in_double_press）不会
+            武装单击待定，残余 release 落在把手上也不再走 click 路径展开。"""
         if not state.get("collapsed"):
             return
-        if time_ms() < state.get("hover_grace_until", 0):
-            return  # 收起冷却窗内任何来源（含单击尾随释放）一律不展开
+        if source != "click" and time_ms() < state.get("hover_grace_until", 0):
+            return  # 非点击来源在收起冷却窗内不展开（悬停/菜单防自恢复）
         state["collapsed"] = False
         cfg["collapsed"] = False
         save_config_keys(config_path, cfg, data_dir, ["collapsed"])
