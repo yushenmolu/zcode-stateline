@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.1.4-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.1.5-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -1920,9 +1920,12 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         except Exception:
             return None
 
-    def _gesture_expand():
+    def _gesture_click_expand():
+        """单击确认展开（手势状态机 _fire_click -> on_expand）：带 source
+        =="click" 走冷却豁免——刚收起也能单击把手立即展开（用户明确意图，
+        不被双击后 1500ms 冷却窗拦截）。"""
         try:
-            expand_bar()
+            expand_bar(source="click")
         except Exception:
             try:
                 _log_err(data_dir, "handle gesture expand error:\n%s"
@@ -1942,7 +1945,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         after=_gesture_after,
         after_cancel=lambda i: root.after_cancel(i),
         now=time_ms,
-        on_expand=_gesture_expand,
+        on_expand=_gesture_click_expand,
         on_persist=_gesture_persist,
     )
 
@@ -2209,7 +2212,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         state["handle_armed"] = False   # 武装只消费一次
         _cancel_hover_expand()
         try:
-            hover_expand_id = root.after(HANDLE_HOVER_MS, expand_bar)
+            hover_expand_id = root.after(HANDLE_HOVER_MS,
+                                         lambda: expand_bar(source=None))
         except Exception:
             hover_expand_id = None
 
@@ -2253,20 +2257,25 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             except Exception:
                 pass
 
-    def expand_bar():
+    def expand_bar(source=None):
         """展开：把手 -> 完整状态条（取简单：重新贴边 ZCode 底部，不还原
         收起前的手动位置）。持久化 collapsed=false，清掉把手手动记忆（下次
         收起按记忆位置重新出现；本次展开后把手坐标记忆保留在配置文件）。
         恢复完整条高度并强制宽度生效（cur_w=None 绕过防抖）。
 
-        收起冷却守卫（防收起后自恢复）：刚收起 COLLAPSE_HOVER_GRACE_MS 内
-        任何展开路径（悬停 timer / 单击 arm_click / 未来路径）一律拦截——
-        避免双击收起的同桌手势（残留轻按把手）在冷却内被识别成"单击展开"
-        又把状态条拉回完整态。"""
+        source 区分展开路径（冷却守卫按来源差异处理）：
+          - 悬停计时（默认/None）与右键菜单（"menu"）：仍受收起冷却守卫——
+            刚收起 COLLAPSE_HOVER_GRACE_MS 内不展开，避免双击收起的同桌
+            手势（残留轻按把手）+ 把手恰在指针下 500ms 悬停自展开，把
+            状态条又拉回完整态（防自恢复）。
+          - 单击确认（_gesture_click_expand 经手势状态机 _fire_click ->
+            on_expand 传入 "click"）：单击是用户明确意图，直接展开、不受
+            冷却拦截——修复「双击收起后点不回来」（单击展开与防自恢复不冲突：
+            防自恢复针对的是无意识悬停/残留手势，单击必须可靠可用）。"""
         if not state.get("collapsed"):
             return
-        if time_ms() < state.get("hover_grace_until", 0):
-            return  # 收起冷却窗内禁止展开（悬停+单击同源防线）
+        if source != "click" and time_ms() < state.get("hover_grace_until", 0):
+            return  # 收起冷却窗内仅拦截非单击路径（悬停/菜单防自恢复）
         state["collapsed"] = False
         cfg["collapsed"] = False
         save_config_keys(config_path, cfg, data_dir, ["collapsed"])
@@ -2709,7 +2718,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if win().is_iconic(hz):          # 最小化 -> 隐藏
                 set_visible(False)
                 return
-            if not is_foreground_zcode():    # 前台非 ZCode -> 隐藏
+            collapsed = bool(state.get("collapsed"))
+            if not collapsed and not is_foreground_zcode():   # 前台非 ZCode -> 隐藏
                 set_visible(False)
                 return
             zrect = window_rect_of(hz)
@@ -2723,9 +2733,12 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                 return
             # 收起态：把手停在用户上次拖动留下的位置（manual_handle，poll
             # 不再吸回），直到展开清标志；启动/未拖过 -> 按记忆位置
-            # （handle_x/y，越界回退右下角）或默认底部居中停靠。同样受
-            # 上面前台/最小化显隐判定管辖（ZCode 非前台时把手也隐藏）。
-            if state.get("collapsed"):
+            # （handle_x/y，越界回退右下角）或默认底部居中停靠。
+            # 显隐豁免：收起态把手不要求 ZCode 在前台（双击收起本身就让前台
+            # 离开 ZCode，若仍按前台隐藏会被下一拍 poll 藏掉 ->「对话框没了」），
+            # 但 ZCode 最小化（IsIconic）/找不到 ZCode 窗口时仍隐藏，避免
+            # ZCode 整个关闭后还残留一个把手悬在桌面上；完整态仍仅前台显示。
+            if collapsed:
                 bar_w = state.get("cur_w") or HANDLE_W_DEFAULT
                 if state.get("manual_handle"):
                     set_visible(True)
