@@ -111,6 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATUSBAR_VERSION = "0.1.4-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -1704,6 +1705,7 @@ def read_stats_once(data_dir, db_path, cfg=None):
             "line1": info.get("line1") or SESSION_UNKNOWN,
             "speedTokPerSec": st.get("speedTokPerSec"),
             "speedAvgTokPerSec": st.get("speedAvgTokPerSec"),
+            "version": STATUSBAR_VERSION,
         }
     except Exception as e:
         return {"ok": False, "line": STATS_PENDING, "source": "error", "error": str(e)}
@@ -2255,9 +2257,16 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         """展开：把手 -> 完整状态条（取简单：重新贴边 ZCode 底部，不还原
         收起前的手动位置）。持久化 collapsed=false，清掉把手手动记忆（下次
         收起按记忆位置重新出现；本次展开后把手坐标记忆保留在配置文件）。
-        恢复完整条高度并强制宽度生效（cur_w=None 绕过防抖）。"""
+        恢复完整条高度并强制宽度生效（cur_w=None 绕过防抖）。
+
+        收起冷却守卫（防收起后自恢复）：刚收起 COLLAPSE_HOVER_GRACE_MS 内
+        任何展开路径（悬停 timer / 单击 arm_click / 未来路径）一律拦截——
+        避免双击收起的同桌手势（残留轻按把手）在冷却内被识别成"单击展开"
+        又把状态条拉回完整态。"""
         if not state.get("collapsed"):
             return
+        if time_ms() < state.get("hover_grace_until", 0):
+            return  # 收起冷却窗内禁止展开（悬停+单击同源防线）
         state["collapsed"] = False
         cfg["collapsed"] = False
         save_config_keys(config_path, cfg, data_dir, ["collapsed"])
@@ -2811,6 +2820,18 @@ def main(argv=None):
         refresh_ms = max(int(args.interval_ms), 200)
     else:
         refresh_ms = max(int(cfg.get("refresh_ms", REFRESH_MS_DEFAULT)), 200)
+
+    # ---- 自证机制：GUI 启动写 boot.log（--once 不建窗口不落 boot）----
+    if not args.once:
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            with open(os.path.join(data_dir, "statusbar.boot.log"), "a",
+                      encoding="utf-8") as _bf:
+                _bf.write(time.strftime("%Y-%m-%d %H:%M:%S")
+                          + " STATUSBAR_VERSION=" + STATUSBAR_VERSION
+                          + " pid=" + str(os.getpid()) + chr(10))
+        except Exception:
+            pass
 
     if args.once:
         payload = read_stats_once(data_dir, db_path, cfg=cfg)
