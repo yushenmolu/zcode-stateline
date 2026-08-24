@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.1.7-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.2.0-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -1473,7 +1473,7 @@ def find_zcode_window():
 
 
 def _find_zcode_window_by_exe():
-    """按 exe 名枚举兜底：遍历顶层可见窗口，进程 exe 匹配 ZCode.exe 即
+    """按 exe 名枚举兜底：遍历顶层可见窗口，进程 exe 名含 zcode（小写）即
     返回其句柄；未找到返回 0（绝不抛——兜底失败等价找不到）。"""
     user32 = ctypes.windll.user32
     EnumWindowsProc = ctypes.WINFUNCTYPE(
@@ -1490,7 +1490,7 @@ def _find_zcode_window_by_exe():
             if not pid:
                 return True
             exe = process_exe_path(pid).replace("\\", "/").lower()
-            if exe.endswith("zcode.exe"):
+            if "zcode" in os.path.basename(exe):
                 result["hwnd"] = hwnd
                 return False   # 找到即停
         except Exception:
@@ -1560,8 +1560,48 @@ def process_exe_path(pid):
         return ""
 
 
+def _zcode_process_alive():
+    """ZCode 进程是否存活：EnumWindows 遍历可见顶层窗口，按窗口所属进程
+    exe 名小写含 "zcode"（非精确 exe 名、非窗口标题——用户终端标题可能是
+    "user@DESKTOP-..." 等任意字符串）判定；命中任一即返回 True。
+
+    OpenProcess 失败按「存活」处理（不误藏——收起态把手宁可多显示一拍，
+    也不在 ZCode 真退出前被藏掉；进程表轮询下一拍自然会收敛）。
+    任何异常返回 True（同样的不误藏原则），绝不抛。
+    """
+    user32 = ctypes.windll.user32
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = {"alive": False}
+
+    def _enum_cb(hwnd, _lparam):
+        try:
+            if found["alive"]:
+                return False
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetParent(hwnd):
+                return True   # 只取顶层窗口
+            pid = pid_of(hwnd)
+            if not pid:
+                return True
+            exe = process_exe_path(pid).replace("\\", "/").lower()
+            if "zcode" in exe:
+                found["alive"] = True
+                return False   # 找到即停
+        except Exception:
+            return True
+        return True
+
+    try:
+        user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+    except Exception:
+        return True
+    return found["alive"]
+
+
 def is_foreground_zcode():
-    """前台窗口是否属于 ZCode 进程（pid 一致 或 exe 名匹配 ZCode.exe）。"""
+    """前台窗口是否属于 ZCode 进程（pid 一致 或 exe 名含 zcode 模糊匹配）。"""
     try:
         hz = find_zcode_window()
         if not hz:
@@ -1574,7 +1614,7 @@ def is_foreground_zcode():
         if zpid and fpid and fpid == zpid:
             return True
         exe = process_exe_path(fpid).replace("\\", "/").lower()
-        if exe.endswith("zcode.exe"):
+        if "zcode" in os.path.basename(exe):
             return True
         return False
     except Exception:
@@ -2765,34 +2805,23 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if state.get("dragging"):
                 set_visible(True)
                 return
-            hz = find_zcode_window()
-            if not hz:
-                set_visible(False)
-                return
-            if win().is_iconic(hz):          # 最小化 -> 隐藏
-                set_visible(False)
-                return
             collapsed = bool(state.get("collapsed"))
-            if not collapsed and not is_foreground_zcode():   # 前台非 ZCode -> 隐藏
-                set_visible(False)
-                return
-            zrect = window_rect_of(hz)
-            if zrect is None:
-                set_visible(False)
-                return
-            # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回
-            # （仍受前台/最小化显示逻辑控制）。
-            if state.get("manual_position"):
-                set_visible(True)
-                return
-            # 收起态：把手停在用户上次拖动留下的位置（manual_handle，poll
-            # 不再吸回），直到展开清标志；启动/未拖过 -> 按记忆位置
-            # （handle_x/y，越界回退右下角）或默认底部居中停靠。
-            # 显隐豁免：收起态把手不要求 ZCode 在前台（双击收起本身就让前台
-            # 离开 ZCode，若仍按前台隐藏会被下一拍 poll 藏掉 ->「对话框没了」），
-            # 但 ZCode 最小化（IsIconic）/找不到 ZCode 窗口时仍隐藏，避免
-            # ZCode 整个关闭后还残留一个把手悬在桌面上；完整态仍仅前台显示。
             if collapsed:
+                # 收起态分支（0.2.0 与完整态彻底解耦）：
+                # 收起把手**不依赖 ZCode 窗口查找**（用户 ZCode 标题是终端风格
+                # 时精确标题/精确 exe 兜底都可能找不到，下一拍 poll 用 SW_HIDE
+                # 会把双击收起后的把手藏掉 ->「能缩不能显示」）：
+                #   - ZCode 进程真退出（_zcode_process_alive False）-> 藏；
+                #   - 真窗口句柄可用且最小化（IsIconic）-> 藏；句柄拿不到
+                #     （标题匹配不到/权限不足）则跳过该检查，绝不因此隐藏；
+                #   - 否则走现有收起停靠（贴屏幕底部中心），set_visible(True)。
+                if not _zcode_process_alive():
+                    set_visible(False)
+                    return
+                hz_c = find_zcode_window()
+                if hz_c and win().is_iconic(hz_c):
+                    set_visible(False)
+                    return
                 bar_w = state.get("cur_w") or HANDLE_W_DEFAULT
                 if state.get("manual_handle"):
                     set_visible(True)
@@ -2813,6 +2842,27 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                     state["last_xy"] = hxy
                 set_visible(True)
                 return
+            hz = find_zcode_window()
+            if not hz:
+                set_visible(False)
+                return
+            if win().is_iconic(hz):          # 最小化 -> 隐藏
+                set_visible(False)
+                return
+            if not is_foreground_zcode():   # 前台非 ZCode -> 隐藏
+                set_visible(False)
+                return
+            zrect = window_rect_of(hz)
+            if zrect is None:
+                set_visible(False)
+                return
+            # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回
+            # （仍受前台/最小化显示逻辑控制）。
+            if state.get("manual_position"):
+                set_visible(True)
+                return
+            # 完整态（未收起）：贴 ZCode 底部外沿（水平居中），钳制工作区。
+            # （收起态分支已在上面处理并 return，这里不再需要 collapsed 判定。）
             bar_w = state.get("cur_w") or WINDOW_W
             xy = dock_rect(zrect, bar_w, WINDOW_H)
             xy = clamp_to_work_area(xy, bar_w, WINDOW_H, zrect)
