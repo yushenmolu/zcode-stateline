@@ -184,6 +184,8 @@ ICON_SPD = u"\u26a1"     # ⚡ 速度 tok/s
 HANDLE_H = 18            # 收起把手高度（小条 ~72x18）
 HANDLE_W_DEFAULT = 72    # 收起把手宽度估算（内容自适应渲染；记忆位置/越界回退用）
 HANDLE_HOVER_MS = 500    # 把手悬停多久自动展开（毫秒）
+COLLAPSE_HOVER_GRACE_MS = 1500   # 收起冷却窗：收起后这段时间内把手不响应悬停展开
+                                 # （防双击收起后把手恰在指针下 -> 500ms 悬停自展开 ->「收起又自己恢复」）
 HANDLE_FALLBACK_MARGIN = 8  # 越界回退右下角时距工作区右/下缘的留白
 HANDLE_TIP = (u"\u5df2\u6536\u8d77\u2014\u2014"
               u"\u60ac\u505c\u6216\u5355\u51fb\u5c55\u5f00\u5b8c\u6574\u7edf\u8ba1")
@@ -1892,6 +1894,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "manual_handle": False,   # 收起态把手被手动拖过 -> poll 不再吸回（直到展开）
         "press_xy": None,         # 完整态按下时指针屏幕坐标（区分「单击」与「拖动」）
         "last_drag_xy": None,     # 收起态拖动最近一次被 clamp 后的目标坐标
+        "hover_grace_until": 0,   # 收起冷却截止（epoch 毫秒）：此之前悬停展开不排程
+        "handle_armed": False,    # 悬停展开武装标志：需 leave->enter 才重新武装
     }
     hover_expand_id = None        # 把手悬停自动展开的 after 计时器（cancel 用）
 
