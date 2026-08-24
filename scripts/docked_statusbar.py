@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.2.0-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.2.1-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -185,7 +185,10 @@ ICON_SPD = u"\u26a1"     # ⚡ 速度 tok/s
 HANDLE_H = 18            # 收起把手高度（小条 ~72x18）
 HANDLE_W_DEFAULT = 72    # 收起把手宽度估算（内容自适应渲染；记忆位置/越界回退用）
 HANDLE_HOVER_MS = 500    # 把手悬停多久自动展开（毫秒）
+# ---- 收起冷却/展开守卫 ----
 COLLAPSE_HOVER_GRACE_MS = 1500   # 收起冷却窗：收起后这段时间内把手不响应悬停展开
+DOUBLE_CLICK_TAIL_MS = 500      # 双击尾巴遮蔽窗：收起后此刻内残余 button 释放
+                                # 不喂手势机（双击收起的 Release#2 不再 arm_click 展开）
                                  # （防双击收起后把手恰在指针下 -> 500ms 悬停自展开 ->「收起又自己恢复」）
 HANDLE_FALLBACK_MARGIN = 8  # 越界回退右下角时距工作区右/下缘的留白
 HANDLE_TIP = (u"\u5df2\u6536\u8d77\u2014\u2014"
@@ -1991,6 +1994,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "press_xy": None,         # 完整态按下时指针屏幕坐标（区分「单击」与「拖动」）
         "last_drag_xy": None,     # 收起态拖动最近一次被 clamp 后的目标坐标
         "hover_grace_until": 0,   # 收起冷却截止（epoch 毫秒）：此之前悬停展开不排程
+        "ignore_click_until": 0,  # 双击尾巴遮蔽截止（epoch 毫秒）：此之前收起态
+                                  # 释放事件不喂手势机（防收起后残余 release 又展开）
         "handle_armed": False,    # 悬停展开武装标志：需 leave->enter 才重新武装
     }
     hover_expand_id = None        # 把手悬停自动展开的 after 计时器（cancel 用）
@@ -2333,6 +2338,11 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         hide_tooltip()
         _cancel_hover_expand()
         hand_gesture.cancel_click()          # 收起瞬间清理未决单击待定/拖动态
+        # 双击尾巴遮蔽：双击最后一次抬起的残余释放事件若在收起后仍到达手势机
+        # （此时 cancel_click 已把 in_double_press 清为 False，release 会误走
+        # _arm_click -> 250ms 后 click 路径展开，把刚收起的条又拉回完整态），
+        # 这里置遮蔽窗：窗口内下次 release 不再喂手势机，双击尾巴被吃掉。
+        state["ignore_click_until"] = time_ms() + DOUBLE_CLICK_TAIL_MS
         # 防自恢复：收起后进入悬停展开冷却窗，并把把手 disarm —— 把手恰在
         # 指针下也不会 500ms 后自展开；需 leave->enter 且过冷却后才恢复悬停展开。
         state["hover_grace_until"] = time_ms() + COLLAPSE_HOVER_GRACE_MS
@@ -2381,6 +2391,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         hide_tooltip()
         _cancel_hover_expand()
         hand_gesture.cancel_click()
+        state["ignore_click_until"] = 0   # 展开后清双击尾巴遮蔽（防残留遮蔽正常点击）
         state["manual_handle"] = False   # 展开后清标志：下次收起重新按记忆位置
         state["manual_position"] = False
         state["manual_xy"] = None
@@ -2677,6 +2688,15 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         - 完整态 -> 结束拖动、标记手动定位（poll 不再吸回），记录稳定位置。"""
         if state.get("collapsed"):
             cur_xy = state.get("last_drag_xy")
+            # 双击尾巴遮蔽：收起后 DOUBLE_CLICK_TAIL_MS 内（collapse_bar 置的
+            # ignore_click_until）到达的释放事件——双击收起的残余 Release#2——
+            # 直接取消待定并丢弃，不喂手势机（否则 in_double_press 已被
+            # cancel_click 清掉，release 误走 _arm_click，250ms 后 click 路径
+            # 展开，收起被弹回）。
+            if time_ms() < state.get("ignore_click_until", 0):
+                hand_gesture.cancel_click()
+                state["last_drag_xy"] = None
+                return
             act = hand_gesture.release({"x_root": event.x_root,
                                         "y_root": event.y_root}, cur_xy)
             state["last_drag_xy"] = None
@@ -2780,6 +2800,23 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                 pass
         _after(state.get("refresh_ms", refresh_ms), refresh_stats)
 
+    def _apply_noactivate():
+        """持续保障 WS_EX_NOACTIVATE（0.2.1）：创建后仅在 1960 一次设置过，
+        拖动/点击激活会重入清除扩展样式（点击 pythonw 后窗口可被激活，导致
+        前台判定/焦点行为异常）。每次显示前重新 Apply + SWP_NOACTIVATE。"""
+        if not hwnd:
+            return
+        try:
+            style = win().get_window_long(hwnd, GWL_EXSTYLE)
+            if not (style & WS_EX_NOACTIVATE):
+                win().set_window_long(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+            win().set_window_pos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+        except Exception:
+            pass
+
     def set_visible(show):
         if not hwnd:
             return
@@ -2803,6 +2840,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             # withdraw，否则拖动会被自隐藏打断），也不贴边 MoveWindow；
             # 释放后恢复完整显隐判定 + manual_position 接管停靠位置。
             if state.get("dragging"):
+                _apply_noactivate()   # 拖动中显示同样持续保障 NOACTIVATE
                 set_visible(True)
                 return
             collapsed = bool(state.get("collapsed"))
@@ -2849,22 +2887,30 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if win().is_iconic(hz):          # 最小化 -> 隐藏
                 set_visible(False)
                 return
-            if not is_foreground_zcode():   # 前台非 ZCode -> 隐藏
-                set_visible(False)
-                return
+            # 0.2.1 判活改判：完整态可见性只由「公开目标（ZCode）存在且非
+            # 最小化且窗口矩形可得」决定——贴边/拖动后点击或拖动会激活 pythonw
+            # 自身（is_foreground_zcode 变 False，pythonw exe 不含 zcode 匹配
+            # 不到），旧逻辑这里 SW_HIDE 会把完整条藏没。现在不再因前台非
+            # ZCode 就隐藏；前台仅降级为辅助贴边（见下），不决定窗口死活。
             zrect = window_rect_of(hz)
             if zrect is None:
                 set_visible(False)
                 return
             # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回
-            # （仍受前台/最小化显示逻辑控制）。
+            # （仍受目标存在/最小化/矩形可得显示逻辑控制）。
             if state.get("manual_position"):
+                _apply_noactivate()
                 set_visible(True)
                 return
             # 完整态（未收起）：贴 ZCode 底部外沿（水平居中），钳制工作区。
-            # （收起态分支已在上面处理并 return，这里不再需要 collapsed 判定。）
+            # 前台判定仅用于「贴边锚点退一级」（ZCode 非前台但窗口存在时用
+            # 当前矩形贴边，仍保持可见），不再作为隐藏条件。
             bar_w = state.get("cur_w") or WINDOW_W
-            xy = dock_rect(zrect, bar_w, WINDOW_H)
+            if is_foreground_zcode():
+                xy = dock_rect(zrect, bar_w, WINDOW_H)
+            else:
+                xy = clamp_to_work_area((zrect[0], zrect[2] + MARGIN),
+                                        bar_w, WINDOW_H, zrect)
             xy = clamp_to_work_area(xy, bar_w, WINDOW_H, zrect)
             if xy is None:
                 set_visible(False)
@@ -2872,9 +2918,13 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if xy != state["last_xy"]:
                 win().move_window(hwnd, xy[0], xy[1], bar_w, WINDOW_H, True)
                 state["last_xy"] = xy
+            _apply_noactivate()
             set_visible(True)
         except Exception:
-            # 任何异常只隐藏或保持现状，绝不让小条抢焦点、绝不弹错
+            # 任何异常只隐藏或保持现状，绝不让小条抢焦点、绝不弹错。
+            # 0.2.1：仅隐藏本拍，下一拍 poll 仍会按「目标存在/最小化/矩形可得」
+            # 重新判定显示（不永久藏死）——异常多为瞬时（如窗口重入瞬间矩形
+            # 取不到），fail-closed 防抢焦点但不可把条永远藏没。
             try:
                 set_visible(False)
             except Exception:
