@@ -2188,11 +2188,23 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
     def _schedule_hover_expand():
         """（重新）启动悬停 0.5s 自动展开计时（Move 事件刷新 = 重置计时）。
-        手势按压/拖动进行中不排悬停展开（按下即取消悬停，避免悬停展开与
-        单击/双击/拖动裁决冲突）；悬停计时只在未被按压时运行。"""
+
+        守卫（互斥清晰）：
+          - 收起冷却期内（collapse_bar 后 COLLAPSE_HOVER_GRACE_MS 内）不排程
+            —— 防双击收起后把手恰在指针下的立即自展开；
+          - 未武装（handle_armed=False，收起瞬间被 disarm）不排程 ——
+            悬停展开要求指针先离开把手再重新进入（leave->enter）才再次武装；
+          - 手势按压/拖动进行中不排悬停展开（按下即取消悬停，避免悬停展开与
+            单击/双击/拖动裁决冲突）。
+        排程成功后 consume 武装（handle_armed=False），一次 leave->enter 只武装一次。"""
         nonlocal hover_expand_id
+        if time_ms() < state.get("hover_grace_until", 0):
+            return
+        if not state.get("handle_armed", False):
+            return
         if hand_gesture.press_xy is not None or hand_gesture.dragging:
             return
+        state["handle_armed"] = False   # 武装只消费一次
         _cancel_hover_expand()
         try:
             hover_expand_id = root.after(HANDLE_HOVER_MS, expand_bar)
@@ -2219,6 +2231,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         hide_tooltip()
         _cancel_hover_expand()
         hand_gesture.cancel_click()          # 收起瞬间清理未决单击待定/拖动态
+        # 防自恢复：收起后进入悬停展开冷却窗，并把把手 disarm —— 把手恰在
+        # 指针下也不会 500ms 后自展开；需 leave->enter 且过冷却后才恢复悬停展开。
+        state["hover_grace_until"] = time_ms() + COLLAPSE_HOVER_GRACE_MS
+        state["handle_armed"] = False
         # 完整态默认贴边（manual_position 是完整态拖动记忆；收起态不沿用）
         state["manual_position"] = False
         state["manual_xy"] = None
@@ -2253,6 +2269,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         state["manual_position"] = False
         state["manual_xy"] = None
         state["last_xy"] = None
+        state["hover_grace_until"] = 0   # 展开后清冷却：本次会话下次收起重新计时
+        state["handle_armed"] = False    # 展开后 disarm：下次收起仍需 leave->enter
         state["cur_w"] = None      # 绕过宽度防抖：72 -> ~620 必须立刻生效
         try:
             canvas.config(height=WINDOW_H)  # 恢复完整条高度（把手态是 HANDLE_H）
@@ -2306,16 +2324,21 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                            fill=ACCENT_GREEN, anchor="w", tags=("hdl",))
 
         def _enter(_e):
-            _schedule_hover_expand()          # 悬停 0.5s 自动展开
+            # 仅当已武装（leave->enter 后）才排悬停展开；arm 事件会立刻 consume，
+            # 冷却期内的 enter 因冷却守卫不排程，小幅度移动不重复武装。
+            if state.get("handle_armed", False):
+                _schedule_hover_expand()      # 悬停 0.5s 自动展开
             tooltip_enter(HANDLE_TIP)         # 「已收起——悬停或单击展开」
 
         def _motion(e):
-            _schedule_hover_expand()          # Move 刷新（重置）展开计时
+            if state.get("handle_armed", False):
+                _schedule_hover_expand()      # Move 刷新（重置）展开计时
             if _tip_visible():
                 show_tooltip(HANDLE_TIP, e.x_root, e.y_root)
 
         def _leave(_e):
             _cancel_hover_expand()
+            state["handle_armed"] = True      # 离开把手 -> 重新武装（下次进入可展开）
             tooltip_leave()
 
         canvas.tag_bind("hdl", "<Enter>", _enter)
