@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.1.5-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.1.6-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -276,11 +276,19 @@ def load_config(config_path):
     return cfg, config_path
 
 
-def _apply_raw_config(cfg, raw):
-    """把已解析的 raw dict 按 schema 原地合并进 cfg（load_config 与热加载共用）。"""
+def _apply_raw_config(cfg, raw, skip_collapsed=False):
+    """把已解析的 raw dict 按 schema 原地合并进 cfg（load_config 与热加载共用）。
+
+    skip_collapsed=True 时跳过 collapsed 键（默认合并——load_config 启动恢复用）：
+    热加载只同步其它键，collapsed 的写权只留给 collapse_bar/expand_bar（用户主动
+    双击/点击展开时原子写回），避免热加载重读 mtime 边缘把 cfg["collapsed"] 翻
+    回 false，导致下次写回盘上 collapsed 被误清（热加载竞态自恢复源之一）。
+    """
     for key in ("show_model", "show_session", "show_avg_duration", "show_input",
                 "show_output", "show_cache_read", "show_cache_hit", "show_speed",
                 "show_reasoning", "collapsed"):
+        if skip_collapsed and key == "collapsed":
+            continue
         if key in raw:
             v = raw[key]
             if isinstance(v, bool):
@@ -336,7 +344,7 @@ def hot_reload_config(cfg, config_path, data_dir, prev_mtime):
     except Exception as e:
         _log_err(data_dir, "config hot-reload failed, keep current config: %r" % (e,))
         return mtime
-    _apply_raw_config(cfg, raw)
+    _apply_raw_config(cfg, raw, skip_collapsed=True)
     return mtime
 
 
@@ -1921,9 +1929,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             return None
 
     def _gesture_click_expand():
-        """单击确认展开（手势状态机 _fire_click -> on_expand）：带 source
-        =="click" 走冷却豁免——刚收起也能单击把手立即展开（用户明确意图，
-        不被双击后 1500ms 冷却窗拦截）。"""
+        """单击确认展开（手势状态机 _fire_click -> on_expand）：source
+        =="click"。与悬停/菜单一样受收起冷却窗拦截——双击收起的同桌手势
+        （第二次抬起残余 release）可能误触发单击待定后到期，冷却窗内一律
+        不展开（防自恢复），用户再单击一次即展开。"""
         try:
             expand_bar(source="click")
         except Exception:
@@ -2263,19 +2272,22 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         收起按记忆位置重新出现；本次展开后把手坐标记忆保留在配置文件）。
         恢复完整条高度并强制宽度生效（cur_w=None 绕过防抖）。
 
-        source 区分展开路径（冷却守卫按来源差异处理）：
+        source 区分展开路径（冷却守卫对任何来源一视同仁）：
           - 悬停计时（默认/None）与右键菜单（"menu"）：仍受收起冷却守卫——
             刚收起 COLLAPSE_HOVER_GRACE_MS 内不展开，避免双击收起的同桌
             手势（残留轻按把手）+ 把手恰在指针下 500ms 悬停自展开，把
             状态条又拉回完整态（防自恢复）。
           - 单击确认（_gesture_click_expand 经手势状态机 _fire_click ->
-            on_expand 传入 "click"）：单击是用户明确意图，直接展开、不受
-            冷却拦截——修复「双击收起后点不回来」（单击展开与防自恢复不冲突：
-            防自恢复针对的是无意识悬停/残留手势，单击必须可靠可用）。"""
+            on_expand 传入 "click"）：单击是用户明确意图，但**同样**受冷却
+            拦截——双击收起的同桌手势（第二次抬起残余 release）落在把手上
+            会经手势机武装单击待定、250ms 后 _fire_click 到期展开；若不拦，
+            收起瞬间被误判为"确认双击"又弹回完整态（这正是「双击收起后自
+            弹回」的根因）。冷却窗内一律不展开（防自恢复）；用户冷却后或
+            再单击一次即可靠展开。"""
         if not state.get("collapsed"):
             return
-        if source != "click" and time_ms() < state.get("hover_grace_until", 0):
-            return  # 收起冷却窗内仅拦截非单击路径（悬停/菜单防自恢复）
+        if time_ms() < state.get("hover_grace_until", 0):
+            return  # 收起冷却窗内任何来源（含单击尾随释放）一律不展开
         state["collapsed"] = False
         cfg["collapsed"] = False
         save_config_keys(config_path, cfg, data_dir, ["collapsed"])
@@ -2616,6 +2628,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             return
         cfg[key] = val
         save_config_show_keys(config_path, cfg, data_dir)
+        _sync_cfg_mtime()   # 写回后 mtime 已变：同步热加载基线，避免下一拍重读同值文件
         # 立即重画（不等下一拍刷新）；启动早期 last_info 可能仍是全 None dict
         try:
             render_ui(state.get("last_info") or {
@@ -2627,11 +2640,6 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                          % traceback.format_exc())
             except Exception:
                 pass
-        # 写回后 mtime 已变：同步热加载基线，避免下一拍重读同值文件
-        try:
-            state["cfg_mtime"] = os.path.getmtime(config_path)
-        except Exception:
-            pass
 
     # 拖动绑到 Canvas 全区域（含两行文字与各指标块；close 小块在 drag_start 内排除）
     canvas.bind("<ButtonPress-1>", drag_start)
