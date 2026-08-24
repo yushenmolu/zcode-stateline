@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.2.1-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.2.2-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -225,6 +225,7 @@ SW_SHOWNOACTIVATE = 4
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STILL_ACTIVE = 259
 MONITOR_DEFAULTTONEAREST = 2
+MONITOR_DEFAULTTOPRIMARY = 1
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +241,17 @@ def _log_err(data_dir, msg):
             f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
         pass
+
+
+def _throttled_collapsed_err(state, data_dir, name):
+    """收起把手判定失败诊断日志（0.2.2）：同因连续失败只记一行，不刷屏；
+    判定恢复后由收起态成功路径清 state["last_collapse_err"]=None。"""
+    if state.get("last_collapse_err") == name:
+        return False
+    state["last_collapse_err"] = name
+    _log_err(data_dir,
+             "collapsed-handle: %s failed, fallback=default-dock" % name)
+    return True
 
 
 def load_config(config_path):
@@ -427,7 +439,7 @@ def valid_and_clamped_handle_xy(xy, work_area,
                                 margin=HANDLE_FALLBACK_MARGIN):
     """把记忆的把手预设坐标 (x, y) 处理成可停靠坐标：
 
-    - 无记忆（None / 非二元组）-> 默认底部居中（default_handle_xy）；
+    - 无记忆（None / 非二元组 / 含 None 成员）-> 默认底部居中（default_handle_xy）；
     - 坐标夹在 work_area 内可完整放下 -> 原样返回（已在区内的手工拖动值）；
     - 越出工作区 / 工作区过小放不下 -> 回退默认**右下角**
       (工作区宽-把手宽-margin, 工作区高-把手高-margin)。
@@ -437,7 +449,12 @@ def valid_and_clamped_handle_xy(xy, work_area,
     wl, wt, wr, wb = work_area
     if wr <= wl or wb <= wt:
         return None
-    if not xy or len(xy) != 2:
+    # (None, None) 也是「无记忆」：cfg 的 handle_x/handle_y 在用户从未拖过
+    # 把手时为 None（0.2.2 修复：旧守卫 `not xy or len(xy) != 2` 放过了
+    # (None, None)，int(None) 抛 TypeError，poll 外层 except 把收起把手
+    # SW_HIDE 掉——「双击收起后把手消失」的确定性根因之一）。
+    if (not xy or len(xy) != 2
+            or xy[0] is None or xy[1] is None):
         return default_handle_xy(work_area, handle_w, handle_h)
     fx = int(xy[0])
     fy = int(xy[1])
@@ -448,6 +465,72 @@ def valid_and_clamped_handle_xy(xy, work_area,
         dy = wb - handle_h - margin
         return dx, dy
     return fx, fy
+
+
+def collapsed_poll_decision(state, cfg, bar_w, alive, zcode_hwnd,
+                            is_iconic, current_xy, work_area,
+                            valid_and_clamped, default_dock, on_err):
+    """收起态 poll 判定（0.2.2 抽为模块级纯函数，可独立重放测试；副作用
+    move/show/hide 仍由调用方 run_gui.poll 执行，本函数只做裁决）。
+
+    依赖全部显式注入（不隐式依赖闭包/全局），判定语义（0.2.2 根因修复）：
+      - ZCode 进程退出 / 真窗口最小化 -> 藏（语义保留）；
+      - 坐标/工作区判定**瞬时失败**（current_window_xy 或
+        valid_and_clamped_handle_xy 返回 None）-> 不再隐藏，回退默认停靠
+        （工作区底部居中，default_handle_xy）并保持可见。
+
+    参数：
+      - state:           run_gui state（读 manual_handle）
+      - cfg:             配置（读 handle_x/handle_y 记忆把手坐标）
+      - bar_w:           把手宽度
+      - alive:           ZCode 进程是否存活（False -> 藏）
+      - zcode_hwnd:      ZCode 窗口句柄（0/None 视为取不到，跳过最小化判定）
+      - is_iconic(h):    窗口是否最小化（命中 -> 藏）
+      - current_xy():    小条当前屏幕坐标；失败返回 None
+      - work_area(zrect): 矩形所在显示器工作区；失败返回 None
+      - valid_and_clamped(xy, wa): 记忆坐标 -> 可停靠坐标；wa 不可得返回 None
+      - default_dock(bar_w): 回退默认停靠坐标；失败返回 None
+      - on_err(name):    判定失败诊断回调（仅失败时调用；调用方负责落
+                          docked-statusbar-err.log 与同因去重）
+
+    返回 (visible, hxy)：
+      - (False, None)    -> 调用方 SW_HIDE（ZCode 退出/最小化；极端兜底失败）
+      - (True, None)     -> 调用方 SW_SHOW（manual_handle：不动位置）
+      - (True, (x, y))   -> 调用方 move_window 到 (x,y) 后 SW_SHOW
+    """
+    if not alive:
+        return False, None
+    if zcode_hwnd and is_iconic(zcode_hwnd):
+        return False, None
+    if state.get("manual_handle"):
+        return True, None
+
+    def _safe(fn):
+        """坐标/工作区依赖调用防抛：任一判定抛异常视同失败（走回退默认停靠），
+        绝不让异常冒泡到 poll 外层 except 导致 SW_HIDE（0.2.2 根因）。"""
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    xy = _safe(current_xy)
+    if xy is None:
+        on_err("current_window_xy")
+        hxy = _safe(lambda: default_dock(bar_w))
+        if hxy is None:
+            return False, None
+        return True, hxy
+    wa = _safe(lambda: work_area((xy[0], xy[1],
+                                  xy[0] + bar_w, xy[1] + HANDLE_H)))
+    hxy = _safe(lambda: valid_and_clamped(
+        (cfg.get("handle_x"), cfg.get("handle_y")), wa))
+    if hxy is None:
+        on_err("valid_and_clamped_handle_xy")
+        hxy = _safe(lambda: default_dock(bar_w))
+        if hxy is None:
+            return False, None
+        return True, hxy
+    return True, hxy
 
 
 # ---------------------------------------------------------------------------
@@ -1423,6 +1506,12 @@ class _WinApi(object):
         user32.MonitorFromRect.restype = wintypes.HMONITOR
         self.monitor_from_rect = user32.MonitorFromRect
 
+        # MonitorFromPoint 是**按值**传 POINT（8 字节），argtypes 用结构体本身
+        # （非指针），ctypes 自动按值转换——与 MonitorFromRect 的 LPCRECT 不同。
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = wintypes.HMONITOR
+        self.monitor_from_point = user32.MonitorFromPoint
+
         user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
         user32.GetMonitorInfoW.restype = wintypes.BOOL
         self.get_monitor_info = user32.GetMonitorInfoW
@@ -1639,6 +1728,24 @@ def work_area_of_rect(zrect):
     try:
         rect = wintypes.RECT(*zrect)
         hm = win().monitor_from_rect(ctypes.byref(rect), MONITOR_DEFAULTTONEAREST)
+        if not hm:
+            return None
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if win().get_monitor_info(hm, ctypes.byref(info)):
+            w = info.rcWork
+            return (w.left, w.top, w.right, w.bottom)
+    except Exception:
+        pass
+    return None
+
+
+def _primary_work_area():
+    """主显示器工作区 (left,top,right,bottom)；失败返回 None（0.2.2 收起把手
+    回退停靠的最后兜底：小条自身显示器工作区取不到时退回主屏）。"""
+    try:
+        hm = win().monitor_from_point(wintypes.POINT(0, 0),
+                                      MONITOR_DEFAULTTOPRIMARY)
         if not hm:
             return None
         info = MONITORINFO()
@@ -2606,6 +2713,25 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             pass
         return None
 
+    def _default_dock_xy(bar_w):
+        """坐标/工作区瞬时不可得时的回退停靠（0.2.2）：优先小条自身所在
+        显示器工作区（get_window_rect 直取顶层句柄——与 current_window_xy
+        的 child 解析失败场景互补），再退主显示器（_primary_work_area）；
+        仍失败返回 None。定位用生产 default_handle_xy（工作区底部居中）。"""
+        wa = None
+        try:
+            rect = wintypes.RECT()
+            if hwnd and win().get_window_rect(hwnd, ctypes.byref(rect)):
+                wa = work_area_of_rect((rect.left, rect.top,
+                                        rect.right, rect.bottom))
+        except Exception:
+            wa = None
+        if wa is None:
+            wa = _primary_work_area()
+        if wa is None:
+            return None
+        return default_handle_xy(wa, bar_w)
+
     def drag_start(event):
         """按下：完整态（未收起）延用偏移拖动；收起态走手势状态机 press
         （记录坐标+时间，无动作；250ms 内第二次按下到达会取消单击待定）。
@@ -2853,29 +2979,36 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                 #   - 真窗口句柄可用且最小化（IsIconic）-> 藏；句柄拿不到
                 #     （标题匹配不到/权限不足）则跳过该检查，绝不因此隐藏；
                 #   - 否则走现有收起停靠（贴屏幕底部中心），set_visible(True)。
-                if not _zcode_process_alive():
-                    set_visible(False)
-                    return
-                hz_c = find_zcode_window()
-                if hz_c and win().is_iconic(hz_c):
-                    set_visible(False)
-                    return
+                # 0.2.2 根因修复：坐标/工作区判定**瞬时失败**（current_window_xy
+                # 或 work_area_of_rect 返回 None）不再 SW_HIDE（曾导致「双击收起
+                # 后把手消失」），回退默认停靠（工作区底部居中，default_handle_xy）
+                # 并保持可见；判定抽为模块级 collapsed_poll_decision（依赖显式
+                # 注入，可独立重放测试），本闭包只做副作用与诊断落盘。
                 bar_w = state.get("cur_w") or HANDLE_W_DEFAULT
-                if state.get("manual_handle"):
-                    set_visible(True)
-                    return
-                xy = current_window_xy()
-                if xy is None:
+
+                def _collapsed_err(name):
+                    # 同因连续失败只记一行（瞬时失败通常下一拍自愈；持续失败
+                    # 也不刷屏），判定恢复后由成功路径清 last_collapse_err。
+                    _throttled_collapsed_err(state, data_dir, name)
+
+                visible, hxy = collapsed_poll_decision(
+                    state, cfg, bar_w,
+                    alive=_zcode_process_alive(),
+                    zcode_hwnd=find_zcode_window(),
+                    is_iconic=win().is_iconic,
+                    current_xy=current_window_xy,
+                    work_area=work_area_of_rect,
+                    valid_and_clamped=lambda xy, wa: valid_and_clamped_handle_xy(
+                        xy, wa, bar_w),
+                    default_dock=_default_dock_xy,
+                    on_err=_collapsed_err,
+                )
+                if not visible:
                     set_visible(False)
                     return
-                wa = work_area_of_rect((xy[0], xy[1],
-                                        xy[0] + bar_w, xy[1] + HANDLE_H))
-                hxy = valid_and_clamped_handle_xy(
-                    (cfg.get("handle_x"), cfg.get("handle_y")), wa, bar_w)
-                if hxy is None:
-                    set_visible(False)
-                    return
-                if hxy != state["last_xy"]:
+                if state.get("last_collapse_err") is not None:
+                    state["last_collapse_err"] = None   # 判定恢复 -> 允许再记
+                if hxy is not None and hxy != state["last_xy"]:
                     win().move_window(hwnd, hxy[0], hxy[1], bar_w, HANDLE_H, True)
                     state["last_xy"] = hxy
                 set_visible(True)
