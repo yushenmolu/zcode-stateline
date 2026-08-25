@@ -15,11 +15,23 @@ docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对
 「当前会话」判定优先级（fail-closed：判定不充分显示占位，绝不猜；
 data_dir/current-session.json 由 scripts/mark_session.py 在
 SessionStart/UserPromptSubmit 时写入真实会话 ID）：
+  0. 实时流 active 且带 sessionId（0.4.2 新增最高优先级：正在发请求的会话
+     就是当前对话；proxy_server.py 写 live_stream.json）-> 用该 session_id；
   1. current-session.json 存在且 updated_at 距今 < 30 秒 -> 用其 session_id；
   2. 否则 db 兜底（限 60 秒窗口）：最近 60 秒内有模型调用的最新主会话
      （model_usage started_at DESC 第一条、非 subagent）；
   3. 否则 token-stats.jsonl ts 最大主会话记录——行尾标注「（最近会话累计）」；
   4. 都没有 -> 「（会话未识别，待首轮活动）」占位。
+切换对话（未发消息）时无事件源，状态条在下一个流开始（或 mark/db 窗口
+到期）前沿用旧会话——此为无信号可判的固有边界；发消息后由 0 立即跟随。
+
+0.4.2 变更（fix-20260824）：
+  - 会话跟随：live_stream active 且 sessionId 存在时以其为当前会话（最高
+    优先级），切换对话发消息后状态条立即跟随新会话；
+  - 生成中防误报：实时流 active 但其 sessionId 与当前会话不一致（旧会话
+    残留流）时不显示生成中；LIVE_STALE_MS 60s -> 10s，流停后 10 秒内消退；
+  - tok/s 弱化：速度从徽标内（粗体主显示）降为徽标旁小号灰字，仅生成中
+    显示，不占主显示；--once 输出结构不变。
 
 数据源（本轮改进）：
   - **主数据源 = db.sqlite（model_usage 行级）**：模型调用完成即落库，比
@@ -56,7 +68,8 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
       窗口宽自适应内容（基准 620，见 plan_statusbar_layout_3zone），底色
       #14161a + 顶部 1px 分隔线 #2a2f38。
       第一行（~20px）：状态徽标（圆角色块 + 深色粗体字；空闲灰 / 生成中绿
-      ⚡（实时流活跃时徽标内带实时 tok/s）/ 工具中蓝 🔧 / 出错红）+ 会话
+      ⚡ / 工具中蓝 🔧 / 出错红）+ 速度小字（0.4.2 起 tok/s 为徽标旁小号灰字，
+      仅生成中显示，不再占徽标主显示）+ 会话
       标题（灰 #9aa1aa），右端「×」close 小块（hover 红 #e5534b + 白字）。
       第二行（~30px）：本轮统计——当前会话最近一轮 `◷<秒> · in <k/M> ·
       out <k/M> · cache hit <%>`（数字 Consolas 等宽防跳字；每轮结束更新，
@@ -74,10 +87,11 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
     refresh_ms 覆盖 --interval-ms 默认（数据刷新间隔，默认 1000ms）。
     坏 JSON / 缺字段一律回退默认值并写一条日志到 docked-statusbar-err.log。
     --config <path> 覆盖配置文件路径。
-  - 速度（tok/s）：生成中随状态徽标显示实时流速度（累计字符 ÷ 流已用时，
-    字符≈token 近似）；常规态最近一次 completed 请求的
-    output_tokens/(duration_ms/1000) 仅供 --once 输出（speedTokPerSec /
-    speedAvgTokPerSec，可 null；jsonl 无行级耗时故速度仅 db 可算）。
+  - 速度（tok/s）：生成中实时流速度（累计字符 ÷ 流已用时，字符≈token 近似）
+    以徽标旁小号灰字显示（0.4.2，次要不抢主显示；仅生成中）；常规态最近一次
+    completed 请求的 output_tokens/(duration_ms/1000) 仅供 --once 输出
+    （speedTokPerSec / speedAvgTokPerSec，可 null；jsonl 无行级耗时故速度仅
+    db 可算）。
   - 靠边收起（collapsed）：双击状态条任意区域 / 右键「收起到边缘」-> 收成
     ~72x18 底部小把手（◐ 缓存命中率绿字，贴屏幕底缘、ZCode 底部中心 x
     附近）；把手悬停 ~0.5s（Move 刷新计时）或单击 -> 展开回完整状态条
@@ -116,7 +130,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.4.1-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.4.2-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -127,7 +141,8 @@ PID_NAME = "statusbar.pid"
 MARK_FILE_NAME = "current-session.json"
 CONFIG_FILE_NAME = "statusbar-config.json"
 LIVE_STREAM_NAME = "live_stream.json"   # 实时流计数共享文件（proxy_server.py 原子写）
-LIVE_STALE_MS = 60 * 1000               # 实时流新鲜窗口：距最后事件超此值视为过期/卡住
+LIVE_STALE_MS = 10 * 1000               # 实时流新鲜窗口：距最后事件超此值视为过期/卡住
+                                        # （0.4.2 60s->10s：切换对话后旧流不再长时间误报生成中）
 LIVE_USAGE_FRESH_MS = 30 * 1000         # 流结束后精确 usage 的展示窗口（随后回 db 轮询）
 MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（30 秒）
 DB_ACTIVE_WINDOW_MS = 60 * 1000  # db 兜底判定窗口：最近 60 秒内有模型调用才算活跃
@@ -763,17 +778,22 @@ def read_mark_file(data_dir):
     return sid
 
 
-def resolve_current_session(rows, data_dir, db_path):
+def resolve_current_session(rows, data_dir, db_path, live_session_id=None):
     """
     综合确定「当前会话」id（fail-closed：判定不充分宁可返回 None 占位，绝不猜）。
     优先级：
+      0. live_stream active 且带 sessionId（正在发请求的会话就是当前对话，
+         0.4.2 新增最高优先级；非 subagent）-> "live"；
       1. data_dir/current-session.json 新鲜标记（< 30 秒，非 subagent）-> "mark"；
       2. db 最近 DB_ACTIVE_WINDOW_MS（60 秒）内有模型调用的最新主会话
          （model_usage started_at DESC 第一条、非 subagent）-> "db"；
       3. token-stats.jsonl ts 最大主会话记录 -> "jsonl"（调用方需标注
          「（最近会话累计）」，因为这只是「最近有记录的会话」而非确切当前会话）；
       4. 都没有 -> (None, "none")，调用方显示占位文案。
+    live_session_id 为 None（无流 / proxy 未提取到）时回退 1-4 原链。
     """
+    if live_session_id and not _is_subagent_sid(live_session_id):
+        return live_session_id, "live"
     sid = read_mark_file(data_dir)
     if sid and not _is_subagent_sid(sid):
         return sid, "mark"
@@ -1107,12 +1127,22 @@ def resolve_turn_status(live_stats, db_path, session_id):
     返回 (status, speed_tok_per_s, turn_stats)：
       - status 走 status_detector（实时流活跃 -> 生成中；否则 db 行判定）；
       - turn_stats = recent_turn_stats 输出（最近一轮，无数据为 None）。
-    会话未识别（None）时返回 ('idle', None, None)，不猜。"""
+    会话未识别（None）时返回 ('idle', None, None)，不猜。
+
+    0.4.2 生成中防误报：live 流 active 但其 sessionId 存在且与当前会话不一致
+    （切到别的对话后旧流仍在/残留）时，按无实时流处理，不显示生成中。
+    live 流 sessionId 为 None（proxy 未提取到）时不抑制——无法证伪，宁可显示。
+    """
     if not session_id:
         return "idle", None, None
     mu_row = db_latest_model_usage_status(db_path, session_id)
     tu_row = recent_turn_stats(db_path, session_id)
-    status, spd = status_detector(live_stats, mu_row, tu_row)
+    eff_live = live_stats
+    if live_stats and live_stats.get("stream_active"):
+        live_sid = live_stats.get("sessionId")
+        if live_sid is not None and live_sid != session_id:
+            eff_live = None  # 旧会话残留流：不误报生成中
+    status, spd = status_detector(eff_live, mu_row, tu_row)
     return status, spd, tu_row
 
 
@@ -1223,16 +1253,20 @@ def session_label(db_path, session_id):
     return u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"
 
 
-def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None):
+def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
+                     live_session_id=None):
     """
     每帧（GUI / --once）统一解析展示信息，返回 dict：
       {text, source, session_id, model, session_label, line1, line2, stats}
     其中：
-      - session 判定走 resolve_current_session（mark -> db -> jsonl）；
+      - session 判定走 resolve_current_session（live -> mark -> db -> jsonl）；
       - 统计按该会话 db 优先聚合（build_stats_line）；stats 为标准 dict；
       - model / title 读 db（会话判定为新会话时才重读，否则沿用 cur 缓存）；
       - line1 按配置 show_model/show_session 裁剪；model 保留完整值（tooltip）。
     任何异常兜底为 None / 「—」，绝不外抛。
+
+    live_session_id 来自 live_stream.json（0.4.2 新增）：stream active 且
+    sessionId 存在时传该 id，用于会话判定链最高优先级。
     """
     cfg = cfg or dict(DEFAULT_CONFIG)
     info = {
@@ -1250,7 +1284,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None):
         "error": None,
     }
     try:
-        sid, source = resolve_current_session(rows, data_dir, db_path)
+        sid, source = resolve_current_session(rows, data_dir, db_path,
+                                               live_session_id=live_session_id)
         info["session_id"] = sid
         info["source"] = source
         if sid is None:
@@ -1368,6 +1403,7 @@ def live_to_stats(live, cfg=None):
         speed = (chars / elapsed) if (elapsed and elapsed > 0.05) else None
         return {
             "stream_active": True,
+            "sessionId": live.get("sessionId"),  # 0.4.2：透传，供会话判定/生成中匹配
             "inputTokens": int(live.get("stream_input_tokens") or 0),
             "outputTokens": chars,
             "reasoningTokens": reas,
@@ -1381,6 +1417,7 @@ def live_to_stats(live, cfg=None):
             elapsed = live_elapsed_s(live)
             st = {
                 "stream_active": False,
+                "sessionId": None,
                 "precise_usage": True,
                 "inputTokens": int(u.get("input_tokens") or 0),
                 "outputTokens": outp,
@@ -2294,7 +2331,11 @@ def read_stats_once(data_dir, db_path, cfg=None):
     任何异常不抛。line 按 cfg 的 show_* 裁剪（与旧第二行口径一致）。"""
     try:
         rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
-        info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=None)
+        live = read_live_stream(data_dir)
+        live_session_id = (live.get("sessionId")
+                           if live and live.get("active") else None)
+        info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=None,
+                                live_session_id=live_session_id)
         if info.get("stats") is not None:
             line = stats_to_text(info["stats"], cfg or dict(DEFAULT_CONFIG))
             if info.get("recent_note"):
@@ -2304,7 +2345,6 @@ def read_stats_once(data_dir, db_path, cfg=None):
         if line is None:
             line = STATS_PENDING
         st = info.get("stats") or {}
-        live = read_live_stream(data_dir)
         live_stats = live_to_stats(live, cfg)
         status, spd, turn_stats = resolve_turn_status(
             live_stats, db_path, info.get("session_id"))
@@ -3046,8 +3086,13 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
         # ---- 文本拼装 ----
         badge_txt = STATUS_TEXT.get(status, STATUS_TEXT["idle"])
+        # 0.4.2：tok/s 不再进徽标（主显示保留「⚡生成中」徽标本身），改为徽标旁
+        # 小号灰字；speed_txt 供绘制段使用，speed_w 计入布局避免窗口宽度不足。
+        speed_txt = None
+        speed_w = 0
         if status == "generating" and speed is not None:
-            badge_txt += u" %.1f tok/s" % speed
+            speed_txt = u"%.1f tok/s" % speed
+            speed_w = 4 + f_dim.measure(speed_txt)  # 4px 间隔 + 小字宽
         turn_segs = _turn_segments(turn)
         turn_w = sum(_fmap[f].measure(t) for t, f, _ in turn_segs)
         cum_txt = cumulative_text(cum)
@@ -3056,7 +3101,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         # ---- 先实测、后布局（三区宽度全部 tkinter.font 实测）----
         badge_w = 0
         if show_status:
-            badge_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt)
+            badge_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt) + speed_w
         cum_w = f_dim.measure(cum_txt) if (show_cum and cum_txt) else 0
         note_w = f_dim.measure(SESSION_RECENT_NOTE) if has_note else 0
         # 模型名并入不可裁槽（与徽标同槽：徽标+模型名恒不裁，对话名按剩余宽截短）
@@ -3078,20 +3123,29 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         # 顶部 1px 分隔线（提质感）
         canvas.create_rectangle(0, 0, win_w, 1, fill=EDGE_LINE, outline="")
 
-        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 模型名（蓝）+ 对话名 ----
+        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 速度小字（0.4.2）+ 模型名（蓝）+ 对话名 ----
         x = 12
         if show_status:
             color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
+            badge_only_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt)
             rect = round_rect(canvas, x, ROW1_CY - BADGE_H / 2.0,
-                              x + badge_w, ROW1_CY + BADGE_H / 2.0, 9,
+                              x + badge_only_w, ROW1_CY + BADGE_H / 2.0, 9,
                               fill=color, outline="")
-            canvas.create_text(x + badge_w / 2.0, ROW1_CY, text=badge_txt,
+            canvas.create_text(x + badge_only_w / 2.0, ROW1_CY, text=badge_txt,
                                font=BADGE_FONT, fill=BADGE_FG,
                                anchor="center", tags=("m_badge",))
             bind_hover("m_badge",
                        STATUS_TIPS.get(status, STATUS_TIPS["idle"]),
                        rect, color, color)
-            x += badge_w + badge_gap
+            x += badge_only_w
+            if speed_txt:
+                x += 4  # 徽标与速度小字间隔
+                canvas.create_text(x, ROW1_CY, text=speed_txt,
+                                   font=FONT_DIM, fill=FG_DIM,
+                                   anchor="w", tags=("m_spd",))
+                bind_hover("m_spd", STATUS_TIPS.get(status, ""))
+                x += f_dim.measure(speed_txt)
+            x += badge_gap
         if cfg.get("show_model", True) and model:
             mtxt = _truncate(model, 20) or "model?"
             canvas.create_text(x, ROW1_CY, text=mtxt, font=FONT_DIM,
@@ -3341,14 +3395,21 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                         or mark_changed
                         or state["db_read_count"] == 0)
             cur_cache = None if force_db else state["last_info"]
-            info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
-                                    cur=cur_cache)
-            # 实时流（0.4.0 并入状态徽标）：活跃且新鲜 -> 生成中徽标 + 实时
-            # tok/s；流结束/过期 -> 交给 db 行判定（工具中/出错/空闲）。
-            live_stats = None
+            # 实时流（0.4.2）：先读 live_stream，active 且带 sessionId 时
+            # 以该会话为当前会话（正在发请求的会话就是当前对话，最准）；
+            # 无流/无 sessionId 时回退 mark -> db -> jsonl 原链。
+            live = None
+            live_session_id = None
             if cfg.get("show_live", True):
                 live = read_live_stream(data_dir)
-                live_stats = live_to_stats(live, cfg)
+                live_session_id = (live.get("sessionId")
+                                   if live and live.get("active") else None)
+            info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
+                                    cur=cur_cache,
+                                    live_session_id=live_session_id)
+            # 实时流转 stats（0.4.0 并入状态徽标）：活跃且新鲜 -> 生成中徽标
+            # + 实时 tok/s；流结束/过期 -> 交给 db 行判定（工具中/出错/空闲）。
+            live_stats = live_to_stats(live, cfg)
             status, spd, turn_stats = resolve_turn_status(
                 live_stats, db_path, info.get("session_id"))
             info["status"] = status
