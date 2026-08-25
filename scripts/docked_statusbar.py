@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（两行：模型/会话 + 统计）。
+docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对话级三区：状态徽标+对话名 / 本轮统计 / 会话累计）。
 
 作用：ZCode 没有官方 UI 槽位，本脚本用一个无边框置顶的 tkinter 小条
 「智能贴边」到 ZCode 主窗口底部外沿（水平居中）。仅当 ZCode 在前台且
-未最小化时显示；每 ~1 秒刷新两行：第一行显示当前模型名与当前会话标题，
-第二行显示该会话自己的 token 统计（`⏱<秒> · in <k/M> · out <k/M> ·
-cache hit <%>`）。
+未最小化时显示；每 ~1 秒刷新为对话级状态显示：
+  - 第一行：状态徽标（空闲=灰「空闲」/ 生成中=绿「⚡生成中」带实时 tok/s /
+    工具中=蓝「🔧工具中」/ 出错=红「出错」）+ 对话名；
+  - 第二行：本轮统计——当前会话最近一轮的 `⏱<秒> · in <k/M> · out <k/M> ·
+    cache hit <%>`（每轮结束更新，非会话累计）；
+  - 右侧小字：会话累计（`in <k/M> · out <k/M>` 小号次要）。
 
 「当前会话」判定优先级（fail-closed：判定不充分显示占位，绝不猜；
 data_dir/current-session.json 由 scripts/mark_session.py 在
@@ -49,32 +52,32 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
     ~400ms 后显示一个无边框置顶小气泡，跟随鼠标；移开即隐藏。气泡复用
     单一全局 toplevel，只改文本，避免反复建窗口。指标块悬停同时高亮块
     背景（#1b1e24 -> #262b33）。
-  - UI 主题（彩色指标块风，暗色，AA/WCAG 对比度）：
-      窗口宽自适应内容（基准 620，见 plan_statusbar_layout），底色 #14161a + 顶部 1px 分隔线 #2a2f38。
-      第一行（信息行，~20px）：左侧蓝色小圆点（#4f9cf7）+ 模型名（亮蓝
-      #4f9cf7）+ 会话标题（灰 #9aa1aa），右端「×」close 小块（hover 红
-      #e5534b + 白字）。
-      第二行（指标行，~30px）：一排圆角指标块（tkinter 无原生圆角，用
-      create_polygon + smooth=True 近似；底色 #1b1e24，块间 8px），每块 =
-      「彩色小标识 + 标签 + 数值」：◷耗时（灰白 #9aa1aa）/ ▸in ◂out（白
-      #e6e8eb）/ ◐缓存命中（绿 #3fb68b，块内附 60x4 微型进度条：槽
-      #2a2f38、填充 #3fb68b、命中率 >70% 变亮绿 #5dd6a8）/ ↻cache read
-      （灰）/ ✦reasoning（紫 #b08cf7，仅 show_reasoning=true 时画）。
-      数值用 Consolas 等宽防跳字；每块悬停高亮 #262b33 + tooltip 解释；
-      每块对应一个 show_* 开关，关掉的块不画、不留空位。文本/进度条画在
-      同一 Canvas 上，按 tag 分组绑定事件。
+  - UI 主题（对话级三区布局，暗色，AA/WCAG 对比度）：
+      窗口宽自适应内容（基准 620，见 plan_statusbar_layout_3zone），底色
+      #14161a + 顶部 1px 分隔线 #2a2f38。
+      第一行（~20px）：状态徽标（圆角色块 + 深色粗体字；空闲灰 / 生成中绿
+      ⚡（实时流活跃时徽标内带实时 tok/s）/ 工具中蓝 🔧 / 出错红）+ 会话
+      标题（灰 #9aa1aa），右端「×」close 小块（hover 红 #e5534b + 白字）。
+      第二行（~30px）：本轮统计——当前会话最近一轮 `◷<秒> · in <k/M> ·
+      out <k/M> · cache hit <%>`（数字 Consolas 等宽防跳字；每轮结束更新，
+      非会话累计；无已完成轮次显示「（本轮统计待更新）」）。
+      右侧小字（第三区）：会话累计 `in <k/M> · out <k/M>`（灰小号次要，
+      jsonl 兜底判定时尾部附「（最近会话累计）」标注）。
+      三区独立开关（show_status / show_recent_turn / show_cumulative），
+      关掉的区不画、不留空位；文本画在单一 Canvas 上，按 tag 分组绑定
+      悬停 tooltip 与拖动。
   - 显示项可配置：data_dir/statusbar-config.json（缺省自动生成默认配置）。
-    show_model / show_session / show_avg_duration / show_input / show_output /
-    show_cache_read / show_cache_hit / show_speed / show_reasoning 决定第一/
-    二行拼哪些项；右键菜单「显示项」子菜单可直接勾选切换（切换即重画并
-    原子写回配置，无需手改 JSON）；手改文件也会在下一拍热加载生效。
+    show_status / show_recent_turn / show_cumulative 决定三区（状态徽标 /
+    本轮统计 / 会话累计）是否渲染；右键菜单「显示项」子菜单可直接勾选切换
+    （切换即重画并原子写回配置，无需手改 JSON）；手改文件也会在下一拍热
+    加载生效。
     refresh_ms 覆盖 --interval-ms 默认（数据刷新间隔，默认 1000ms）。
     坏 JSON / 缺字段一律回退默认值并写一条日志到 docked-statusbar-err.log。
     --config <path> 覆盖配置文件路径。
-  - 速度块（⚡ tok/s，橙黄 #e8b33f，cache read 之后）：最近一次 completed
-    请求的 output_tokens/(duration_ms/1000)；tooltip 顺带会话平均 =
-    SUM(output)/SUM(duration)。仅 db 行级可算（jsonl 无单次耗时），无数据
-    不画。--once 额外输出 speedTokPerSec / speedAvgTokPerSec（可 null）。
+  - 速度（tok/s）：生成中随状态徽标显示实时流速度（累计字符 ÷ 流已用时，
+    字符≈token 近似）；常规态最近一次 completed 请求的
+    output_tokens/(duration_ms/1000) 仅供 --once 输出（speedTokPerSec /
+    speedAvgTokPerSec，可 null；jsonl 无行级耗时故速度仅 db 可算）。
   - 靠边收起（collapsed）：双击状态条任意区域 / 右键「收起到边缘」-> 收成
     ~72x18 底部小把手（◐ 缓存命中率绿字，贴屏幕底缘、ZCode 底部中心 x
     附近）；把手悬停 ~0.5s（Move 刷新计时）或单击 -> 展开回完整状态条
@@ -84,8 +87,10 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
     退出时若 pid 仍是自己的则删除。
   - CLI：--once 读一次打印统计 JSON 后退出（不建窗口、不进 GUI）。
     输出结构：{ok, line, source, sessionId, model, sessionLabel, line1,
-    speedTokPerSec, speedAvgTokPerSec}；
-    line 按 show_* 配置裁剪（与状态条第二行实际渲染一致）。
+    speedTokPerSec, speedAvgTokPerSec, status, recentTurn, version}；
+    line 按 show_* 配置裁剪（与旧第二行口径一致）；status 为状态徽标判定
+    （generating/error/tool/idle）；recentTurn 为当前会话最近一轮
+    turn_usage 统计对象（无数据为 null）。
 
 调用：
   pythonw.exe docked_statusbar.py [--data-dir DIR] [--db-path PATH]
@@ -111,7 +116,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.3.0-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.4.0-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -128,6 +133,7 @@ MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（3
 DB_ACTIVE_WINDOW_MS = 60 * 1000  # db 兜底判定窗口：最近 60 秒内有模型调用才算活跃
 DB_READ_INTERVAL = 5        # 每 N 次刷新才重读一次 db（model/title 不频繁变化）
 STATS_PENDING = u"\uff08\u672c\u8f6e\u7ed3\u675f\u540e\u66f4\u65b0\uff09"  # （本轮结束后更新）
+TURN_PENDING = u"\uff08\u672c\u8f6e\u7edf\u8ba1\u5f85\u66f4\u65b0\uff09"  # （本轮统计待更新）——0.4.0 第二行无已完成轮次时占位
 SESSION_UNKNOWN = u"\uff08\u4f1a\u8bdd\u672a\u8bc6\u522b\uff0c\u5f85\u9996\u8f6e\u6d3b\u52a8\uff09"  # （会话未识别，待首轮活动）
 SESSION_RECENT_NOTE = u"\uff08\u6700\u8fd1\u4f1a\u8bdd\u7d2f\u8ba1\uff09"  # （最近会话累计）——jsonl 兜底判定时的标注
 
@@ -156,6 +162,45 @@ FONT_DIM = ("Microsoft YaHei UI", 9)      # 第一行（会话·模型）小字
 FONT_MAIN = ("Microsoft YaHei UI", 10)    # 指标块中文标签
 FONT_NUM = ("Consolas", 10, "bold")       # 指标块数字（等宽防跳字）
 FONT_CLOSE = ("Microsoft YaHei UI", 9, "bold")
+
+# ---- 状态徽标（0.4.0 对话级状态显示：第一行 状态徽标 + 对话名）----
+STATUS_TEXT = {
+    "idle": u"\u7a7a\u95f2",                        # 空闲
+    "generating": u"\u26a1\u751f\u6210\u4e2d",      # ⚡生成中
+    "tool": u"\U0001f527\u5de5\u5177\u4e2d",        # 🔧工具中
+    "error": u"\u51fa\u9519",                       # 出错
+}
+STATUS_COLORS = {
+    "idle": "#7d8590",          # 灰
+    "generating": ACCENT_GREEN,  # 绿
+    "tool": ACCENT_BLUE,        # 蓝
+    "error": "#e5534b",         # 红
+}
+STATUS_TIPS = {
+    "idle": u"\u7a7a\u95f2\uff1a\u5f53\u524d\u65e0\u6a21\u578b\u6d3b\u52a8",
+    "generating": (u"\u751f\u6210\u4e2d\uff1a\u5b9e\u65f6\u6d41\u6b63\u5728\u8f93\u51fa\uff0c"
+                   u"\u901f\u5ea6\u4e3a\u5b57\u7b26\u2248token \u8fd1\u4f3c"),
+                   # 生成中：实时流正在输出，速度为字符≈token 近似
+    "tool": (u"\u5de5\u5177\u4e2d\uff1a\u6700\u8fd1\u4e00\u6b21\u6a21\u578b\u8c03\u7528\u542b"
+             u"\u5de5\u5177\u8c03\u7528\uff0c\u6216\u5f53\u524d\u8f6e\u672a\u5b8c\u6210"),
+             # 工具中：最近一次模型调用含工具调用，或当前轮未完成
+    "error": u"\u51fa\u9519\uff1a\u6700\u8fd1\u4e00\u6b21\u6a21\u578b\u8c03\u7528\u4ee5\u9519\u8bef\u7ed3\u675f",
+}
+BADGE_FONT = ("Microsoft YaHei UI", 9, "bold")  # 徽标文字（粗体）
+BADGE_FG = "#0e1114"          # 徽标文字色（深色，对状态色过 AA）
+BADGE_PAD_X = 9               # 徽标内左右留白
+BADGE_H = 18                  # 徽标高
+BADGE_GAP = 8                 # 徽标与标题间距（起步值；收缩档位见下）
+BADGE_GAP_STEPS = (8, 6, 4)   # 徽标-标题间距收缩档位（超宽时其次于标题截短）
+
+# ---- 本轮统计 / 会话累计（0.4.0 第二行 + 右侧小字）----
+ROW2_TURN_Y = 40              # 第二行（本轮统计 / 累计小字）文字垂直中心
+TIP_TURN = (u"\u672c\u8f6e\u7edf\u8ba1\uff1a\u5f53\u524d\u4f1a\u8bdd\u6700\u8fd1\u4e00\u8f6e"
+            u"\u6a21\u578b\u8c03\u7528\u7684\u8017\u65f6 / \u8f93\u5165 / \u8f93\u51fa / "
+            u"\u7f13\u5b58\u547d\u4e2d\u7387\uff08\u6bcf\u8f6e\u7ed3\u675f\u66f4\u65b0\uff0c"
+            u"\u975e\u4f1a\u8bdd\u7d2f\u8ba1\uff09")
+            # 本轮统计：当前会话最近一轮模型调用的耗时 / 输入 / 输出 / 缓存命中率（每轮结束更新，非会话累计）
+TIP_CUM = u"\u4f1a\u8bdd\u7d2f\u8ba1\uff1a\u5f53\u524d\u5bf9\u8bdd\u5168\u90e8\u8f6e\u6b21\u7684\u7d2f\u8ba1\u8f93\u5165 / \u8f93\u51fa"
 
 # ---- 彩色指标块（Canvas 绘制）----
 BLOCK_BG = "#1b1e24"     # 指标块底色
@@ -211,6 +256,10 @@ DEFAULT_CONFIG = {
     "show_speed": True,
     "show_reasoning": False,
     "show_live": True,
+    # ---- 0.4.0 对话级三区（状态徽标 / 本轮统计 / 会话累计）----
+    "show_status": True,
+    "show_recent_turn": True,
+    "show_cumulative": True,
     "collapsed": False,
     "handle_x": None,
     "handle_y": None,
@@ -306,7 +355,9 @@ def _apply_raw_config(cfg, raw, skip_collapsed=False):
     """
     for key in ("show_model", "show_session", "show_avg_duration", "show_input",
                 "show_output", "show_cache_read", "show_cache_hit", "show_speed",
-                "show_reasoning", "show_live", "collapsed"):
+                "show_reasoning", "show_live",
+                "show_status", "show_recent_turn", "show_cumulative",
+                "collapsed"):
         if skip_collapsed and key == "collapsed":
             continue
         if key in raw:
@@ -368,18 +419,13 @@ def hot_reload_config(cfg, config_path, data_dir, prev_mtime):
     return mtime
 
 
-# 右键「显示项」子菜单的开关项：(中文标签, 配置键)，顺序即菜单顺序
+# 右键「显示项」子菜单的开关项：(中文标签, 配置键)，顺序即菜单顺序。
+# 0.4.0 改版为对话级三区：状态徽标 / 本轮统计 / 会话累计（旧指标块时代的
+# show_* 键仍保留在配置中兼容旧配置文件，但不再对应可见区域）。
 SHOW_MENU_ITEMS = (
-    (u"\u6a21\u578b", "show_model"),               # 模型
-    (u"\u4f1a\u8bdd", "show_session"),             # 会话
-    (u"\u8017\u65f6", "show_avg_duration"),        # 耗时
-    (u"\u8f93\u5165", "show_input"),               # 输入
-    (u"\u8f93\u51fa", "show_output"),              # 输出
-    (u"\u7f13\u5b58\u547d\u4e2d", "show_cache_hit"),   # 缓存命中
-    (u"\u7f13\u5b58\u8bfb\u53d6", "show_cache_read"),  # 缓存读取
-    (u"\u901f\u5ea6 tok/s", "show_speed"),         # 速度 tok/s
-    (u"\u63a8\u7406", "show_reasoning"),           # 推理
-    (u"\u5b9e\u65f6\u751f\u6210", "show_live"),    # 实时生成（本地 SSE 代理计数）
+    (u"\u72b6\u6001\u5fbd\u6807", "show_status"),         # 状态徽标
+    (u"\u672c\u8f6e\u7edf\u8ba1", "show_recent_turn"),    # 本轮统计
+    (u"\u4f1a\u8bdd\u7d2f\u8ba1", "show_cumulative"),    # 会话累计
 )
 
 
@@ -943,6 +989,158 @@ def db_session_speed(db_path, session_id):
             pass
 
 
+def recent_turn_stats(db_path, session_id):
+    """当前会话**最近一轮** turn_usage 统计（0.4.0；表 PRIMARY KEY 为
+    (session_id, turn_id)，按 started_at 取最新一行；subagent 过滤同前，
+    不参与统计）。只读 db。
+
+    返回 dict（无数据 / 读取失败返回 None）：
+      {turn_id, status, startedAt, completedAt, durationMs,
+       timeToFirstTokenMs, toolCallCount, toolErrorCount,
+       inputTokens, outputTokens, cacheReadTokens, computedTotalTokens}
+    供「本轮统计」行与状态判定（turn 未完成特征）使用。
+    """
+    if not session_id or _is_subagent_sid(session_id):
+        return None
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT turn_id, status, started_at, completed_at, duration_ms, "
+            "time_to_first_token_ms, tool_call_count, tool_error_count, "
+            "input_tokens, output_tokens, cache_read_input_tokens, "
+            "computed_total_tokens "
+            "FROM turn_usage WHERE session_id = ? "
+            "AND COALESCE(session_id, '') NOT LIKE 'sess_subagent_%' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        (turn_id, status, started_at, completed_at, duration_ms,
+         ttft, tool_calls, tool_errors, inp, outp, cache_rd, total) = row
+        return {
+            "turn_id": turn_id,
+            "status": status,
+            "startedAt": started_at,
+            "completedAt": completed_at,
+            "durationMs": duration_ms,
+            "timeToFirstTokenMs": ttft,
+            "toolCallCount": int(tool_calls or 0),
+            "toolErrorCount": int(tool_errors or 0),
+            "inputTokens": int(inp or 0),
+            "outputTokens": int(outp or 0),
+            "cacheReadTokens": int(cache_rd or 0),
+            "computedTotalTokens": int(total or 0),
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_latest_model_usage_status(db_path, session_id):
+    """会话最新 model_usage 行的状态特征（0.4.0，状态判定用）：
+    返回 {status, tool_call_count} 或 None（无数据 / 读取失败）。
+    subagent 会话不参与展示。"""
+    if not session_id or _is_subagent_sid(session_id):
+        return None
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT status, tool_call_count FROM model_usage "
+            "WHERE session_id = ? "
+            "AND COALESCE(query_source, '') <> 'subagent' "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"status": row[0], "tool_call_count": int(row[1] or 0)}
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def status_detector(live_stats, mu_row, tu_row):
+    """状态判定（0.4.0；纯函数，可独立单测）。返回 (status, speed_tok_per_s)：
+      status ∈ {'generating', 'error', 'tool', 'idle'}；speed 仅生成中可能
+      非 None（实时流 tok/s）。
+
+      优先级（命中即返回；检测不到运行中状态时降级 'idle'，不误报）：
+        a. live_stats 且 stream_active=True（实时流新鲜——live_to_stats
+           已把关陈旧/卡住）-> 'generating'（绿⚡，speed 取实时流 tok/s）；
+        b. mu_row 且 status=='error' -> 'error'（红）；
+        c. mu_row 且 tool_call_count>0，或 tu_row 未完成
+           （tool_error_count>0 或 status 非 completed）-> 'tool'（蓝🔧）；
+        d. 否则 'idle'（灰）。
+
+      mu_row / tu_row 为 db 行 dict（db_latest_model_usage_status /
+      recent_turn_stats 的输出；None 表示无数据）。
+    """
+    if live_stats and live_stats.get("stream_active"):
+        return "generating", live_stats.get("speedTokPerSec")
+    if mu_row and mu_row.get("status") == "error":
+        return "error", None
+    if mu_row and (mu_row.get("tool_call_count") or 0) > 0:
+        return "tool", None
+    if tu_row:
+        if (tu_row.get("toolErrorCount") or 0) > 0:
+            return "tool", None
+        if tu_row.get("status") and tu_row["status"] != "completed":
+            return "tool", None
+    return "idle", None
+
+
+def resolve_turn_status(live_stats, db_path, session_id):
+    """0.4.0 统一解析「状态 + 本轮统计」（GUI 每帧与 --once 共用）：
+    返回 (status, speed_tok_per_s, turn_stats)：
+      - status 走 status_detector（实时流活跃 -> 生成中；否则 db 行判定）；
+      - turn_stats = recent_turn_stats 输出（最近一轮，无数据为 None）。
+    会话未识别（None）时返回 ('idle', None, None)，不猜。"""
+    if not session_id:
+        return "idle", None, None
+    mu_row = db_latest_model_usage_status(db_path, session_id)
+    tu_row = recent_turn_stats(db_path, session_id)
+    status, spd = status_detector(live_stats, mu_row, tu_row)
+    return status, spd, tu_row
+
+
+def turn_stats_text(turn_stats):
+    """本轮统计行文本（0.4.0）：`⏱<秒> · in <k/M> · out <k/M> · cache hit <%>`。
+    命中率口径沿用会话累计：cacheRead / input（input 已含 cacheRead 部分）。
+    turn_stats 为 None 返回 TURN_PENDING（本轮统计待更新）。"""
+    if not turn_stats:
+        return TURN_PENDING
+    inp = int(turn_stats.get("inputTokens") or 0)
+    cache_rd = int(turn_stats.get("cacheReadTokens") or 0)
+    hit = (cache_rd / float(inp) * 100.0) if inp > 0 else 0.0
+    return (u"\u23f1%.1fs \u00b7 in %s \u00b7 out %s \u00b7 cache hit %.1f%%"
+            % ((turn_stats.get("durationMs") or 0) / 1000.0,
+               format_tokens(inp),
+               format_tokens(turn_stats.get("outputTokens") or 0),
+               hit))
+
+
+def cumulative_text(stats):
+    """会话累计小字（0.4.0 第三区）：`in <k/M> · out <k/M>`；stats 为 None 返回 None。"""
+    if not stats:
+        return None
+    return (u"in %s \u00b7 out %s"
+            % (format_tokens(stats.get("inputTokens") or 0),
+               format_tokens(stats.get("outputTokens") or 0)))
+
+
 def build_stats_line(rows, db_path=None, session_id=None):
     """
     聚合统计。**数据源优先级改为 db 优先**：db 行级聚合（模型调用完成即
@@ -1493,6 +1691,61 @@ def plan_statusbar_layout(block_ws, row1_w_fn, note_w, work_w,
             "show_note": False, "n_blocks": n, "blocks_row_w": blocks_row_w}
 
 
+def plan_statusbar_layout_3zone(badge_w, title_w_fn, turn_w, cum_w, note_w,
+                                work_w, close_w=CLOSE_RESERVE_W,
+                                pad_l=12, pad_r=10):
+    """
+    0.4.0 三区自适应布局（纯函数；宽度全部由调用方实测后传入，可独立单测）。
+
+    入参：
+      badge_w:   状态徽标宽（含内边距；show_status=false 时传 0）
+      title_w_fn: title_w_fn(label_max) -> 对话名内容宽（标题截到
+                 label_max；label_max 取 LABEL_MAX_STEPS 档位）
+      turn_w:    本轮统计行宽（show_recent_turn=false 时传 0）
+      cum_w:     累计小字宽（show_cumulative=false 时传 0）
+      note_w:    「（最近会话累计）」标注宽（无标注传 0）
+      work_w:    窗口宽上限（所在显示器工作区宽 - 16px）
+
+    返回 {win_w, label_max, badge_gap, show_cum, show_note}。
+
+    不变量（优先级高于美观，绝不违反）：
+      - 状态徽标 / 本轮统计 / 累计小字**永不因宽度裁剪**；
+      - 超上限时的收缩优先级：截短对话名（16→12→10→8→6→4）->
+        缩间距（徽标-标题 8/6/4，第二行累计间距同步）->
+        省略累计小字的「（最近会话累计）」标注（最后手段）；
+      - win_w 恒 <= work_w（极端小屏全档位仍超时钳到上限，徽标与统计
+        仍全部渲染，物理上才可能溢出，逻辑上永不裁统计）。
+    """
+
+    def _row1_w(lm, bg):
+        return pad_l + badge_w + bg + title_w_fn(lm) + pad_r + close_w
+
+    def _row2_w(bg, sc, sn):
+        nw = (note_w + 6) if (sc and sn) else 0
+        return pad_l + turn_w + bg + (cum_w if sc else 0) + nw + pad_r + close_w
+
+    # 收缩候选序列（妥协程度递增；第一个放得下的即胜出）：
+    # 1) 截短标题；2) 缩间距；3) 省累计标注（仅当累计区开启时才有意义）。
+    # show_cum 恒等于 cum_w>0（配置决定），布局层**永不整区丢弃累计**。
+    for lm in LABEL_MAX_STEPS:
+        for bg in BADGE_GAP_STEPS:
+            for sn in (True, False):
+                if sn and note_w <= 0:
+                    continue
+                w = max(_row1_w(lm, bg), _row2_w(bg, cum_w > 0, sn))
+                if w <= work_w:
+                    return {"win_w": w, "label_max": lm, "badge_gap": bg,
+                            "show_cum": cum_w > 0, "show_note": sn}
+    # 全档位仍超上限（极端小屏）：最紧凑档（最短标题 + 最小间距 + 省标注），
+    # win_w 钳到上限；徽标/统计仍完整渲染。
+    lm = LABEL_MAX_STEPS[-1]
+    bg = BADGE_GAP_STEPS[-1]
+    sc = cum_w > 0
+    w = max(_row1_w(lm, bg), _row2_w(bg, sc, False))
+    return {"win_w": min(w, work_w), "label_max": lm, "badge_gap": bg,
+            "show_cum": sc, "show_note": False}
+
+
 def round_rect(cv, x0, y0, x1, y1, radius=6, **kwargs):
     """近似圆角矩形（tkinter 无原生圆角：create_polygon + smooth=True）。"""
     r = min(radius, (x1 - x0) / 2.0, (y1 - y0) / 2.0)
@@ -2036,8 +2289,9 @@ class GestureState(object):
 # ---------------------------------------------------------------------------
 
 def read_stats_once(data_dir, db_path, cfg=None):
-    """读一次统计，返回 {'ok','line','source','sessionId','model','sessionLabel','line1'}；任何异常不抛。
-    line 按 cfg 的 show_* 裁剪（与状态条实际渲染一致）。"""
+    """读一次统计，返回 {'ok','line','source','sessionId','model','sessionLabel',
+    'line1','speedTokPerSec','speedAvgTokPerSec','status','recentTurn','version',...}；
+    任何异常不抛。line 按 cfg 的 show_* 裁剪（与旧第二行口径一致）。"""
     try:
         rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
         info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=None)
@@ -2051,6 +2305,9 @@ def read_stats_once(data_dir, db_path, cfg=None):
             line = STATS_PENDING
         st = info.get("stats") or {}
         live = read_live_stream(data_dir)
+        live_stats = live_to_stats(live, cfg)
+        status, spd, turn_stats = resolve_turn_status(
+            live_stats, db_path, info.get("session_id"))
         return {
             "ok": True,
             "line": line,
@@ -2061,6 +2318,8 @@ def read_stats_once(data_dir, db_path, cfg=None):
             "line1": info.get("line1") or SESSION_UNKNOWN,
             "speedTokPerSec": st.get("speedTokPerSec"),
             "speedAvgTokPerSec": st.get("speedAvgTokPerSec"),
+            "status": status,
+            "recentTurn": turn_stats,
             "version": STATUSBAR_VERSION,
             "live": live if isinstance(live, dict) else None,
         }
@@ -2733,122 +2992,136 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         canvas.tag_bind("hdl", "<Leave>", _leave)
 
     def render_ui(info):
-        """整幅重画（同一回调内 delete+create，Tk 单次刷帧无闪烁）：
-        顶部 1px 分隔线 + 第一行（●模型 会话）+ close 小块 + 第二行彩色指标块。
-        窗口宽按内容自适应（plan_statusbar_layout）：指标块（含 cache read）
-        永不因宽度丢块，超上限时依次收标题 -> 缩间距 -> 省累计标注。"""
+        """整幅重画（0.4.0 对话级三区：同一回调内 delete+create，Tk 单次刷帧
+        无闪烁）：顶部 1px 分隔线 + 第一行（状态徽标 + 对话名）+ 第二行
+        （本轮统计）+ 右侧小字（会话累计）+ close 小块。
+        窗口宽按内容自适应（plan_statusbar_layout_3zone）：状态徽标 / 本轮
+        统计 / 累计小字**永不因宽度裁剪**，超上限时依次收对话名 -> 缩间距 ->
+        省累计标注。"""
         canvas.delete("all")
         if state.get("collapsed"):
             # 收起态：只画底部小把手（◐ 命中率），几何走 HANDLE_H 分支
             _render_handle(info)
             return
-        show_m = cfg.get("show_model", True)
-        show_s = cfg.get("show_session", True)
+        show_status = cfg.get("show_status", True)
+        show_turn = cfg.get("show_recent_turn", True)
+        show_cum = cfg.get("show_cumulative", True)
+        status = info.get("status") or "idle"
+        speed = info.get("status_speed")
         model = info.get("model")
         label = info.get("session_label")
-        mtxt = (_truncate(model, 20) or "model?") if (show_m and model) else None
+        turn = info.get("turn_stats")
+        cum = info.get("stats")
 
-        # ---- 先实测、后布局：块宽/标注宽/第一行宽（tkinter.font 实测）----
-        blocks = build_metric_blocks(info.get("stats"), cfg)
-        block_ws = compute_block_widths(
-            blocks,
-            lambda t: f_icon.measure(t),
-            lambda t: f_main.measure(t),
-            lambda t: f_num.measure(t))
-        has_note = bool(info.get("stats") and info.get("recent_note"))
+        _fmap = {FONT_MAIN: f_main, FONT_NUM: f_num, FONT_DIM: f_dim,
+                 ICON_FONT: f_icon}
+
+        def _turn_segments(ts):
+            """本轮统计分段（(text, font, fg) 列表）；无数据返回单段占位。"""
+            if not ts:
+                return [(TURN_PENDING, FONT_MAIN, FG_DIM)]
+            inp = int(ts.get("inputTokens") or 0)
+            cache_rd = int(ts.get("cacheReadTokens") or 0)
+            hit = (cache_rd / float(inp) * 100.0) if inp > 0 else 0.0
+            return [
+                (ICON_DUR, ICON_FONT, FG_DIM),
+                (u"%.1fs" % ((ts.get("durationMs") or 0) / 1000.0),
+                 FONT_NUM, FG),
+                (u" \u00b7 in ", FONT_MAIN, FG_DIM),
+                (format_tokens(inp), FONT_NUM, FG),
+                (u" \u00b7 out ", FONT_MAIN, FG_DIM),
+                (format_tokens(ts.get("outputTokens") or 0), FONT_NUM, FG),
+                (u" \u00b7 cache hit ", FONT_MAIN, FG_DIM),
+                (u"%.1f%%" % hit, FONT_NUM, FG),
+            ]
+
+        def _draw_turn_stats(x, y, ts):
+            """第二行：本轮统计分段绘制（数字等宽防跳字）+ 整行悬停 tooltip。"""
+            segs = _turn_segments(ts)
+            for t, f, c in segs:
+                canvas.create_text(x, y, text=t, font=f, fill=c,
+                                   anchor="w", tags=("m_turn",))
+                x += _fmap[f].measure(t)
+            bind_hover("m_turn", TIP_TURN)
+
+        # ---- 文本拼装 ----
+        badge_txt = STATUS_TEXT.get(status, STATUS_TEXT["idle"])
+        if status == "generating" and speed is not None:
+            badge_txt += u" %.1f tok/s" % speed
+        turn_segs = _turn_segments(turn)
+        turn_w = sum(_fmap[f].measure(t) for t, f, _ in turn_segs)
+        cum_txt = cumulative_text(cum)
+        has_note = bool(cum and info.get("recent_note"))
+
+        # ---- 先实测、后布局（三区宽度全部 tkinter.font 实测）----
+        badge_w = 0
+        if show_status:
+            badge_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt)
+        cum_w = f_dim.measure(cum_txt) if (show_cum and cum_txt) else 0
         note_w = f_dim.measure(SESSION_RECENT_NOTE) if has_note else 0
 
-        def _row1_w(lm):
-            w = 12
-            if mtxt:
-                w += 10 + f_dim.measure(mtxt) + 8
-            if show_s and label:
-                w += f_dim.measure(_truncate(label, lm) or u"")
-            return w
+        def _title_w(lm):
+            if not label:
+                return 0
+            return f_dim.measure(_truncate(label, lm) or u"")
 
-        plan = plan_statusbar_layout(block_ws, _row1_w, note_w,
-                                     _avail_work_w())
+        plan = plan_statusbar_layout_3zone(badge_w, _title_w, turn_w, cum_w,
+                                           note_w, _avail_work_w())
         win_w = _apply_width(plan["win_w"])
-        gap = plan["gap"]
+        badge_gap = plan["badge_gap"]
+        show_cum_now = bool(plan["show_cum"] and cum_txt)
+        show_note_now = bool(plan["show_note"] and has_note)
 
         # 顶部 1px 分隔线（提质感）
         canvas.create_rectangle(0, 0, win_w, 1, fill=EDGE_LINE, outline="")
 
-        # ---- 第一行：● 模型（蓝）+ 会话标题（灰，按布局档位截断）----
+        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 对话名 ----
         x = 12
-        has_any = False
-        if mtxt:
-            has_any = True
-            canvas.create_oval(x, ROW1_CY - 3, x + 6, ROW1_CY + 3,
-                               fill=ACCENT_BLUE, outline="")
-            x += 10
-            canvas.create_text(x, ROW1_CY, text=mtxt, font=FONT_DIM,
-                               fill=ACCENT_BLUE, anchor="w", tags=("m_model",))
-            x += f_dim.measure(mtxt) + 8
-        if show_s and label:
-            has_any = True
-            canvas.create_text(x, ROW1_CY, text=_truncate(label, plan["label_max"]),
+        if show_status:
+            color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
+            rect = round_rect(canvas, x, ROW1_CY - BADGE_H / 2.0,
+                              x + badge_w, ROW1_CY + BADGE_H / 2.0, 9,
+                              fill=color, outline="")
+            canvas.create_text(x + badge_w / 2.0, ROW1_CY, text=badge_txt,
+                               font=BADGE_FONT, fill=BADGE_FG,
+                               anchor="center", tags=("m_badge",))
+            bind_hover("m_badge",
+                       STATUS_TIPS.get(status, STATUS_TIPS["idle"]),
+                       rect, color, color)
+            x += badge_w + badge_gap
+        if label:
+            canvas.create_text(x, ROW1_CY,
+                               text=_truncate(label, plan["label_max"])
+                               or u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09",
                                font=FONT_DIM, fill=FG_DIM, anchor="w",
                                tags=("m_sess",))
-        if not has_any:
-            # fail-closed：第一行无内容 -> 会话未识别占位（与旧口径一致）
+            tip = u"\u4f1a\u8bdd\uff1a%s" % label
+            if model:
+                tip = tip + u"\n\u6a21\u578b\uff1a%s" % model
+            bind_hover("m_sess", tip)
+        elif not show_status:
+            # fail-closed：徽标也关掉且无对话名 -> 会话未识别占位
             canvas.create_text(12, ROW1_CY, text=SESSION_UNKNOWN,
                                font=FONT_DIM, fill=FG_DIM, anchor="w")
-        if show_m and model:
-            bind_hover("m_model", u"\u6a21\u578b\uff1a%s" % model)
-        if show_s and label:
-            bind_hover("m_sess", u"\u4f1a\u8bdd\uff1a%s" % label)
 
         # ---- 右上 close 小块 ----
         _draw_close(win_w)
 
-        # ---- 第二行：彩色指标块（全部渲染，永不因宽度丢块；关掉的块不画）----
-        x = 10
-        for blk, w in zip(blocks, block_ws):
-            if blk["kind"] == "pending":
-                # 无数据 / 显示项全关：单块灰字占位（fail-closed 文案）
-                txt = blk["text"]
-                round_rect(canvas, x, ROW2_Y, x + w, ROW2_Y + BLOCK_H, 6,
-                           fill=BLOCK_BG, outline="")
-                canvas.create_text(x + BLOCK_PAD, ROW2_Y + BLOCK_H / 2.0,
-                                   text=txt, font=FONT_MAIN, fill=FG_DIM,
-                                   anchor="w")
-                x += w + gap
-                continue
-            y0, y1 = ROW2_Y, ROW2_Y + BLOCK_H
-            tag = "blk_" + blk["kind"]
-            rect = round_rect(canvas, x, y0, x + w, y1, 6,
-                              fill=BLOCK_BG, outline="")
-            has_bar = blk.get("progress") is not None
-            ty = y0 + 11 if has_bar else (y0 + y1) / 2.0
-            tx = x + BLOCK_PAD
-            canvas.create_text(tx, ty, text=blk["icon"], font=ICON_FONT,
-                               fill=blk["icon_color"], anchor="w", tags=(tag,))
-            tx += f_icon.measure(blk["icon"]) + 5
-            canvas.create_text(tx, ty, text=blk["label"], font=FONT_MAIN,
-                               fill=FG_DIM, anchor="w", tags=(tag,))
-            tx += f_main.measure(blk["label"]) + 5
-            canvas.create_text(tx, ty, text=blk["value"], font=FONT_NUM,
-                               fill=blk["value_color"], anchor="w", tags=(tag,))
-            if has_bar:
-                pct = max(0.0, min(100.0, float(blk["progress"])))
-                bx, by = x + BLOCK_PAD, y0 + 19
-                canvas.create_rectangle(bx, by, bx + BAR_W, by + BAR_H,
-                                        fill=BAR_SLOT, outline="", tags=(tag,))
-                fillw = int(round(BAR_W * pct / 100.0))
-                if fillw >= 1:
-                    bar_color = BAR_FILL_HI if pct > 70.0 else BAR_FILL
-                    canvas.create_rectangle(bx, by, bx + fillw, by + BAR_H,
-                                            fill=bar_color, outline="",
-                                            tags=(tag,))
-            bind_hover(tag, blk.get("tip"), rect, BLOCK_BG, BLOCK_HOVER)
-            x += w + gap
-        # jsonl 兜底判定的会话：块行尾灰字标注（与 --once 一致；超宽时布局
-        # 收缩链的最后手段是省略本标注，指标块任何情况都保留）
-        if plan["show_note"]:
-            canvas.create_text(x - gap + 2, ROW2_Y + BLOCK_H / 2.0,
-                               text=SESSION_RECENT_NOTE, font=FONT_DIM,
-                               fill=FG_DIM, anchor="w")
+        # ---- 第二行：本轮统计（左侧）+ 会话累计小字（右侧）----
+        if show_turn:
+            _draw_turn_stats(10, ROW2_TURN_Y, turn)
+        if show_cum_now:
+            # 累计小字右对齐（close 小块左侧留白），jsonl 兜底判定时左侧
+            # 附「（最近会话累计）」标注（超宽时布局先省略标注，不裁统计）。
+            cx = win_w - CLOSE_RESERVE_W - 6
+            canvas.create_text(cx, ROW2_TURN_Y, text=cum_txt, font=FONT_DIM,
+                               fill=FG_DIM, anchor="e", tags=("m_cum",))
+            bind_hover("m_cum", TIP_CUM)
+            if show_note_now:
+                canvas.create_text(cx - f_dim.measure(cum_txt) - 6,
+                                   ROW2_TURN_Y, text=SESSION_RECENT_NOTE,
+                                   font=FONT_DIM, fill=FG_DIM, anchor="e",
+                                   tags=("m_cum_note",))
 
     def current_window_xy():
         """取小条当前屏幕坐标 (x, y)；失败返回 None。"""
@@ -3036,7 +3309,6 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                 lambda _e: collapse_bar() if not state.get("collapsed") else None)
 
     def refresh_stats():
-        line_fallback = STATS_PENDING
         info = {"text": None, "line1": None, "session_id": None,
                 "model": None, "session_label": None, "stats": None}
         try:
@@ -3052,37 +3324,27 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         except Exception:
             pass
         try:
-            # 实时流优先（0.3.0）：本地 SSE 代理正在转发且新鲜 -> 生成中视图；
-            # 流结束且 usage 新鲜 -> 精确 usage 视图；否则维持原 db/jsonl 轮询。
+            rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
+            mark_sid = read_mark_file(data_dir)
+            mark_changed = state.get("last_mark_sid") != mark_sid
+            state["last_mark_sid"] = mark_sid
+            force_db = (state["last_info"] is None
+                        or mark_changed
+                        or state["db_read_count"] == 0)
+            cur_cache = None if force_db else state["last_info"]
+            info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
+                                    cur=cur_cache)
+            # 实时流（0.4.0 并入状态徽标）：活跃且新鲜 -> 生成中徽标 + 实时
+            # tok/s；流结束/过期 -> 交给 db 行判定（工具中/出错/空闲）。
             live_stats = None
             if cfg.get("show_live", True):
                 live = read_live_stream(data_dir)
                 live_stats = live_to_stats(live, cfg)
-            if live_stats is not None:
-                base = state.get("last_info") or {}
-                info = {
-                    "text": None,
-                    "line1": base.get("line1") or SESSION_UNKNOWN,
-                    "session_id": base.get("session_id"),
-                    "model": base.get("model"),
-                    "session_label": base.get("session_label"),
-                    "stats": live_stats,
-                    "recent_note": False,
-                }
-                line_fallback = stats_to_text(live_stats, cfg)
-            else:
-                rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
-                mark_sid = read_mark_file(data_dir)
-                mark_changed = state.get("last_mark_sid") != mark_sid
-                state["last_mark_sid"] = mark_sid
-                force_db = (state["last_info"] is None
-                            or mark_changed
-                            or state["db_read_count"] == 0)
-                cur_cache = None if force_db else state["last_info"]
-                info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
-                                        cur=cur_cache)
-                if info.get("line2") is not None:
-                    line_fallback = info["line2"]
+            status, spd, turn_stats = resolve_turn_status(
+                live_stats, db_path, info.get("session_id"))
+            info["status"] = status
+            info["status_speed"] = spd
+            info["turn_stats"] = turn_stats
         except Exception:
             pass
         state["last_info"] = info
