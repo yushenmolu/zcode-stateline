@@ -116,7 +116,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.4.0-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.4.1-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -3059,6 +3059,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             badge_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt)
         cum_w = f_dim.measure(cum_txt) if (show_cum and cum_txt) else 0
         note_w = f_dim.measure(SESSION_RECENT_NOTE) if has_note else 0
+        # 模型名并入不可裁槽（与徽标同槽：徽标+模型名恒不裁，对话名按剩余宽截短）
+        if cfg.get("show_model", True) and model:
+            badge_w += f_dim.measure(_truncate(model, 20) or "model?") + 8
 
         def _title_w(lm):
             if not label:
@@ -3075,7 +3078,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         # 顶部 1px 分隔线（提质感）
         canvas.create_rectangle(0, 0, win_w, 1, fill=EDGE_LINE, outline="")
 
-        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 对话名 ----
+        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 模型名（蓝）+ 对话名 ----
         x = 12
         if show_status:
             color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
@@ -3089,6 +3092,12 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                        STATUS_TIPS.get(status, STATUS_TIPS["idle"]),
                        rect, color, color)
             x += badge_w + badge_gap
+        if cfg.get("show_model", True) and model:
+            mtxt = _truncate(model, 20) or "model?"
+            canvas.create_text(x, ROW1_CY, text=mtxt, font=FONT_DIM,
+                               fill=ACCENT_BLUE, anchor="w", tags=("m_model",))
+            x += f_dim.measure(mtxt) + 8
+            bind_hover("m_model", u"模型：%s" % model)
         if label:
             canvas.create_text(x, ROW1_CY,
                                text=_truncate(label, plan["label_max"])
