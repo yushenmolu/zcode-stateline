@@ -111,7 +111,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.2.2-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.3.0-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -121,6 +121,9 @@ JSONL_NAME = "token-stats.jsonl"
 PID_NAME = "statusbar.pid"
 MARK_FILE_NAME = "current-session.json"
 CONFIG_FILE_NAME = "statusbar-config.json"
+LIVE_STREAM_NAME = "live_stream.json"   # 实时流计数共享文件（proxy_server.py 原子写）
+LIVE_STALE_MS = 60 * 1000               # 实时流新鲜窗口：距最后事件超此值视为过期/卡住
+LIVE_USAGE_FRESH_MS = 30 * 1000         # 流结束后精确 usage 的展示窗口（随后回 db 轮询）
 MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（30 秒）
 DB_ACTIVE_WINDOW_MS = 60 * 1000  # db 兜底判定窗口：最近 60 秒内有模型调用才算活跃
 DB_READ_INTERVAL = 5        # 每 N 次刷新才重读一次 db（model/title 不频繁变化）
@@ -180,6 +183,7 @@ ICON_HIT = u"\u25d0"     # ◐ 缓存命中
 ICON_CRD = u"\u21bb"     # ↻ cache read
 ICON_RSN = u"\u2726"     # ✦ reasoning
 ICON_SPD = u"\u26a1"     # ⚡ 速度 tok/s
+ICON_LIVE = u"\u25cf"    # ● 实时生成中
 
 # ---- 靠边收起（collapsed 把手）----
 HANDLE_H = 18            # 收起把手高度（小条 ~72x18）
@@ -206,6 +210,7 @@ DEFAULT_CONFIG = {
     "show_cache_hit": True,
     "show_speed": True,
     "show_reasoning": False,
+    "show_live": True,
     "collapsed": False,
     "handle_x": None,
     "handle_y": None,
@@ -301,7 +306,7 @@ def _apply_raw_config(cfg, raw, skip_collapsed=False):
     """
     for key in ("show_model", "show_session", "show_avg_duration", "show_input",
                 "show_output", "show_cache_read", "show_cache_hit", "show_speed",
-                "show_reasoning", "collapsed"):
+                "show_reasoning", "show_live", "collapsed"):
         if skip_collapsed and key == "collapsed":
             continue
         if key in raw:
@@ -374,6 +379,7 @@ SHOW_MENU_ITEMS = (
     (u"\u7f13\u5b58\u8bfb\u53d6", "show_cache_read"),  # 缓存读取
     (u"\u901f\u5ea6 tok/s", "show_speed"),         # 速度 tok/s
     (u"\u63a8\u7406", "show_reasoning"),           # 推理
+    (u"\u5b9e\u65f6\u751f\u6210", "show_live"),    # 实时生成（本地 SSE 代理计数）
 )
 
 
@@ -1106,6 +1112,91 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None):
 
 
 # ---------------------------------------------------------------------------
+# 实时流（0.3.0）：读取 proxy_server.py 写的 live_stream.json，转成状态条 stats
+# ---------------------------------------------------------------------------
+
+def read_live_stream(data_dir):
+    """读本地 SSE 代理的实时计数文件；不存在 / 坏 JSON 返回 None（绝不抛）。
+
+    与 proxy_server.py 约定：<data-dir>/live_stream.json，原子写。
+    """
+    try:
+        with open(os.path.join(data_dir, LIVE_STREAM_NAME), "r",
+                  encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def live_elapsed_s(live):
+    """流已耗时秒（now - started_at）；缺 started_at 返回 None。"""
+    try:
+        st = float(live.get("started_at") or 0)
+    except Exception:
+        st = 0.0
+    if st <= 0:
+        return None
+    return max(time.time() - st, 0.0)
+
+
+def live_to_stats(live, cfg=None):
+    """把 live_stream.json 快照转成状态条 stats（纯函数，可独立单测）。
+
+    返回 None = 无实时流可展示（调用方维持原 db 轮询逻辑）：
+      - active=True 且距 last_event_at 新鲜（< LIVE_STALE_MS）-> 生成中 stats：
+        {stream_active:True, outputTokens:字符≈token, reasoningTokens,
+         speedTokPerSec:字符/耗时, elapsed_s}
+      - active=False 但 last_usage 新鲜（距 ts < LIVE_USAGE_FRESH_MS）
+        -> 精确 usage stats（{precise_usage:True, input/output/cacheRead...}）
+      - 其余（无文件 / 过期 / 无 usage）-> None
+    """
+    if not live:
+        return None
+    now = time.time()
+    try:
+        ts = float(live.get("ts") or 0)
+    except Exception:
+        ts = 0.0
+    try:
+        last_evt = float(live.get("last_event_at") or ts)
+    except Exception:
+        last_evt = ts
+    active = bool(live.get("active"))
+    if active and (now - last_evt) < (LIVE_STALE_MS / 1000.0):
+        chars = int(live.get("stream_output_chars") or 0)
+        reas = int(live.get("stream_reasoning_chars") or 0)
+        elapsed = live_elapsed_s(live)
+        speed = (chars / elapsed) if (elapsed and elapsed > 0.05) else None
+        return {
+            "stream_active": True,
+            "inputTokens": int(live.get("stream_input_tokens") or 0),
+            "outputTokens": chars,
+            "reasoningTokens": reas,
+            "speedTokPerSec": speed,
+            "elapsed_s": elapsed,
+        }
+    if not active and ts > 0 and (now - ts) < (LIVE_USAGE_FRESH_MS / 1000.0):
+        u = live.get("last_usage")
+        if isinstance(u, dict):
+            outp = int(u.get("output_tokens") or 0)
+            elapsed = live_elapsed_s(live)
+            st = {
+                "stream_active": False,
+                "precise_usage": True,
+                "inputTokens": int(u.get("input_tokens") or 0),
+                "outputTokens": outp,
+                "cacheReadTokens": int(u.get("cache_read_input_tokens") or 0),
+                "reasoningTokens": int(u.get("reasoning_tokens") or 0),
+                "elapsed_s": elapsed,
+            }
+            if elapsed and elapsed > 0.05:
+                st["speedTokPerSec"] = outp / elapsed
+            return st
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 显示项拼接（按配置 show_* 决定第二行拼哪些指标）
 # ---------------------------------------------------------------------------
 
@@ -1120,6 +1211,8 @@ def build_line2_parts(stats, cfg):
     """
     if not stats:
         return [("text", STATS_PENDING, FONT_MAIN, FG, None)]
+    if stats.get("stream_active"):
+        return _build_live_parts(stats)
     show_dur = cfg.get("show_avg_duration", True)
     show_in = cfg.get("show_input", True)
     show_out = cfg.get("show_output", True)
@@ -1176,6 +1269,37 @@ def build_line2_parts(stats, cfg):
     return parts
 
 
+# 实时流 tooltip 文案（0.3.0）
+TIP_LIVE = (u"\u5b9e\u65f6\u6d41\uff1a\u6b63\u5728\u751f\u6210\u4e2d\uff0c"
+            u"\u6570\u503c\u4e3a\u5b57\u7b26\u8fd1\u4f3c token\uff0c"
+            u"\u6d41\u7ed3\u675f\u5207\u6362\u7cbe\u786e usage")
+            # 实时流：正在生成中，数值为字符近似 token，流结束切换精确 usage
+TIP_LIVE_SPD = (u"\u5b9e\u65f6\u901f\u5ea6\uff1a\u7d2f\u8ba1\u5b57\u7b26 \u00f7 "
+                u"\u6d41\u5df2\u7528\u65f6\u957f\uff08\u5b57\u7b26\u2248token \u8fd1\u4f3c\uff09")
+                # 实时速度：累计字符 ÷ 流已用时长（字符≈token 近似）
+TIP_LIVE_OUT = (u"\u5b9e\u65f6\u8f93\u51fa\uff1a\u5f53\u524d\u6d41\u7684\u7d2f\u8ba1"
+                u"\u8f93\u51fa\u5b57\u7b26\uff08\u8fd1\u4f3c token\uff0c"
+                u"\u6d41\u7ed3\u675f\u540e\u4ee5 usage \u7cbe\u786e\u503c\u66ff\u6362\uff09")
+                # 实时输出：当前流的累计输出字符（近似 token，流结束后以 usage 精确值替换）
+
+
+def _build_live_parts(stats):
+    """生成中视图的文本片段（--once / stats_to_text 用）：⚡ tok/s · out 累计 · 生成中…"""
+    parts = []
+    spd = stats.get("speedTokPerSec")
+    if spd is not None:
+        parts.append(("speed", u"\u26a1%.1f tok/s" % spd,
+                      FONT_NUM, ACCENT_ORANGE, TIP_LIVE_SPD))
+        parts.append(("sep", u" \u00b7 ", FONT_MAIN, SEP_COLOR, None))
+    parts.append(("label", u"out ", FONT_MAIN, FG_DIM, TIP_LIVE_OUT))
+    parts.append(("out", format_tokens(stats.get("outputTokens", 0)),
+                  FONT_NUM, FG, None))
+    parts.append(("sep", u" \u00b7 ", FONT_MAIN, SEP_COLOR, None))
+    parts.append(("streaming", u"\u751f\u6210\u4e2d\u2026",
+                  FONT_MAIN, ACCENT_GREEN, TIP_LIVE))
+    return parts
+
+
 def stats_to_text(stats, cfg):
     """按配置把 stats 渲染成一行文本（--once 的 line 输出；GUI 侧改为指标块渲染）。"""
     if stats is None:
@@ -1200,6 +1324,31 @@ TIP_SPD = (u"\u901f\u5ea6\uff1a\u6700\u8fd1\u4e00\u6b21\u8bf7\u6c42\u7684\u8f93\
            # 速度：最近一次请求的输出速度 = 输出 token ÷ 该次耗时
 
 
+def _build_live_blocks(stats):
+    """生成中视图的彩色指标块（0.3.0）：⚡ tok/s · out 累计字符 · ● 生成中…
+    速度有值才画（流刚开始无速度时不画、不留空位，与 db 速度块口径一致）。"""
+    blocks = []
+    spd = stats.get("speedTokPerSec")
+    if spd is not None:
+        blocks.append({
+            "kind": "speed", "icon": ICON_SPD, "icon_color": ACCENT_ORANGE,
+            "label": "", "value": u"%.1f tok/s" % spd,
+            "value_color": ACCENT_ORANGE, "tip": TIP_LIVE_SPD, "progress": None,
+        })
+    blocks.append({
+        "kind": "output", "icon": ICON_OUT, "icon_color": FG,
+        "label": "out",
+        "value": format_tokens(stats.get("outputTokens", 0)),
+        "value_color": FG, "tip": TIP_LIVE_OUT, "progress": None,
+    })
+    blocks.append({
+        "kind": "streaming", "icon": ICON_LIVE, "icon_color": ACCENT_GREEN,
+        "label": "", "value": u"\u751f\u6210\u4e2d\u2026",
+        "value_color": ACCENT_GREEN, "tip": TIP_LIVE, "progress": None,
+    })
+    return blocks
+
+
 def build_metric_blocks(stats, cfg):
     """
     按配置把 stats 拆成「彩色指标块」描述列表（纯数据；块宽由渲染层按字体实测）。
@@ -1210,6 +1359,8 @@ def build_metric_blocks(stats, cfg):
     """
     if not stats:
         return [{"kind": "pending", "text": STATS_PENDING, "tip": None}]
+    if stats.get("stream_active"):
+        return _build_live_blocks(stats)
     blocks = []
     if cfg.get("show_avg_duration", True):
         blocks.append({
@@ -1899,6 +2050,7 @@ def read_stats_once(data_dir, db_path, cfg=None):
         if line is None:
             line = STATS_PENDING
         st = info.get("stats") or {}
+        live = read_live_stream(data_dir)
         return {
             "ok": True,
             "line": line,
@@ -1910,6 +2062,7 @@ def read_stats_once(data_dir, db_path, cfg=None):
             "speedTokPerSec": st.get("speedTokPerSec"),
             "speedAvgTokPerSec": st.get("speedAvgTokPerSec"),
             "version": STATUSBAR_VERSION,
+            "live": live if isinstance(live, dict) else None,
         }
     except Exception as e:
         return {"ok": False, "line": STATS_PENDING, "source": "error", "error": str(e)}
@@ -2899,17 +3052,37 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         except Exception:
             pass
         try:
-            rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
-            mark_sid = read_mark_file(data_dir)
-            mark_changed = state.get("last_mark_sid") != mark_sid
-            state["last_mark_sid"] = mark_sid
-            force_db = (state["last_info"] is None
-                        or mark_changed
-                        or state["db_read_count"] == 0)
-            cur_cache = None if force_db else state["last_info"]
-            info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=cur_cache)
-            if info.get("line2") is not None:
-                line_fallback = info["line2"]
+            # 实时流优先（0.3.0）：本地 SSE 代理正在转发且新鲜 -> 生成中视图；
+            # 流结束且 usage 新鲜 -> 精确 usage 视图；否则维持原 db/jsonl 轮询。
+            live_stats = None
+            if cfg.get("show_live", True):
+                live = read_live_stream(data_dir)
+                live_stats = live_to_stats(live, cfg)
+            if live_stats is not None:
+                base = state.get("last_info") or {}
+                info = {
+                    "text": None,
+                    "line1": base.get("line1") or SESSION_UNKNOWN,
+                    "session_id": base.get("session_id"),
+                    "model": base.get("model"),
+                    "session_label": base.get("session_label"),
+                    "stats": live_stats,
+                    "recent_note": False,
+                }
+                line_fallback = stats_to_text(live_stats, cfg)
+            else:
+                rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
+                mark_sid = read_mark_file(data_dir)
+                mark_changed = state.get("last_mark_sid") != mark_sid
+                state["last_mark_sid"] = mark_sid
+                force_db = (state["last_info"] is None
+                            or mark_changed
+                            or state["db_read_count"] == 0)
+                cur_cache = None if force_db else state["last_info"]
+                info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
+                                        cur=cur_cache)
+                if info.get("line2") is not None:
+                    line_fallback = info["line2"]
         except Exception:
             pass
         state["last_info"] = info

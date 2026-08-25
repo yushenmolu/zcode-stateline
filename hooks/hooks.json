@@ -29,6 +29,11 @@
             "type": "command",
             "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/ensure-docked-statusbar.cmd\"",
             "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/ensure-proxy.cmd\"",
+            "async": false
           }
         ]
       }

@@ -4,7 +4,7 @@
 
 > English in one sentence: A ZCode plugin that shows real-time token usage, cache hit rate and speed (duration/TTFT) per conversation — as an in-chat stats line plus a docked status bar, with a `/stats` command for full reports.
 
-- 版本：0.2.0
+- 版本：0.3.0
 - 许可：MIT
 - 平台：Windows（ZCode 桌面版 + Python 3.10+，仅标准库，无第三方依赖）
 
@@ -45,8 +45,9 @@
   - **按当前对话各自统计**：状态条跟随当前活跃对话，显示**该会话自己**的累计数据；子代理（subagent）会话一律过滤，不串数据。
   - **可拖动**：按住任意区域左键拖到任意位置（自动钳制在屏幕内）；拖动后停在原处，右键 →「重新贴边」恢复自动跟随。
   - **悬停解释（tooltip）**：悬停各指标约 0.4 秒弹出气泡解释含义，截断的模型名/会话标题显示完整值。
-  - **右键「显示项」菜单**：9 个指标开关直接勾选切换，立即生效并自动写回配置文件。
+  - **右键「显示项」菜单**：10 个指标开关直接勾选切换，立即生效并自动写回配置文件。
   - **低延迟数据源**：每约 1 秒只读直查 ZCode 本地数据库 `model_usage` 行级记录（模型调用完成即落库），jsonl 记录仅作兜底。
+  - **实时生成流（0.3.0 新增）**：本地 SSE 反向代理 `proxy_server.py`（127.0.0.1:18080 → 127.0.0.1:8080）透明转发模型请求，边收边转发的同时按 SSE 协议逐事件解析 `delta.reasoning_content` / `delta.content` 的字符增量（近似 token），流末尾 `usage` 取精确值，每事件原子写 `live_stream.json`。状态条每秒轮询该文件：生成中时第二行切换为 `⚡ <近似 tok/s> · out <累计字符≈token> · 生成中…`；流结束且 `last_usage` 新鲜（30 秒内）→ 精确 usage 更新；无流 → 维持原 db 轮询。配置开关 `show_live`（默认 true，右键「显示项」可关闭），代理与状态条独立进程，崩溃只丢实时视图不影响 db 统计。**需配置 ZCode 的 baseURL 改为 `http://127.0.0.1:18080/v1` 后生效**（由另一子代理完成）。
 - **对话内自动统计行（兜底显示）**：会话启动与每轮提问时通过钩子注入上下文，模型在每次回复末尾自动附一行固定格式的统计；状态条不在时也有数字可看。
 - **每轮 Stop 自动记录**：每轮结束自动把该会话新增的已完成调用聚合为一行 JSON，追加到 `token-stats.jsonl` 长期档案（幂等，重复触发不产生重复行）。
 - **`/stats` 斜杠命令**：会话内输入 `/stats [会话|历史|模型|缓存|速度]` 输出统计报告。
@@ -101,13 +102,14 @@
 | `show_cache_hit` | `true` | 第二行显示缓存命中率（绿色，含微型进度条） |
 | `show_speed` | `true` | 第二行显示输出速度 ⚡ tok/s（最近一次请求，橙黄） |
 | `show_reasoning` | `false` | 第二行显示思考 token（reasoning，紫色） |
+| `show_live` | `true` | 实时生成流视图（0.3.0）：生成中显示 ⚡ tok/s · out 累计 · 生成中… |
 | `collapsed` | `false` | 状态条收起为底部迷你把手（双击/右键收起，悬停/单击展开；重启保持） |
 | `refresh_ms` | `1000` | 刷新/贴边轮询间隔毫秒（250–60000） |
 | `theme` | `"dark"` | 主题（当前仅 dark） |
 
 ### 右键菜单
 
-- **显示项**：9 个指标开关（模型/会话/耗时/输入/输出/缓存命中/缓存读取/速度 tok/s/推理），勾选即显隐，立即重画并自动写回配置。
+- **显示项**：10 个指标开关（模型/会话/耗时/输入/输出/缓存命中/缓存读取/速度 tok/s/推理/实时生成），勾选即显隐，立即重画并自动写回配置。
 - **重新贴边**：拖动过后恢复自动跟随 ZCode 窗口底部。
 - **收起到边缘**：把状态条收成屏幕底部迷你把手（双击状态条同效）。
 - **退出 statusbar**：关闭状态条。
@@ -125,8 +127,12 @@
 会话启动/提问 ──► hooks.json ──► mark-session.cmd ──► mark_session.py ──► current-session.json（当前会话标记）
                             └─► inject-context.cmd ──► inject_context.py ──► 注入统计行上下文（additionalContext）
                             └─► ensure-docked-statusbar.cmd ──► docked_statusbar.py（贴边状态条，每秒只读刷新）
+                            └─► ensure-proxy.cmd ──► proxy_server.py（本地 SSE 反向代理 18080→8080，0.3.0）
+                                                              └─► 逐事件解析计数 ──► live_stream.json（原子写）
+                                                              └─► 状态条每秒轮询：生成中/精确 usage 实时视图
 每轮结束 Stop ──► hooks.json ──► on-stop.cmd ──► record_usage.py ──► 只读聚合 db ──► 追加 token-stats.jsonl
 手动查报告 ────► /stats ──► db_stats.py ──► 只读聚合 db ──► 会话/历史/按模型统计
+模型请求（经 baseURL 改 18080 后）──► proxy_server.py ──► 透明转发 ──► 127.0.0.1:8080（ZCode 本地模型服务）
 ```
 
 - **数据库只读**：所有 SQL 经 `sqlite3.connect("file:...?mode=ro")` + `PRAGMA query_only=ON`，绝不写 ZCode 数据库。
@@ -141,6 +147,7 @@
 - 对话内统计行依赖模型遵循注入的格式指令，偶发遗漏属正常。
 - Stop 触发时最后一笔调用可能仍在途，该轮数据由游标在下一轮补齐（延迟而非丢失）；进程被强杀时该轮统计缺失。
 - 缓存命中率为输入侧口径，与厂商账单口径（含 cache_creation）可能不一致。
+- 实时流计数为**字符近似**（字符≈token），精确值以流末尾 `usage` 为准且仅展示最近一次请求；代理未运行（或 8080 上游不可达）时无实时视图，状态条自动维持 db 轮询不报错；需把 ZCode 模型 baseURL 改为 `http://127.0.0.1:18080/v1` 才走代理（未改前一切行为与旧版一致）。
 - ZCode 升级若改 `db.sqlite` 表结构，SQL 需要相应调整。
 
 ## 常见问题
