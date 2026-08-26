@@ -21,7 +21,9 @@ proxy_server.py — 本地 SSE 反向代理（zcode-token-stats 实时流计数�
   - 流末尾 usage（input/output/cacheRead/total 等）取精确值；
   - 每事件把实时计数**原子写**到 <data-dir>/live_stream.json，供
     docked_statusbar.py 每秒轮询展示「生成中 token / 速度」；流结束 /
-    异常 / 超时（60s 无数据）置 active=false 并保留精确 usage。
+    异常 / 超时（180s 无数据）置 active=false 并保留精确 usage。
+    0.5.0：**收到请求即写 active=true**（转发开始就落 active，不等上游
+    响应头），首 token 前的等待期状态条也能显示「生成中」。
 
 容错原则：不缓存、不缓冲（边收边转发）；上游断连/转发异常只记日志、关闭
 该连接，绝不影响 ZCode 对上游的重试（请求失败由客户端自行重试，语义与
@@ -43,7 +45,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.5.0"
 
 LISTEN_HOST_DEFAULT = "127.0.0.1"
 LISTEN_PORT_DEFAULT = 18080
@@ -54,7 +56,9 @@ DATA_DIR_DEFAULT = os.path.join(
 )
 STATE_FILE_NAME = "live_stream.json"
 LOG_FILE_NAME = "live-proxy.log"
-STREAM_READ_TIMEOUT = 60.0   # 上游读超时秒：60s 无数据 -> 置 active=false
+STREAM_READ_TIMEOUT = 180.0  # 上游读超时秒（0.5.0 60->180：模型首 token 延迟可达
+                             # 20-33s，大上下文更久；180s 无数据才置 active=false，
+                             # 可 --stream-timeout 覆盖）
 STATE_THROTTLE_S = 0.15      # 状态文件写限流（每秒最多 ~6 次原子写）
 
 # 转发时跳过的请求头（由本代理重设/管理；Accept-Encoding 去掉以保上游返回明文）
@@ -422,6 +426,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._send_bad_gateway()
                 return
             try:
+                # 0.5.0：收到请求即写 active=true（不等上游响应头）——首 token
+                # 前的等待期状态条也能显示「生成中」；非 SSE 请求也会短暂 active
+                # 后由下方 finally 的 finish 置回 false。
+                if self.keeper is not None:
+                    self.keeper.begin(sid, model, sess)
                 self._send_upstream(up_sock, body)
                 self._forward_response(sid, up_sock, model, sess)
             finally:
@@ -429,6 +438,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     up_sock.close()
                 except Exception:
                     pass
+                # 0.5.0：请求结束清理活跃流（SSE 已在 _forward_response 里带
+                # usage finish；这里对非 SSE/异常路径兜底，重复 finish 是 no-op）。
+                if self.keeper is not None:
+                    try:
+                        self.keeper.finish(sid, None)
+                    except Exception:
+                        pass
         except Exception as e:
             _log(self.log_dir, "handler error: %r" % (e,))
             try:
@@ -534,8 +550,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             keeper = self.keeper
             counter = None
             if is_sse and keeper is not None:
+                # 0.5.0：begin 已在 _forward 上游连接后调用（收到请求即 active）；
+                # 这里只挂事件回调更新计数。
                 counter = SSECounter()
-                keeper.begin(sid, model, sess)
                 counter.on_event = lambda: keeper.update(
                     sid, counter.output_chars, counter.reasoning_chars,
                     counter.input_tokens, counter.normalized_usage)
@@ -672,6 +689,9 @@ def parse_args(argv=None):
                     help="live state json path (default <data-dir>/live_stream.json)")
     ap.add_argument("--log-file", default=None,
                     help="log file path (default <data-dir>/live-proxy.log)")
+    ap.add_argument("--stream-timeout", type=float, default=None,
+                    help="upstream read timeout in seconds (default %g)"
+                         % STREAM_READ_TIMEOUT)
     ap.add_argument("--once", action="store_true",
                     help="self-test: parse a preset SSE sample and print counts, no listening")
     return ap.parse_args(argv)
@@ -712,6 +732,12 @@ def main(argv=None):
         sys.stdout.write(json.dumps(res, ensure_ascii=False) + "\n")
         return 0
 
+    # 0.5.0：--stream-timeout 覆盖全局超时（默认 180s）
+    timeout = args.stream_timeout
+    if timeout is not None and timeout > 0:
+        global STREAM_READ_TIMEOUT
+        STREAM_READ_TIMEOUT = timeout
+
     upstream_host, upstream_port = _parse_upstream(args.upstream)
     os.makedirs(data_dir, exist_ok=True)
     log_dir = data_dir
@@ -726,9 +752,10 @@ def main(argv=None):
         return 1
     server.daemon_threads = True
 
-    _log(log_dir, "boot VERSION=%s pid=%d listen=%s:%d upstream=%s:%d state=%s"
+    _log(log_dir, "boot VERSION=%s pid=%d listen=%s:%d upstream=%s:%d "
+         "stream_timeout=%.0fs state=%s"
          % (VERSION, os.getpid(), args.listen_host, args.listen_port,
-            upstream_host, upstream_port, state_file))
+            upstream_host, upstream_port, STREAM_READ_TIMEOUT, state_file))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

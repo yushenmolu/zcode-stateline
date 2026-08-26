@@ -33,6 +33,33 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
   - tok/s 弱化：速度从徽标内（粗体主显示）降为徽标旁小号灰字，仅生成中
     显示，不占主显示；--once 输出结构不变。
 
+0.5.0 变更（fix-20260826）：
+  - 子代理流不再抑制：0.4.2 的会话匹配闸（live_sid != session_id ->
+    不显示生成中）把子代理的实时流也压掉，用户盯子代理任务永远 idle。
+    现改为**不按会话抑制生成中**——只按 live active + 新鲜性判定，会话
+    跟随仍由 resolve_current_session 管，二者解耦（取舍：切换对话后旧流
+    残留会在新鲜窗口 45s 内显示生成中，换来的代价是子代理流可实时显示）；
+  - LIVE_STALE_MS 10s -> 45s：模型首 token 延迟实测 20-33s，10s 窗口在
+    首 token 前即判过期掉回 idle；45s 以 last_event_at 距 now < 45s 判定
+    新鲜，首 token 前也持续显示「生成中」；
+  - speed 为 None（首 token 前 / 计时不足）时本轮统计尾部显示「生成中…」
+    占位，不再静默无速度块；
+  - 配置显式化：load 时若 statusbar-config.json 缺失
+    show_live/show_status/show_recent_turn/show_cumulative/show_speed 等
+    键，自动补齐默认值写回文件（不覆盖用户已有值）；
+
+0.6.0 变更（fix-20260826）：
+  - 状态徽标改用 ZCode 钩子时序推断（status-state.json，status_event.py
+    原子写）：UserPromptSubmit -> generating（发消息即「⚡生成中」）；
+    PostToolUse -> tool（「🔧工具中」）；Stop -> idle。**不再读 live_stream、
+    不再依赖代理**（live_stream 即使存在也不读取）；
+  - tok/s 改用数据库精确值：最近一条 completed 非 subagent model_usage 的
+    output_tokens/(duration_ms/1000)（db_latest_speed），非流式字符≈token
+    近似；生成中时显示该精确速度（或最近一次速度）；
+  - STATUS_IDLE_AFTER_MS=60s：最近事件距 now 超 60s 一律回落「空闲」；
+  - show_live 语义保留（控制实时徽标显示；默认 true）；
+  - ensure-proxy 不再由 SessionStart 钩子默认拉起（代理降级为可选）。
+
 数据源（本轮改进）：
   - **主数据源 = db.sqlite（model_usage 行级）**：模型调用完成即落库，比
     jsonl（要等 Stop 钩子 record_usage.py 聚合写盘）早一轮，延迟更低。
@@ -130,7 +157,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.4.3-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.6.0-fix-20260826"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -141,8 +168,13 @@ PID_NAME = "statusbar.pid"
 MARK_FILE_NAME = "current-session.json"
 CONFIG_FILE_NAME = "statusbar-config.json"
 LIVE_STREAM_NAME = "live_stream.json"   # 实时流计数共享文件（proxy_server.py 原子写）
-LIVE_STALE_MS = 10 * 1000               # 实时流新鲜窗口：距最后事件超此值视为过期/卡住
-                                        # （0.4.2 60s->10s：切换对话后旧流不再长时间误报生成中）
+                                        # （0.6.0 起状态徽标不再读它，仅代理侧自用）
+STATUS_STATE_NAME = "status-state.json" # 钩子时序状态文件（status_event.py 原子写）
+STATUS_IDLE_AFTER_MS = 60 * 1000        # 钩子状态新鲜窗口：距最近事件超此值回落「空闲」
+LIVE_STALE_MS = 45 * 1000               # 实时流新鲜窗口：距 last_event_at 超此值视为过期/卡住
+                                        # （0.5.0 10s->45s：模型首 token 延迟实测 20-33s，
+                                        #  10s 窗口在首 token 前即判过期掉回 idle；45s 以
+                                        #  last_event_at 判定，首 token 前也持续显示生成中）
 LIVE_USAGE_FRESH_MS = 30 * 1000         # 流结束后精确 usage 的展示窗口（随后回 db 轮询）
 MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（30 秒）
 DB_ACTIVE_WINDOW_MS = 60 * 1000  # db 兜底判定窗口：最近 60 秒内有模型调用才算活跃
@@ -357,6 +389,21 @@ def load_config(config_path):
         return cfg, config_path
 
     _apply_raw_config(cfg, raw)
+    # 0.5.0 配置显式化：补齐缺失键（show_live / show_status /
+    # show_recent_turn / show_cumulative / show_speed 等）写回文件，
+    # 只补默认值，不覆盖用户已有值。
+    missing_keys = [k for k in DEFAULT_CONFIG if k not in raw]
+    if missing_keys:
+        for _k in missing_keys:
+            raw[_k] = DEFAULT_CONFIG[_k]
+        try:
+            os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+            _tmp = config_path + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            os.replace(_tmp, config_path)
+        except Exception:
+            pass
     return cfg, config_path
 
 
@@ -1092,57 +1139,97 @@ def db_latest_model_usage_status(db_path, session_id):
             pass
 
 
-def status_detector(live_stats, mu_row, tu_row):
-    """状态判定（0.4.0；纯函数，可独立单测）。返回 (status, speed_tok_per_s)：
-      status ∈ {'generating', 'error', 'tool', 'idle'}；speed 仅生成中可能
-      非 None（实时流 tok/s）。
+def _read_status_state(data_dir):
+    """读 ZCode 钩子时序状态文件 status-state.json（status_event.py 原子写）；
+    不存在 / 坏 JSON 返回 None（绝不抛）。0.6.0 起状态徽标唯一来源。"""
+    try:
+        with open(os.path.join(data_dir, STATUS_STATE_NAME), "r",
+                  encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
-      优先级（命中即返回；检测不到运行中状态时降级 'idle'，不误报）：
-        a. live_stats 且 stream_active=True（实时流新鲜——live_to_stats
-           已把关陈旧/卡住）-> 'generating'（绿⚡，speed 取实时流 tok/s）；
-        b. mu_row 且 status=='error' -> 'error'（红）；
-        c. mu_row 且 tool_call_count>0，或 tu_row 未完成
-           （tool_error_count>0 或 status 非 completed）-> 'tool'（蓝🔧）；
-        d. 否则 'idle'（灰）。
 
-      mu_row / tu_row 为 db 行 dict（db_latest_model_usage_status /
-      recent_turn_stats 的输出；None 表示无数据）。
+def db_latest_speed(db_path):
+    """最近一条 completed 非 subagent model_usage 的精确速度（0.6.0）：
+    output_tokens / (duration_ms / 1000)。返回 float 或 None（无数据 / 失败）。
+    tok/s 数据源从实时流改为 db 精确值，不再依赖 live_stream。"""
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT output_tokens, duration_ms FROM model_usage "
+            "WHERE status = 'completed' "
+            "AND COALESCE(query_source, '') <> 'subagent' "
+            "AND output_tokens > 0 AND duration_ms > 0 "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        outp, dur = row
+        if not outp or not dur:
+            return None
+        return outp / (dur / 1000.0)
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def status_detector(status_state, mu_row, tu_row, now=None):
+    """状态判定（0.6.0；纯函数，可独立单测）。返回 (status, speed_tok_per_s)：
+      status ∈ {'generating', 'tool', 'idle'}；speed 恒 None（生成中时由
+      调用方以 db_latest_speed 填充精确速度）。
+
+      状态来源 = ZCode 钩子时序（status-state.json，status_event.py 写）：
+        a. 最近事件 generating 且距 now < STATUS_IDLE_AFTER_MS（60s）
+           -> 'generating'（绿⚡）；
+        b. 最近事件 tool 且距 now < STATUS_IDLE_AFTER_MS -> 'tool'（蓝🔧）；
+        c. 否则 'idle'（无文件 / 事件超龄 / 事件未知 / 会话未识别）。
+
+      0.6.0 起不再读 live_stream、不再依赖代理（live_stream 即使存在也不
+      作为状态来源）。mu_row / tu_row 参数保留（历史签名兼容），不再参与
+      状态判定——状态完全由钩子时序决定。
     """
-    if live_stats and live_stats.get("stream_active"):
-        return "generating", live_stats.get("speedTokPerSec")
-    if mu_row and mu_row.get("status") == "error":
-        return "error", None
-    if mu_row and (mu_row.get("tool_call_count") or 0) > 0:
-        return "tool", None
-    if tu_row:
-        if (tu_row.get("toolErrorCount") or 0) > 0:
-            return "tool", None
-        if tu_row.get("status") and tu_row["status"] != "completed":
-            return "tool", None
+    if now is None:
+        now = time.time()
+    if isinstance(status_state, dict):
+        event = status_state.get("event")
+        ts = status_state.get("ts")
+        if event and ts:
+            try:
+                elapsed_ms = (now * 1000.0) - float(ts)
+            except Exception:
+                elapsed_ms = STATUS_IDLE_AFTER_MS
+            if elapsed_ms < STATUS_IDLE_AFTER_MS:
+                if event == "generating":
+                    return "generating", None
+                if event == "tool":
+                    return "tool", None
     return "idle", None
 
 
-def resolve_turn_status(live_stats, db_path, session_id):
-    """0.4.0 统一解析「状态 + 本轮统计」（GUI 每帧与 --once 共用）：
+def resolve_turn_status(status_state, db_path, session_id):
+    """0.6.0 统一解析「状态 + 本轮统计」（GUI 每帧与 --once 共用）：
     返回 (status, speed_tok_per_s, turn_stats)：
-      - status 走 status_detector（实时流活跃 -> 生成中；否则 db 行判定）；
+      - status 走 status_detector（ZCode 钩子时序：generating / tool / idle）；
+      - speed 仅生成中非 None：取 db_latest_speed（最近一次 completed
+        非 subagent model_usage 的精确 tok/s），不再依赖实时流；
       - turn_stats = recent_turn_stats 输出（最近一轮，无数据为 None）。
     会话未识别（None）时返回 ('idle', None, None)，不猜。
-
-    0.4.2 生成中防误报：live 流 active 但其 sessionId 存在且与当前会话不一致
-    （切到别的对话后旧流仍在/残留）时，按无实时流处理，不显示生成中。
-    live 流 sessionId 为 None（proxy 未提取到）时不抑制——无法证伪，宁可显示。
     """
     if not session_id:
         return "idle", None, None
     mu_row = db_latest_model_usage_status(db_path, session_id)
     tu_row = recent_turn_stats(db_path, session_id)
-    eff_live = live_stats
-    if live_stats and live_stats.get("stream_active"):
-        live_sid = live_stats.get("sessionId")
-        if live_sid is not None and live_sid != session_id:
-            eff_live = None  # 旧会话残留流：不误报生成中
-    status, spd = status_detector(eff_live, mu_row, tu_row)
+    status, spd = status_detector(status_state, mu_row, tu_row)
+    if status == "generating":
+        spd = db_latest_speed(db_path)
     return status, spd, tu_row
 
 
@@ -2331,11 +2418,8 @@ def read_stats_once(data_dir, db_path, cfg=None):
     任何异常不抛。line 按 cfg 的 show_* 裁剪（与旧第二行口径一致）。"""
     try:
         rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
-        live = read_live_stream(data_dir)
-        live_session_id = (live.get("sessionId")
-                           if live and live.get("active") else None)
         info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg, cur=None,
-                                live_session_id=live_session_id)
+                                live_session_id=None)
         if info.get("stats") is not None:
             line = stats_to_text(info["stats"], cfg or dict(DEFAULT_CONFIG))
             if info.get("recent_note"):
@@ -2345,9 +2429,12 @@ def read_stats_once(data_dir, db_path, cfg=None):
         if line is None:
             line = STATS_PENDING
         st = info.get("stats") or {}
-        live_stats = live_to_stats(live, cfg)
+        # 0.6.0：状态徽标来源改为钩子时序 status-state.json（不再读 live_stream）
+        status_state = (_read_status_state(data_dir)
+                        if (cfg or dict(DEFAULT_CONFIG)).get("show_live", True)
+                        else None)
         status, spd, turn_stats = resolve_turn_status(
-            live_stats, db_path, info.get("session_id"))
+            status_state, db_path, info.get("session_id"))
         return {
             "ok": True,
             "line": line,
@@ -2361,7 +2448,7 @@ def read_stats_once(data_dir, db_path, cfg=None):
             "status": status,
             "recentTurn": turn_stats,
             "version": STATUSBAR_VERSION,
-            "live": live if isinstance(live, dict) else None,
+            "live": None,  # 0.6.0：live_stream 不再作为状态来源（钩子时序替代）
         }
     except Exception as e:
         return {"ok": False, "line": STATS_PENDING, "source": "error", "error": str(e)}
@@ -3057,7 +3144,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                  ICON_FONT: f_icon}
 
         def _turn_segments(ts):
-            """本轮统计分段（(text, font, fg) 列表）；无数据返回单段占位。"""
+            """本轮统计分段（(text, font, fg) 列表）；无数据返回单段占位。
+            0.5.0：生成中时无论 speed 是否有值，尾部追加实时速度或占位文案
+            「生成中…」，确保首 token 前用户也看到生成中状态。"""
             if not ts:
                 segs = [(TURN_PENDING, FONT_MAIN, FG_DIM)]
             else:
@@ -3075,12 +3164,13 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                     (u" \u00b7 cache hit ", FONT_MAIN, FG_DIM),
                     (u"%.1f%%" % hit, FONT_NUM, FG),
                 ]
-            # 0.4.3：tok/s 放本轮统计尾部（生成中实时速度；小号灰字弱化，随
-            # show_live 开关联动；无历史轮次占位时同样显示，保证生成中可见）。
-            if (cfg.get("show_live", True) and status == "generating"
-                    and speed is not None):
-                segs.append((u" \u00b7 \u26a1", FONT_MAIN, FG_DIM))
-                segs.append((u"%.1f tok/s" % speed, FONT_DIM, FG_DIM))
+            # 0.5.0：生成中时追加实时速度或占位文案（speed None 则显示「生成中…」）
+            if cfg.get("show_live", True) and status == "generating":
+                if speed is not None:
+                    segs.append((u" \u00b7 \u26a1", FONT_MAIN, FG_DIM))
+                    segs.append((u"%.1f tok/s" % speed, FONT_DIM, FG_DIM))
+                else:
+                    segs.append((u" \u00b7 生成中\u2026", FONT_MAIN, ACCENT_GREEN))
             return segs
 
         def _draw_turn_stats(x, y, ts):
@@ -3391,23 +3481,18 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                         or mark_changed
                         or state["db_read_count"] == 0)
             cur_cache = None if force_db else state["last_info"]
-            # 实时流（0.4.2）：先读 live_stream，active 且带 sessionId 时
-            # 以该会话为当前会话（正在发请求的会话就是当前对话，最准）；
-            # 无流/无 sessionId 时回退 mark -> db -> jsonl 原链。
-            live = None
-            live_session_id = None
+            # 0.6.0：状态徽标来源改为 ZCode 钩子时序 status-state.json
+            # （status_event.py 写），不再读 live_stream / 不依赖代理；
+            # 会话判定走 mark -> db -> jsonl 原链（live_session_id 恒 None）。
+            status_state = None
             if cfg.get("show_live", True):
-                live = read_live_stream(data_dir)
-                live_session_id = (live.get("sessionId")
-                                   if live and live.get("active") else None)
+                status_state = _read_status_state(data_dir)
             info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
                                     cur=cur_cache,
-                                    live_session_id=live_session_id)
-            # 实时流转 stats（0.4.0 并入状态徽标）：活跃且新鲜 -> 生成中徽标
-            # + 实时 tok/s；流结束/过期 -> 交给 db 行判定（工具中/出错/空闲）。
-            live_stats = live_to_stats(live, cfg)
+                                    live_session_id=None)
+            # 钩子时序 -> 状态徽标；生成中时 speed 取 db_latest_speed 精确速度。
             status, spd, turn_stats = resolve_turn_status(
-                live_stats, db_path, info.get("session_id"))
+                status_state, db_path, info.get("session_id"))
             info["status"] = status
             info["status_speed"] = spd
             info["turn_stats"] = turn_stats

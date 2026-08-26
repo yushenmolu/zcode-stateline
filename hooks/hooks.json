@@ -7,6 +7,11 @@
             "type": "command",
             "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/on-stop.cmd\" \"${CLAUDE_SESSION_ID}\"",
             "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" idle \"${CLAUDE_SESSION_ID}\"",
+            "async": false
           }
         ]
       }
@@ -29,11 +34,6 @@
             "type": "command",
             "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/ensure-docked-statusbar.cmd\"",
             "async": false
-          },
-          {
-            "type": "command",
-            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/ensure-proxy.cmd\"",
-            "async": false
           }
         ]
       }
@@ -49,6 +49,22 @@
           {
             "type": "command",
             "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/inject-context.cmd\" user-prompt-submit \"${CLAUDE_SESSION_ID}\"",
+            "async": false
+          },
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" generating \"${CLAUDE_SESSION_ID}\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" tool \"${CLAUDE_SESSION_ID}\"",
             "async": false
           }
         ]
