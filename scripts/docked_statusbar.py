@@ -130,7 +130,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.4.2-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.4.3-fix-20260824"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -3059,21 +3059,29 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         def _turn_segments(ts):
             """本轮统计分段（(text, font, fg) 列表）；无数据返回单段占位。"""
             if not ts:
-                return [(TURN_PENDING, FONT_MAIN, FG_DIM)]
-            inp = int(ts.get("inputTokens") or 0)
-            cache_rd = int(ts.get("cacheReadTokens") or 0)
-            hit = (cache_rd / float(inp) * 100.0) if inp > 0 else 0.0
-            return [
-                (ICON_DUR, ICON_FONT, FG_DIM),
-                (u"%.1fs" % ((ts.get("durationMs") or 0) / 1000.0),
-                 FONT_NUM, FG),
-                (u" \u00b7 in ", FONT_MAIN, FG_DIM),
-                (format_tokens(inp), FONT_NUM, FG),
-                (u" \u00b7 out ", FONT_MAIN, FG_DIM),
-                (format_tokens(ts.get("outputTokens") or 0), FONT_NUM, FG),
-                (u" \u00b7 cache hit ", FONT_MAIN, FG_DIM),
-                (u"%.1f%%" % hit, FONT_NUM, FG),
-            ]
+                segs = [(TURN_PENDING, FONT_MAIN, FG_DIM)]
+            else:
+                inp = int(ts.get("inputTokens") or 0)
+                cache_rd = int(ts.get("cacheReadTokens") or 0)
+                hit = (cache_rd / float(inp) * 100.0) if inp > 0 else 0.0
+                segs = [
+                    (ICON_DUR, ICON_FONT, FG_DIM),
+                    (u"%.1fs" % ((ts.get("durationMs") or 0) / 1000.0),
+                     FONT_NUM, FG),
+                    (u" \u00b7 in ", FONT_MAIN, FG_DIM),
+                    (format_tokens(inp), FONT_NUM, FG),
+                    (u" \u00b7 out ", FONT_MAIN, FG_DIM),
+                    (format_tokens(ts.get("outputTokens") or 0), FONT_NUM, FG),
+                    (u" \u00b7 cache hit ", FONT_MAIN, FG_DIM),
+                    (u"%.1f%%" % hit, FONT_NUM, FG),
+                ]
+            # 0.4.3：tok/s 放本轮统计尾部（生成中实时速度；小号灰字弱化，随
+            # show_live 开关联动；无历史轮次占位时同样显示，保证生成中可见）。
+            if (cfg.get("show_live", True) and status == "generating"
+                    and speed is not None):
+                segs.append((u" \u00b7 \u26a1", FONT_MAIN, FG_DIM))
+                segs.append((u"%.1f tok/s" % speed, FONT_DIM, FG_DIM))
+            return segs
 
         def _draw_turn_stats(x, y, ts):
             """第二行：本轮统计分段绘制（数字等宽防跳字）+ 整行悬停 tooltip。"""
@@ -3086,13 +3094,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
         # ---- 文本拼装 ----
         badge_txt = STATUS_TEXT.get(status, STATUS_TEXT["idle"])
-        # 0.4.2：tok/s 不再进徽标（主显示保留「⚡生成中」徽标本身），改为徽标旁
-        # 小号灰字；speed_txt 供绘制段使用，speed_w 计入布局避免窗口宽度不足。
-        speed_txt = None
-        speed_w = 0
-        if status == "generating" and speed is not None:
-            speed_txt = u"%.1f tok/s" % speed
-            speed_w = 4 + f_dim.measure(speed_txt)  # 4px 间隔 + 小字宽
+        # 0.4.3：tok/s 不再放第一行徽标旁（0.4.2 曾在此以小字灰字显示，用户
+        # 反馈太弱找不到），改到第二行本轮统计尾部（见 _turn_segments）。
         turn_segs = _turn_segments(turn)
         turn_w = sum(_fmap[f].measure(t) for t, f, _ in turn_segs)
         cum_txt = cumulative_text(cum)
@@ -3101,7 +3104,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         # ---- 先实测、后布局（三区宽度全部 tkinter.font 实测）----
         badge_w = 0
         if show_status:
-            badge_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt) + speed_w
+            badge_w = BADGE_PAD_X * 2 + f_main.measure(badge_txt)
         cum_w = f_dim.measure(cum_txt) if (show_cum and cum_txt) else 0
         note_w = f_dim.measure(SESSION_RECENT_NOTE) if has_note else 0
         # 模型名并入不可裁槽（与徽标同槽：徽标+模型名恒不裁，对话名按剩余宽截短）
@@ -3123,7 +3126,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         # 顶部 1px 分隔线（提质感）
         canvas.create_rectangle(0, 0, win_w, 1, fill=EDGE_LINE, outline="")
 
-        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 速度小字（0.4.2）+ 模型名（蓝）+ 对话名 ----
+        # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 模型名（蓝）+ 对话名 ----
         x = 12
         if show_status:
             color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
@@ -3138,13 +3141,6 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                        STATUS_TIPS.get(status, STATUS_TIPS["idle"]),
                        rect, color, color)
             x += badge_only_w
-            if speed_txt:
-                x += 4  # 徽标与速度小字间隔
-                canvas.create_text(x, ROW1_CY, text=speed_txt,
-                                   font=FONT_DIM, fill=FG_DIM,
-                                   anchor="w", tags=("m_spd",))
-                bind_hover("m_spd", STATUS_TIPS.get(status, ""))
-                x += f_dim.measure(speed_txt)
             x += badge_gap
         if cfg.get("show_model", True) and model:
             mtxt = _truncate(model, 20) or "model?"
