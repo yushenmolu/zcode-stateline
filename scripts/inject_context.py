@@ -455,10 +455,38 @@ def main(argv=None):
         # 兜底：任何异常都输出合法 JSON，绝不让 hook 拿到非 JSON / 非 additionalContext
         out = json.dumps({"additionalContext": STATS_UNAVAILABLE_TEXT}, ensure_ascii=False)
     try:
-        sys.stdout.write(out + "\n")
-        sys.stdout.flush()
-    except Exception:
-        pass
+        # 输出恒为 UTF-8 字节：Windows 中文系统下经 cmd 管道捕获 stdout 时，
+        # CPython 文本层默认编码为 GBK(cp936)，统计行的「⏱」(U+23F1) 不在
+        # GBK 内，文本 write 会抛 UnicodeEncodeError 且被 except 吞掉，导致
+        # stdout 全空但 exit 0（统计行注入曾因此静默失效）。直接写
+        # sys.stdout.buffer 字节，绕开文本层编码转换，任何环境恒为合法 UTF-8。
+        buf = getattr(sys.stdout, "buffer", None)
+        wrote = False
+        if buf is not None:
+            buf.write((out + "\n").encode("utf-8"))
+            buf.flush()
+            wrote = True
+        if not wrote:
+            # 极少数嵌入环境无 buffer 属性：回退 reconfigure 为 UTF-8 后按文本写出。
+            try:
+                sys.stdout.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                sys.stdout.write(out + "\n")
+                sys.stdout.flush()
+            except Exception as e:
+                # 最终兜底：保持 hook 绝不失败（exit 0），但不再静默——stderr 留痕。
+                try:
+                    sys.stderr.write("[inject_context] output failed: %r\n" % (e,))
+                except Exception:
+                    pass
+    except Exception as e:
+        # 兜底：任何输出异常都不让 hook 失败；留 stderr 线索，避免静默空输出。
+        try:
+            sys.stderr.write("[inject_context] output failed: %r\n" % (e,))
+        except Exception:
+            pass
     return 0
 
 

@@ -35,17 +35,26 @@ CLI：
   python proxy_server.py [--listen-port 18080] [--upstream http://127.0.0.1:8080]
                          [--data-dir <dir>] [--state-file <path>] [--log-file <path>]
   python proxy_server.py --once   # 自测：解析预置 SSE 样例并输出计数，不监听
+  python proxy_server.py --alive-check [<--listen-port P>] [<--data-dir D>]
+                                  # N5 版本守卫：三重正证据门（pid 文件映像 /
+                                  # 端口归属 / 日志 VERSION）核查在跑代理。
+                                  # 退出码 0=存活同版 1=无实例 2=旧版已清除
+                                  # 3=端口被未知进程占用
 """
 import argparse
+import ctypes
 import json
 import os
+import re
 import socket
+import struct
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.5.0"
+# 0.7.0：N5 版本守卫（--alive-check 三重正证据门）以磁盘上的 __version__ 为准。
+__version__ = VERSION = "0.7.0"
 
 LISTEN_HOST_DEFAULT = "127.0.0.1"
 LISTEN_PORT_DEFAULT = 18080
@@ -56,6 +65,8 @@ DATA_DIR_DEFAULT = os.path.join(
 )
 STATE_FILE_NAME = "live_stream.json"
 LOG_FILE_NAME = "live-proxy.log"
+PID_FILE_NAME = "live-proxy.pid"
+LOG_ROTATE_BYTES = 5 * 1024 * 1024  # N6：live-proxy.log 超过 5MB 轮转为 .old
 STREAM_READ_TIMEOUT = 180.0  # 上游读超时秒（0.5.0 60->180：模型首 token 延迟可达
                              # 20-33s，大上下文更久；180s 无数据才置 active=false，
                              # 可 --stream-timeout 覆盖）
@@ -91,6 +102,39 @@ def _atomic_write_json(path, obj):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _rotate_log_if_needed(log_dir):
+    """N6：启动前检查 live-proxy.log，超过 LOG_ROTATE_BYTES 轮转为 .old
+    （os.replace 覆盖旧 .old）。轮转被占用/失败时静默继续，不阻塞启动。"""
+    try:
+        path = os.path.join(log_dir, LOG_FILE_NAME)
+        if os.path.isfile(path) and os.path.getsize(path) > LOG_ROTATE_BYTES:
+            try:
+                os.replace(path, path + ".old")
+            except OSError:
+                pass  # 旧实例仍持有句柄等情况：放弃本次轮转，照常继续
+    except Exception:
+        pass
+
+
+def _write_pid_file(data_dir):
+    """N5：成功监听后原子写 <data-dir>/live-proxy.pid（tmp + os.replace）。
+
+    在 boot 日志之后调用——pid 文件存在即暗示日志里已有该 pid 的
+    VERSION=... 记录（alive-check 门 c 的隐含顺序）。失败静默。
+    """
+    try:
+        path = os.path.join(data_dir, PID_FILE_NAME)
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
         os.replace(tmp, path)
     except Exception:
         pass
@@ -670,6 +714,262 @@ def run_once_sample():
 
 
 # ---------------------------------------------------------------------------
+# --alive-check：版本守卫（三重正证据门，缺一不杀）
+# ---------------------------------------------------------------------------
+
+# 退出码约定（ensure-proxy.cmd 按此分流）：
+ALIVE_RC_OK = 0       # 同版本实例存活且健康，无需动作
+ALIVE_RC_NONE = 1     # 无实例（端口空闲，可直接启动）
+ALIVE_RC_KILLED = 2   # 已确认的旧版实例被清除，应启动新实例
+ALIVE_RC_UNKNOWN = 3  # 端口被身份未知的进程占用，不能动作
+
+_ALIVE_PYTHON_BASENAMES = frozenset(("python.exe", "pythonw.exe"))
+_ALIVE_KILL_WAIT_MS = 3000   # TerminateProcess 后等进程退出的上限
+_ALIVE_PORT_FREE_POLL_S = 0.5
+_ALIVE_PORT_FREE_POLLS = 6   # 杀旧后最多再等 ~3s 确认端口释放
+
+
+def _say(msg):
+    sys.stdout.write(msg + "\n")
+
+
+def _win_listening_pids_on_port(port):
+    """GetExtendedTcpTable 枚举 IPv4 TCP LISTEN 行，返回监听 port 的 pid 集合。
+
+    返回 None 表示枚举失败（按「身份未知」路径处理，绝不据此杀进程）。
+    行结构 MIB_TCPROW_OWNER_PID 前几个字段固定：dwState / dwLocalAddr /
+    dwLocalPort / dwRemoteAddr / dwRemotePort / dwOwningPid；行尾可能随
+    SDK 版本追加 liCreateTimestamp 等，故行距按实际缓冲大小推算。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        iphlpapi = ctypes.windll.iphlpapi
+        iphlpapi.GetExtendedTcpTable.restype = ctypes.c_ulong
+        iphlpapi.GetExtendedTcpTable.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_int,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        AF_INET = 2
+        TCP_TABLE_OWNER_PID_LISTENER = 3      # 仅 LISTEN 行、带 owning pid
+        ERROR_INSUFFICIENT_BUFFER = 122
+        size = ctypes.c_ulong(0)
+        ret = iphlpapi.GetExtendedTcpTable(
+            None, ctypes.byref(size), False, AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER, 0)
+        if ret != ERROR_INSUFFICIENT_BUFFER or size.value == 0:
+            return None
+        buf = ctypes.create_string_buffer(int(size.value))
+        ret = iphlpapi.GetExtendedTcpTable(
+            buf, ctypes.byref(size), False, AF_INET,
+            TCP_TABLE_OWNER_PID_LISTENER, 0)
+        if ret != 0:
+            return None
+        raw = buf.raw[:int(size.value)]
+        n = struct.unpack_from("<I", raw, 0)[0]
+        if n == 0 or size.value <= 4:
+            return set()
+        rowsize = (size.value - 4) // n
+        if rowsize < 24:                      # 固定前缀至少到 dwOwningPid
+            return None
+        pids = set()
+        for i in range(n):
+            f = struct.unpack_from("<6I", raw, 4 + i * rowsize)
+            state, _laddr, lport_net, _raddr, _rport, owner = f
+            if state != 2:                    # MIB_TCP_STATE_LISTEN
+                continue
+            lport = ((lport_net & 0xFF) << 8) | ((lport_net >> 8) & 0xFF)
+            if lport == port:
+                pids.add(owner)
+        return pids
+    except Exception:
+        return None
+
+
+def _port_busy_probe(port):
+    """连接探活兜底（tcp 表枚举不可用时判定端口是否被占）。"""
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _win_process_image_basename(pid):
+    """OpenProcess + QueryFullProcessImageNameW 取进程映像 basename；失败 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        k32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong)]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return None
+        try:
+            size = ctypes.c_ulong(1024)
+            buf = ctypes.create_unicode_buffer(int(size.value))
+            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return None
+            return os.path.basename(buf.value)
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def _win_terminate_process(pid, exit_code=1):
+    """TerminateProcess 结束进程并等待其退出；成功 True。
+
+    仅在三重正证据门全过后调用。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        k32.TerminateProcess.restype = ctypes.c_int
+        k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        PROCESS_TERMINATE = 0x0001
+        h = k32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if not h:
+            return False
+        try:
+            ok = bool(k32.TerminateProcess(h, exit_code))
+            if ok:
+                k32.WaitForSingleObject(h, _ALIVE_KILL_WAIT_MS)
+            return ok
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def _read_pid_file(data_dir):
+    """读 live-proxy.pid；缺失/损坏/非法返回 None。"""
+    try:
+        with open(os.path.join(data_dir, PID_FILE_NAME), "r",
+                  encoding="utf-8") as f:
+            txt = f.read().strip()
+        pid = int(txt)
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def _latest_log_version_for_pid(log_dir, pid):
+    """live-proxy.log 中该 pid 最近一条 VERSION=xxx；找不到返回 None。"""
+    try:
+        with open(os.path.join(log_dir, LOG_FILE_NAME), "r",
+                  encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return None
+    pat = re.compile(r"VERSION=(\S+)\s+pid=%d\b" % int(pid))
+    found = None
+    for m in pat.finditer(text):
+        found = m.group(1)
+    return found
+
+
+def _port_free(listen_port):
+    lst = _win_listening_pids_on_port(listen_port)
+    if lst is None:
+        return not _port_busy_probe(listen_port)
+    return not lst
+
+
+def _run_alive_check(listen_port, data_dir):
+    """N5 三重正证据门：
+
+    门 a：pid 文件存在 -> OpenProcess 校验映像 basename 是 python/pythonw；
+    门 b：GetExtendedTcpTable 确认该 pid 正持有监听端口；
+    门 c：live-proxy.log 中该 pid 最近一条 VERSION 与磁盘 __version__ 一致。
+
+    任一环节查不到/失败 = 身份未知，绝不杀。三条全过且日志版本更旧时才
+    TerminateProcess 清除旧版。
+    """
+    log_dir = data_dir
+    _say("[alive-check] port=%d data-dir=%s expect-version=%s"
+         % (listen_port, data_dir, __version__))
+
+    listeners = _win_listening_pids_on_port(listen_port)
+    if listeners is None:
+        # 表枚举失败：退化用连接探活只判「是否有东西在听」，归属未知。
+        busy = _port_busy_probe(listen_port)
+        _say("[alive-check] tcp-table unavailable; fallback probe busy=%s"
+             % busy)
+        if not busy:
+            return ALIVE_RC_NONE
+        return ALIVE_RC_UNKNOWN
+    busy = bool(listeners)
+
+    if not busy:
+        _say("[alive-check] nothing listens on %d -> no instance" % listen_port)
+        return ALIVE_RC_NONE
+
+    # ---- 门 a：pid 文件 + 映像校验 ----
+    pid = _read_pid_file(data_dir)
+    if pid is None:
+        _say("[alive-check] port busy but pid file missing/unreadable "
+             "-> unknown holder")
+        return ALIVE_RC_UNKNOWN
+    base = _win_process_image_basename(pid)
+    if base is None:
+        _say("[alive-check] cannot inspect image of pid %d (gone or denied) "
+             "-> unknown holder" % pid)
+        return ALIVE_RC_UNKNOWN
+    if base.lower() not in _ALIVE_PYTHON_BASENAMES:
+        _say("[alive-check] pid %d image %r is not python/pythonw "
+             "-> unknown holder" % (pid, base))
+        return ALIVE_RC_UNKNOWN
+
+    # ---- 门 b：端口归属 ----
+    if pid not in listeners:
+        _say("[alive-check] pid %d does not own listen port %d "
+             "(holders=%s) -> unknown holder" % (pid, listen_port, listeners))
+        return ALIVE_RC_UNKNOWN
+
+    # ---- 门 c：日志版本比对 ----
+    ver = _latest_log_version_for_pid(log_dir, pid)
+    if ver is None:
+        _say("[alive-check] no VERSION record in log for pid %d "
+             "-> unknown identity" % pid)
+        return ALIVE_RC_UNKNOWN
+    if ver == __version__:
+        _say("[alive-check] same-version proxy alive (pid=%d v%s)" % (pid, ver))
+        return ALIVE_RC_OK
+
+    # 三门全过 + 版本不同 -> 杀旧放行
+    _say("[alive-check] outdated proxy confirmed "
+         "(pid=%d log-v%s != disk-v%s) -> terminating" % (pid, ver, __version__))
+    if not _win_terminate_process(pid):
+        _say("[alive-check] TerminateProcess failed on pid %d -> leave as is"
+             % pid)
+        return ALIVE_RC_UNKNOWN
+    for _ in range(_ALIVE_PORT_FREE_POLLS):
+        if _port_free(listen_port):
+            break
+        time.sleep(_ALIVE_PORT_FREE_POLL_S)
+    _say("[alive-check] old proxy cleared (pid=%d) -> should start" % pid)
+    return ALIVE_RC_KILLED
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -694,6 +994,12 @@ def parse_args(argv=None):
                          % STREAM_READ_TIMEOUT)
     ap.add_argument("--once", action="store_true",
                     help="self-test: parse a preset SSE sample and print counts, no listening")
+    ap.add_argument("--alive-check", action="store_true",
+                    help="N5 version guard: verify the running proxy's identity "
+                         "(pid file image / port ownership / logged VERSION); "
+                         "exit 0=alive same version, 1=no instance, "
+                         "2=outdated cleared (should start), "
+                         "3=port held by unknown process")
     return ap.parse_args(argv)
 
 
@@ -722,6 +1028,14 @@ def make_handler(keeper, upstream_host, upstream_port, log_dir):
     return _H
 
 
+class ProxyHTTPServer(ThreadingHTTPServer):
+    """N4：ThreadingHTTPServer 基类 allow_reuse_address=1（SO_REUSEADDR），
+    Windows 下允许第二个进程 bind 同端口也成功，双实例并存、连接随机分流。
+    关闭之：第二个实例 bind 必失败，走 main() 既有的「bind 失败返回 1」路径。"""
+
+    allow_reuse_address = False
+
+
 def main(argv=None):
     args = parse_args(argv)
     data_dir = args.data_dir or DATA_DIR_DEFAULT
@@ -732,6 +1046,16 @@ def main(argv=None):
         sys.stdout.write(json.dumps(res, ensure_ascii=False) + "\n")
         return 0
 
+    if args.alive_check:
+        # N5 版本守卫模式。意外异常兜底返回 1（= 尝试启动）：端口真被占时
+        # 新实例会被 N4 的 bind 失败路径安全拦下，不会造成双实例。
+        try:
+            return _run_alive_check(args.listen_port, data_dir)
+        except Exception:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return ALIVE_RC_NONE
+
     # 0.5.0：--stream-timeout 覆盖全局超时（默认 180s）
     timeout = args.stream_timeout
     if timeout is not None and timeout > 0:
@@ -741,12 +1065,13 @@ def main(argv=None):
     upstream_host, upstream_port = _parse_upstream(args.upstream)
     os.makedirs(data_dir, exist_ok=True)
     log_dir = data_dir
+    _rotate_log_if_needed(log_dir)  # N6：超 5MB 先轮转为 .old 再启动写新日志
 
     keeper = StreamKeeper(state_file)
     handler_cls = make_handler(keeper, upstream_host, upstream_port, log_dir)
 
     try:
-        server = ThreadingHTTPServer((args.listen_host, args.listen_port), handler_cls)
+        server = ProxyHTTPServer((args.listen_host, args.listen_port), handler_cls)
     except OSError as e:
         sys.stderr.write("cannot bind %s:%d: %r\n" % (args.listen_host, args.listen_port, e))
         return 1
@@ -756,6 +1081,7 @@ def main(argv=None):
          "stream_timeout=%.0fs state=%s"
          % (VERSION, os.getpid(), args.listen_host, args.listen_port,
             upstream_host, upstream_port, STREAM_READ_TIMEOUT, state_file))
+    _write_pid_file(data_dir)  # N5：boot 日志落定后声明 pid（供 alive-check 核查）
     try:
         server.serve_forever()
     except KeyboardInterrupt:

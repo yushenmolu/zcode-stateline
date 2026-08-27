@@ -5,8 +5,14 @@ rem listening, so the docked status bar can show live "generating" token
 rem counts via live_stream.json.
 rem
 rem Design notes:
-rem  - Idempotent: probes the listen port first; if something already listens
-rem    on 18080 this is a no-op (no duplicate proxy processes).
+rem  - Idempotent + version-guarded (N5): asks the running proxy to prove its
+rem    identity via `proxy_server.py --alive-check` -- three positive evidence
+rem    gates (pid-file image is python, that pid owns the 18080 listener, and
+rem    its logged VERSION matches this disk copy). rc 0 = same-version proxy
+rem    alive -> no-op; rc 1/2 = nothing runs / outdated proxy already cleared
+rem    -> start; rc 3 = port held by an unrecognized process -> do NOT start
+rem    (avoids a relaunch loop against a foreign listener). Upgraded proxies
+rem    no longer linger forever.
 rem  - Uses pythonw.exe (no console window) and `start` (fire-and-forget), so
 rem    the proxy runs detached from the hook / ZCode lifetime.
 rem  - stdout is stdlib "{}" always, so the hook always sees valid JSON; exit
@@ -63,9 +69,19 @@ if not defined PYW_CMD (
 )
 if not defined PYW_CMD set "PYW_CMD=%PY_CMD%"
 
-rem ---- Idempotent launch: probe 127.0.0.1:18080, start proxy only when free ----
-%PY_CMD% -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1',18080))==0 else 1)" >nul 2>&1
-if errorlevel 1 (
+rem ---- Version-guarded idempotent launch (N5) ----
+rem Exit codes of `proxy_server.py --alive-check`:
+rem   0 = same-version proxy alive  -> no-op
+rem   1 = no instance               -> start
+rem   2 = outdated proxy cleared    -> start replacement
+rem   3 = port held by unknown process -> give up this session (no loop)
+%PY_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\proxy_server.py" --alive-check >nul 2>&1
+set "ALIVE_RC=%errorlevel%"
+if "%ALIVE_RC%"=="3" (
+    echo [zcode-token-stats] Port 18080 is held by an unrecognized process. Proxy not started; will retry next session. 1>&2
+    goto done
+)
+if not "%ALIVE_RC%"=="0" (
     start "" %PYW_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\proxy_server.py"
 )
 

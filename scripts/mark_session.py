@@ -4,7 +4,7 @@
 mark_session.py — 把「当前真实会话 ID」原子写入数据目录 current-session.json。
 
 由 ZCode hook（SessionStart / UserPromptSubmit）调用，ZCode 会把 hook 模板变量
-${ZCODE_SESSION_ID} 展开为当前会话的真实 ID 并作为第一个参数传入。状态条
+${CLAUDE_SESSION_ID} 展开为当前会话的真实 ID 并作为第一个参数传入。状态条
 （docked_statusbar.py）以此标记判断「当前是哪个对话」，从而显示该对话自己的
 累计统计，避免 jsonl 跨会话串数据。
 
@@ -20,7 +20,7 @@ ${ZCODE_SESSION_ID} 展开为当前会话的真实 ID 并作为第一个参数�
     ZCODE_PLUGIN_DATA 不再参与解析（该变量在钩子环境指向另一套空目录）。
   - session_id 获取优先级（stdin 优先，官方钩子输入机制）：
       1) stdin 传入的 hook 输入 JSON 的 "session_id" 公共字段；
-      2) argv[1]（hooks.json 里 "${ZCODE_SESSION_ID}" 模板展开的兜底参数）；
+      2) argv[1]（hooks.json 里 "${CLAUDE_SESSION_ID}" 模板展开的兜底参数）；
       3) 都为空 → 仅输出 {} 退出（不写文件），保证手跑安全。
     stdin 不可读 / 非 JSON / 无 session_id 字段时静默回退 argv，绝不抛错。
 """

@@ -157,7 +157,7 @@ import traceback
 # ---------------------------------------------------------------------------
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATUSBAR_VERSION = "0.6.0-fix-20260826"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.7.0"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -704,6 +704,34 @@ def read_jsonl(path):
     return rows, error
 
 
+# token-stats.jsonl 解析缓存（N6 性能）：文件只增不减，refresh_stats 每秒
+# 全量逐行 json.loads 会越用越卡；以 (st_mtime_ns, st_size) 指纹判断文件
+# 是否变化，未变化直接复用上次解析结果。仅 GUI 刷新循环使用；--once 与
+# 其他读取方仍走原 read_jsonl，解析逻辑本身不变。
+_jsonl_cache = {"key": None, "rows": [], "err": None}
+
+
+def read_jsonl_cached(path):
+    """带 (mtime_ns, size) 指纹缓存的 read_jsonl。返回 (rows, error)。
+
+    指纹与上次一致 -> 直接返回缓存（rows 为同一 list 对象，调用方只读）；
+    首次 / 文件变化 / stat 失败（如文件暂不可见）-> 全量重读并更新缓存，
+    与原行为一致，绝不抛。
+    """
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None   # stat 失败不缓存指纹：本次全量读兜底，下一拍再校验
+    if key is not None and key == _jsonl_cache["key"]:
+        return _jsonl_cache["rows"], _jsonl_cache["err"]
+    rows, err = read_jsonl(path)
+    _jsonl_cache["key"] = key
+    _jsonl_cache["rows"] = rows
+    _jsonl_cache["err"] = err
+    return rows, err
+
+
 def current_session(rows):
     """取 ts 最大记录的**主会话** id（subagent 会话一律跳过；sessionId 为空退 slug）。"""
     candidates = [r for r in rows if not _is_subagent_sid(r.get("sessionId"))]
@@ -868,7 +896,8 @@ def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
         since = time_ms() - int(window_ms)
         row = conn.execute(
             "SELECT session_id FROM model_usage "
-            "WHERE session_id NOT LIKE 'sess_subagent_%' "
+            "WHERE session_id LIKE 'sess_%' "
+            "AND session_id NOT LIKE 'sess_subagent_%' "
             "AND started_at >= ? "
             "ORDER BY started_at DESC, rowid DESC LIMIT 1",
             (since,),
@@ -1233,22 +1262,6 @@ def resolve_turn_status(status_state, db_path, session_id):
     return status, spd, tu_row
 
 
-def turn_stats_text(turn_stats):
-    """本轮统计行文本（0.4.0）：`⏱<秒> · in <k/M> · out <k/M> · cache hit <%>`。
-    命中率口径沿用会话累计：cacheRead / input（input 已含 cacheRead 部分）。
-    turn_stats 为 None 返回 TURN_PENDING（本轮统计待更新）。"""
-    if not turn_stats:
-        return TURN_PENDING
-    inp = int(turn_stats.get("inputTokens") or 0)
-    cache_rd = int(turn_stats.get("cacheReadTokens") or 0)
-    hit = (cache_rd / float(inp) * 100.0) if inp > 0 else 0.0
-    return (u"\u23f1%.1fs \u00b7 in %s \u00b7 out %s \u00b7 cache hit %.1f%%"
-            % ((turn_stats.get("durationMs") or 0) / 1000.0,
-               format_tokens(inp),
-               format_tokens(turn_stats.get("outputTokens") or 0),
-               hit))
-
-
 def cumulative_text(stats):
     """会话累计小字（0.4.0 第三区）：`in <k/M> · out <k/M>`；stats 为 None 返回 None。"""
     if not stats:
@@ -1432,93 +1445,6 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
 
 
 # ---------------------------------------------------------------------------
-# 实时流（0.3.0）：读取 proxy_server.py 写的 live_stream.json，转成状态条 stats
-# ---------------------------------------------------------------------------
-
-def read_live_stream(data_dir):
-    """读本地 SSE 代理的实时计数文件；不存在 / 坏 JSON 返回 None（绝不抛）。
-
-    与 proxy_server.py 约定：<data-dir>/live_stream.json，原子写。
-    """
-    try:
-        with open(os.path.join(data_dir, LIVE_STREAM_NAME), "r",
-                  encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-def live_elapsed_s(live):
-    """流已耗时秒（now - started_at）；缺 started_at 返回 None。"""
-    try:
-        st = float(live.get("started_at") or 0)
-    except Exception:
-        st = 0.0
-    if st <= 0:
-        return None
-    return max(time.time() - st, 0.0)
-
-
-def live_to_stats(live, cfg=None):
-    """把 live_stream.json 快照转成状态条 stats（纯函数，可独立单测）。
-
-    返回 None = 无实时流可展示（调用方维持原 db 轮询逻辑）：
-      - active=True 且距 last_event_at 新鲜（< LIVE_STALE_MS）-> 生成中 stats：
-        {stream_active:True, outputTokens:字符≈token, reasoningTokens,
-         speedTokPerSec:字符/耗时, elapsed_s}
-      - active=False 但 last_usage 新鲜（距 ts < LIVE_USAGE_FRESH_MS）
-        -> 精确 usage stats（{precise_usage:True, input/output/cacheRead...}）
-      - 其余（无文件 / 过期 / 无 usage）-> None
-    """
-    if not live:
-        return None
-    now = time.time()
-    try:
-        ts = float(live.get("ts") or 0)
-    except Exception:
-        ts = 0.0
-    try:
-        last_evt = float(live.get("last_event_at") or ts)
-    except Exception:
-        last_evt = ts
-    active = bool(live.get("active"))
-    if active and (now - last_evt) < (LIVE_STALE_MS / 1000.0):
-        chars = int(live.get("stream_output_chars") or 0)
-        reas = int(live.get("stream_reasoning_chars") or 0)
-        elapsed = live_elapsed_s(live)
-        speed = (chars / elapsed) if (elapsed and elapsed > 0.05) else None
-        return {
-            "stream_active": True,
-            "sessionId": live.get("sessionId"),  # 0.4.2：透传，供会话判定/生成中匹配
-            "inputTokens": int(live.get("stream_input_tokens") or 0),
-            "outputTokens": chars,
-            "reasoningTokens": reas,
-            "speedTokPerSec": speed,
-            "elapsed_s": elapsed,
-        }
-    if not active and ts > 0 and (now - ts) < (LIVE_USAGE_FRESH_MS / 1000.0):
-        u = live.get("last_usage")
-        if isinstance(u, dict):
-            outp = int(u.get("output_tokens") or 0)
-            elapsed = live_elapsed_s(live)
-            st = {
-                "stream_active": False,
-                "sessionId": None,
-                "precise_usage": True,
-                "inputTokens": int(u.get("input_tokens") or 0),
-                "outputTokens": outp,
-                "cacheReadTokens": int(u.get("cache_read_input_tokens") or 0),
-                "reasoningTokens": int(u.get("reasoning_tokens") or 0),
-                "elapsed_s": elapsed,
-            }
-            if elapsed and elapsed > 0.05:
-                st["speedTokPerSec"] = outp / elapsed
-            return st
-    return None
-
-
-# ---------------------------------------------------------------------------
 # 显示项拼接（按配置 show_* 决定第二行拼哪些指标）
 # ---------------------------------------------------------------------------
 
@@ -1533,8 +1459,6 @@ def build_line2_parts(stats, cfg):
     """
     if not stats:
         return [("text", STATS_PENDING, FONT_MAIN, FG, None)]
-    if stats.get("stream_active"):
-        return _build_live_parts(stats)
     show_dur = cfg.get("show_avg_duration", True)
     show_in = cfg.get("show_input", True)
     show_out = cfg.get("show_output", True)
@@ -1571,7 +1495,11 @@ def build_line2_parts(stats, cfg):
     if show_cache_hit:
         _add_sep()
         parts.append(("label", u"cache ", FONT_MAIN, FG_DIM,
-                      u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = \u7f13\u5b58\u8bfb\u53d6 \u00f7 \uff08\u8f93\u5165 + \u7f13\u5b58\u8bfb\u53d6\uff09\uff1b\u6570\u503c\u8d8a\u9ad8\u8d8a\u7701\u94b1"))
+                      # 与 TIP_HIT 同口径：输入总量已含缓存读取部分，不重复相加
+                      u"cache hit\uff1a\u7f13\u5b58\u547d\u4e2d\u7387 = "
+                      u"\u7f13\u5b58\u8bfb\u53d6 \u00f7 \u8f93\u5165\u603b\u91cf"
+                      u"\uff08\u8f93\u5165\u5df2\u542b\u7f13\u5b58\u8bfb\u53d6"
+                      u"\u90e8\u5206\uff09\uff0c\u8d8a\u9ad8\u8d8a\u7701\u94b1"))
         parts.append(("cache", u"hit %.1f%%" % hit, FONT_NUM, ACCENT_GREEN, None))
     if show_cache_read:
         # cache read 与 cache hit 独立开关：两者都开时分开显示（红/蓝数字），
@@ -1588,37 +1516,6 @@ def build_line2_parts(stats, cfg):
 
     if not parts:
         return [("text", STATS_PENDING, FONT_MAIN, FG, None)]
-    return parts
-
-
-# 实时流 tooltip 文案（0.3.0）
-TIP_LIVE = (u"\u5b9e\u65f6\u6d41\uff1a\u6b63\u5728\u751f\u6210\u4e2d\uff0c"
-            u"\u6570\u503c\u4e3a\u5b57\u7b26\u8fd1\u4f3c token\uff0c"
-            u"\u6d41\u7ed3\u675f\u5207\u6362\u7cbe\u786e usage")
-            # 实时流：正在生成中，数值为字符近似 token，流结束切换精确 usage
-TIP_LIVE_SPD = (u"\u5b9e\u65f6\u901f\u5ea6\uff1a\u7d2f\u8ba1\u5b57\u7b26 \u00f7 "
-                u"\u6d41\u5df2\u7528\u65f6\u957f\uff08\u5b57\u7b26\u2248token \u8fd1\u4f3c\uff09")
-                # 实时速度：累计字符 ÷ 流已用时长（字符≈token 近似）
-TIP_LIVE_OUT = (u"\u5b9e\u65f6\u8f93\u51fa\uff1a\u5f53\u524d\u6d41\u7684\u7d2f\u8ba1"
-                u"\u8f93\u51fa\u5b57\u7b26\uff08\u8fd1\u4f3c token\uff0c"
-                u"\u6d41\u7ed3\u675f\u540e\u4ee5 usage \u7cbe\u786e\u503c\u66ff\u6362\uff09")
-                # 实时输出：当前流的累计输出字符（近似 token，流结束后以 usage 精确值替换）
-
-
-def _build_live_parts(stats):
-    """生成中视图的文本片段（--once / stats_to_text 用）：⚡ tok/s · out 累计 · 生成中…"""
-    parts = []
-    spd = stats.get("speedTokPerSec")
-    if spd is not None:
-        parts.append(("speed", u"\u26a1%.1f tok/s" % spd,
-                      FONT_NUM, ACCENT_ORANGE, TIP_LIVE_SPD))
-        parts.append(("sep", u" \u00b7 ", FONT_MAIN, SEP_COLOR, None))
-    parts.append(("label", u"out ", FONT_MAIN, FG_DIM, TIP_LIVE_OUT))
-    parts.append(("out", format_tokens(stats.get("outputTokens", 0)),
-                  FONT_NUM, FG, None))
-    parts.append(("sep", u" \u00b7 ", FONT_MAIN, SEP_COLOR, None))
-    parts.append(("streaming", u"\u751f\u6210\u4e2d\u2026",
-                  FONT_MAIN, ACCENT_GREEN, TIP_LIVE))
     return parts
 
 
@@ -1646,31 +1543,6 @@ TIP_SPD = (u"\u901f\u5ea6\uff1a\u6700\u8fd1\u4e00\u6b21\u8bf7\u6c42\u7684\u8f93\
            # 速度：最近一次请求的输出速度 = 输出 token ÷ 该次耗时
 
 
-def _build_live_blocks(stats):
-    """生成中视图的彩色指标块（0.3.0）：⚡ tok/s · out 累计字符 · ● 生成中…
-    速度有值才画（流刚开始无速度时不画、不留空位，与 db 速度块口径一致）。"""
-    blocks = []
-    spd = stats.get("speedTokPerSec")
-    if spd is not None:
-        blocks.append({
-            "kind": "speed", "icon": ICON_SPD, "icon_color": ACCENT_ORANGE,
-            "label": "", "value": u"%.1f tok/s" % spd,
-            "value_color": ACCENT_ORANGE, "tip": TIP_LIVE_SPD, "progress": None,
-        })
-    blocks.append({
-        "kind": "output", "icon": ICON_OUT, "icon_color": FG,
-        "label": "out",
-        "value": format_tokens(stats.get("outputTokens", 0)),
-        "value_color": FG, "tip": TIP_LIVE_OUT, "progress": None,
-    })
-    blocks.append({
-        "kind": "streaming", "icon": ICON_LIVE, "icon_color": ACCENT_GREEN,
-        "label": "", "value": u"\u751f\u6210\u4e2d\u2026",
-        "value_color": ACCENT_GREEN, "tip": TIP_LIVE, "progress": None,
-    })
-    return blocks
-
-
 def build_metric_blocks(stats, cfg):
     """
     按配置把 stats 拆成「彩色指标块」描述列表（纯数据；块宽由渲染层按字体实测）。
@@ -1681,8 +1553,6 @@ def build_metric_blocks(stats, cfg):
     """
     if not stats:
         return [{"kind": "pending", "text": STATS_PENDING, "tip": None}]
-    if stats.get("stream_active"):
-        return _build_live_blocks(stats)
     blocks = []
     if cfg.get("show_avg_duration", True):
         blocks.append({
@@ -3473,7 +3343,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         except Exception:
             pass
         try:
-            rows, _err = read_jsonl(os.path.join(data_dir, JSONL_NAME))
+            # N6 性能：逐秒全量解析改走指纹缓存，文件未变时复用上次结果
+            rows, _err = read_jsonl_cached(os.path.join(data_dir, JSONL_NAME))
             mark_sid = read_mark_file(data_dir)
             mark_changed = state.get("last_mark_sid") != mark_sid
             state["last_mark_sid"] = mark_sid
@@ -3628,7 +3499,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             if is_foreground_zcode():
                 xy = dock_rect(zrect, bar_w, WINDOW_H)
             else:
-                xy = clamp_to_work_area((zrect[0], zrect[2] + MARGIN),
+                # 非前台退一级贴边：y 取 bottom（zrect[3]）+ margin，与
+                # dock_rect below 模式（y = bottom + margin）同口径。
+                xy = clamp_to_work_area((zrect[0], zrect[3] + MARGIN),
                                         bar_w, WINDOW_H, zrect)
             xy = clamp_to_work_area(xy, bar_w, WINDOW_H, zrect)
             if xy is None:

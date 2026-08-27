@@ -1,6 +1,6 @@
 {
   "name": "zcode-token-stats",
-  "version": "0.3.0",
+  "version": "0.7.0",
   "description": "实时统计 token 使用量、token cache 命中、速度（耗时/TTFT）的 ZCode 插件。通过 Stop 钩子自动把每轮统计追加到 JSONL 记录文件，并提供 /stats 斜杠命令查看本会话/历史/按模型汇总。",
   "author": {
     "name": "zcode-token-stats contributors"

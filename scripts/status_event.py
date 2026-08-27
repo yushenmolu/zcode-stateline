@@ -25,7 +25,7 @@ UTF-8。写入方式：先写临时文件再 os.replace 原子替换，避免并
   - 数据目录优先级：--data-dir > 默认插件数据目录（固定，钩子与 GUI 同目录）。
   - session_id 获取优先级（stdin 优先，官方钩子输入机制）：
       1) stdin 传入的 hook 输入 JSON 的 "session_id" 公共字段；
-      2) argv[2]（hooks.json 里 "${ZCODE_SESSION_ID}" 模板展开的兜底参数）；
+      2) argv[2]（hooks.json 里 "${CLAUDE_SESSION_ID}" 模板展开的兜底参数）；
       3) 都为空 -> 记为 null（事件本身仍记录）。
 """
 import argparse
@@ -37,7 +37,7 @@ import time
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR_DEFAULT = os.path.join(
-    r"C:\Users\yushe\.zcode\cli\plugins\data",
+    os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
 )
 STATUS_STATE_NAME = "status-state.json"
@@ -71,13 +71,32 @@ def read_session_id_from_stdin():
     return None
 
 
+def is_subagent_session(session_id):
+    """session_id 是否属于 subagent 会话（ZCode 给子代理开的独立会话）。
+
+    子代理会被 ZCode 以独立 session_id 运行（形如 ``sess_subagent_*``），其
+    UserPromptSubmit / PostToolUse / Stop 同样会触发本钩子；而 status-state.json
+    是全局单份事件文件，照单全收会把主会话的活动阶段覆盖成子代理的。这里与
+    mark_session.py / docked_statusbar.py 同款判定：命中即跳过写入。
+    """
+    if not session_id or not isinstance(session_id, str):
+        return False
+    s = session_id.strip().lower()
+    return s.startswith("sess_subagent_") or "subagent" in s
+
+
 def write_status_event(event, session_id, data_dir):
-    """校验 event 并原子写入 status-state.json。返回 (ok, error)。"""
+    """校验 event 并原子写入 status-state.json。返回 (ok, error)。
+
+    子代理会话（sess_subagent_*）不会写入事件，防止主会话状态被覆盖。
+    """
     if not event or not isinstance(event, str):
         return False, "empty event"
     event = event.strip().lower()
     if event not in VALID_EVENTS:
         return False, "unknown event: %s" % event
+    if is_subagent_session(session_id):
+        return False, "subagent session ignored"
     try:
         os.makedirs(data_dir, exist_ok=True)
         payload = {
@@ -105,7 +124,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     data_dir = args.data_dir or DATA_DIR_DEFAULT
-    # 注：ZCODE_PLUGIN_DATA 不参与解析——钩子环境下该变量指向另一套空目录。
+    # 注：ZCODE_PLUGIN_DATA 不参与解析——钩子环境下该变量指向另一套空目录
+    # （data/zcode-token-stats@local/），曾导致与钩子读写分叉。
 
     # session_id 优先级：stdin hook JSON 的 session_id -> argv[2] -> None
     session_id = read_session_id_from_stdin() or args.session_id

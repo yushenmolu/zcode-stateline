@@ -24,7 +24,7 @@ rem   PYTHON_BIN   Python interpreter. Default: python on PATH, then py -3
 setlocal EnableExtensions
 
 rem Keep in sync with .zcode-plugin\plugin.json
-set "VERSION=0.2.0"
+set "VERSION=0.7.0"
 
 set "DRY=0"
 if /i "%~1"=="/dry" set "DRY=1"
@@ -80,7 +80,7 @@ if "%DRY%"=="1" (
     echo [DRY] robocopy exit code above is from list-only mode ^(no files copied^).
 ) else (
     echo [install] Step 1/3: copying project files to plugin cache ...
-    robocopy "%SRC%" "%DST%" /E /NP /NFL /NDL /NJH /NJS /XD .git __pycache__ /XF *.pyc >nul
+    robocopy "%SRC%" "%DST%" /E /NP /NFL /NDL /NJH /NJS /XD .git __pycache__ /XF *.pyc *.bak-* >nul
     if errorlevel 8 (
         echo [install] ERROR: robocopy failed with code %ERRORLEVEL%. 1>&2
         exit /b 1
