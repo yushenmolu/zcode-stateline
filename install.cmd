@@ -76,7 +76,7 @@ rem Step 1/3: copy project files into the plugin cache
 rem ============================================================
 if "%DRY%"=="1" (
     echo [DRY] Step 1/3: would copy project files:
-    robocopy "%SRC%" "%DST%" /E /L /NP /XD .git __pycache__ /XF *.pyc
+    robocopy "%SRC%" "%DST%" /E /L /NP /XD .git __pycache__ /XF *.pyc *.bak-*
     echo [DRY] robocopy exit code above is from list-only mode ^(no files copied^).
 ) else (
     echo [install] Step 1/3: copying project files to plugin cache ...
