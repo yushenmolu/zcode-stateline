@@ -1087,14 +1087,16 @@ def resolve_session_sticky(state, rows, data_dir, db_path):
     return sticky, "sticky"
 
 
-def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
+def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS, conn=None):
     """db 侧「最近活跃」判定：window_ms 毫秒内有 model_usage 行的最新主会话 id。
 
     只把**最近 60 秒内确有模型调用**的主会话当作当前会话（非 subagent），
     无时间窗的「最新一条」不再作为兜底（那是猜测，fail-closed 不猜）。
     started_at 为 epoch 毫秒（与 record_usage 游标同口径）。失败返回 None。
-    """
-    conn = _db_connect(db_path)
+    conn 传入时复用（不关闭），否则自开自关。"""
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None
     try:
@@ -1113,18 +1115,23 @@ def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_recent_session_activity(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
+def db_recent_session_activity(db_path, window_ms=DB_ACTIVE_WINDOW_MS,
+                               conn=None):
     """db 侧「最近活动」信号：window_ms 毫秒内最新主会话模型调用行的
     (session_id, started_at)。与 db_recent_session_id 同查询，但返回真实
     活动时间戳供粘滞判定信号竞争（处置：db 候选不得用读取时刻伪造 ts）。
-    窗口外/无行/失败返回 (None, 0)。"""
-    conn = _db_connect(db_path)
+    窗口外/无行/失败返回 (None, 0)。
+    conn 传入时复用（不关闭），否则自开自关。"""
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None, 0
     try:
@@ -1146,16 +1153,20 @@ def db_recent_session_activity(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
     except Exception:
         return None, 0
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_latest_session_id(db_path):
+def db_latest_session_id(db_path, conn=None):
     """db 侧确定当前活跃主会话：最新 model_usage 的 session_id（跳过 subagent），
-    兜底最新 session（同样跳过 subagent）。"""
-    conn = _db_connect(db_path)
+    兜底最新 session（同样跳过 subagent）。
+    conn 传入时复用（不关闭），否则自开自关。"""
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None, "db access failed"
     try:
@@ -1177,18 +1188,22 @@ def db_latest_session_id(db_path):
     except Exception as e:
         return None, str(e)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_latest_model_id(db_path, session_id):
+def db_latest_model_id(db_path, session_id, conn=None):
     """会话最新 model_usage 行的 model_id（ORDER BY started_at DESC）；无则 None。
-    subagent 会话不参与展示。"""
+    subagent 会话不参与展示。
+    conn 传入时复用（不关闭），否则自开自关。"""
     if not session_id or _is_subagent_sid(session_id):
         return None
-    conn = _db_connect(db_path)
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None
     try:
@@ -1201,17 +1216,21 @@ def db_latest_model_id(db_path, session_id):
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_session_title(db_path, session_id):
-    """session 表按 session_id 取 title（去首尾空白）；subagent / 无则 ''。"""
+def db_session_title(db_path, session_id, conn=None):
+    """session 表按 session_id 取 title（去首尾空白）；subagent / 无则 ''。
+    conn 传入时复用（不关闭），否则自开自关。"""
     if not session_id or _is_subagent_sid(session_id):
         return ""
-    conn = _db_connect(db_path)
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return ""
     try:
@@ -1225,19 +1244,23 @@ def db_session_title(db_path, session_id):
     except Exception:
         return ""
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_aggregate_session(db_path, session_id):
+def db_aggregate_session(db_path, session_id, conn=None):
     """只读聚合某**主会话**的 completed 行（subagent 会话返回 None，不参与统计）。
     主数据源行级聚合：avgDuration = AVG(completed 行 duration_ms)。
-    返回标准 stats dict 或 None（会话无数据/读取失败）。"""
+    返回标准 stats dict 或 None（会话无数据/读取失败）。
+    conn 传入时复用（不关闭），否则自开自关。"""
     if _is_subagent_sid(session_id):
         return None
-    conn = _db_connect(db_path)
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None
     try:
@@ -1272,23 +1295,27 @@ def db_aggregate_session(db_path, session_id):
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_session_speed(db_path, session_id):
+def db_session_speed(db_path, session_id, conn=None):
     """当前会话的输出速度（tok/s，只读 db；jsonl 无行级数据故仅此一路）。
 
     - recent = 最近一条 completed 非 subagent 行的 output_tokens/(duration_ms/1000)
       （ORDER BY started_at DESC LIMIT 1；该行 duration_ms 为 NULL/0 时无速度）；
     - avg = SUM(output_tokens)/SUM(duration_ms)*1000（会话平均，completed 行）。
     返回 (recent, avg)，各自可为 None（无 db / 无会话 / 无有效数据）。
+    conn 传入时复用（不关闭），否则自开自关；内部两条 SQL 共用同一 conn。
     """
     if not session_id or _is_subagent_sid(session_id):
         return None, None
-    conn = _db_connect(db_path)
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None, None
     try:
@@ -1317,13 +1344,14 @@ def db_session_speed(db_path, session_id):
     except Exception:
         return None, None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def recent_turn_stats(db_path, session_id):
+def recent_turn_stats(db_path, session_id, conn=None):
     """当前会话**最近一轮** turn_usage 统计（0.4.0；表 PRIMARY KEY 为
     (session_id, turn_id)，按 started_at 取最新一行；subagent 过滤同前，
     不参与统计）。只读 db。
@@ -1333,10 +1361,13 @@ def recent_turn_stats(db_path, session_id):
        timeToFirstTokenMs, toolCallCount, toolErrorCount,
        inputTokens, outputTokens, cacheReadTokens, computedTotalTokens}
     供「本轮统计」行与状态判定（turn 未完成特征）使用。
+    conn 传入时复用（不关闭），否则自开自关。
     """
     if not session_id or _is_subagent_sid(session_id):
         return None
-    conn = _db_connect(db_path)
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None
     try:
@@ -1371,19 +1402,23 @@ def recent_turn_stats(db_path, session_id):
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
-def db_latest_model_usage_status(db_path, session_id):
+def db_latest_model_usage_status(db_path, session_id, conn=None):
     """会话最新 model_usage 行的状态特征（0.4.0，状态判定用）：
     返回 {status, tool_call_count} 或 None（无数据 / 读取失败）。
-    subagent 会话不参与展示。"""
+    subagent 会话不参与展示。
+    conn 传入时复用（不关闭），否则自开自关。"""
     if not session_id or _is_subagent_sid(session_id):
         return None
-    conn = _db_connect(db_path)
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None
     try:
@@ -1400,10 +1435,11 @@ def db_latest_model_usage_status(db_path, session_id):
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _read_status_state(data_dir):
@@ -1418,11 +1454,14 @@ def _read_status_state(data_dir):
         return None
 
 
-def db_latest_speed(db_path):
+def db_latest_speed(db_path, conn=None):
     """最近一条 completed 非 subagent model_usage 的精确速度（0.6.0）：
     output_tokens / (duration_ms / 1000)。返回 float 或 None（无数据 / 失败）。
-    tok/s 数据源从实时流改为 db 精确值，不再依赖 live_stream。"""
-    conn = _db_connect(db_path)
+    tok/s 数据源从实时流改为 db 精确值，不再依赖 live_stream。
+    conn 传入时复用（不关闭），否则自开自关。"""
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
     if conn is None:
         return None
     try:
@@ -1442,10 +1481,11 @@ def db_latest_speed(db_path):
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def status_detector(status_state, mu_row, tu_row, now=None):
