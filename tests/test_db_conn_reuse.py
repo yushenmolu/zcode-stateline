@@ -192,5 +192,77 @@ class TestTickSingleConnection(unittest.TestCase):
         self.assertEqual((sid, source), ("sess_main", "db"))
 
 
+class TestUiaSignal(unittest.TestCase):
+    """Task 3.2: uia 第 4 信号源仅在开关开启且探测拍时参与竞争。"""
+
+    def _mkedb_path(self):
+        db_path = os.path.join(self._tmp.name, "uia.sqlite")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("CREATE TABLE session (id TEXT, title TEXT)")
+            conn.execute("INSERT INTO session VALUES (?,?)",
+                         ("sess_tab", "会话甲"))
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = self._mkedb_path()
+        self.data_dir = os.path.join(self._tmp.name, "d")
+        os.makedirs(self.data_dir, exist_ok=True)
+
+    def _patch_cfg(self, enabled):
+        """patch DEFAULT_CONFIG 开关（resolve_session_sticky 从 cfg 取值）。"""
+        cfg = dict(dsb.DEFAULT_CONFIG)
+        cfg["enable_uia_tab_probe"] = enabled
+        return mock.patch.object(dsb, "DEFAULT_CONFIG", cfg)
+
+    def test_uia_signal_participates_only_when_enabled(self):
+        with mock.patch.object(dsb.uia_tab_probe, "probe_active_tab_title",
+                               return_value="会话甲") as m_probe, \
+             mock.patch.object(dsb, "time_ms", lambda: 5_000_000):
+            # 1) 开关关：不调 probe，信号缺席（mark 也无 -> none/jsonl）
+            state1 = {}
+            with self._patch_cfg(False):
+                sid, src = dsb.resolve_session_sticky(
+                    state1, [], self.data_dir, self.db_path,
+                    conn=None, probe_now=True)
+            m_probe.assert_not_called()
+            self.assertIsNone(sid)
+
+            # 2) 开关开 + probe_now + 唯一命中：uia 信号参与竞争并设 sticky
+            state2 = {}
+            with self._patch_cfg(True):
+                sid, src = dsb.resolve_session_sticky(
+                    state2, [], self.data_dir, self.db_path,
+                    conn=None, probe_now=True)
+            m_probe.assert_called_once()
+            self.assertEqual((sid, src), ("sess_tab", "uia"))
+            self.assertEqual(state2["sticky_sid"], "sess_tab")
+
+            # 3) 开关开但非探测拍（probe_now=False）：不调 probe，保持 sticky
+            m_probe.reset_mock()
+            with self._patch_cfg(True):
+                sid, src = dsb.resolve_session_sticky(
+                    state2, [], self.data_dir, self.db_path,
+                    conn=None, probe_now=False)
+            m_probe.assert_not_called()
+            self.assertEqual((sid, src), ("sess_tab", "sticky"))
+
+            # 4) 开关开 + 探测拍 + 歧义（反查 None）：信号缺席，保持 sticky
+            with mock.patch.object(dsb.uia_tab_probe, "probe_active_tab_title",
+                                   return_value="歧义标题"), \
+                 mock.patch.object(dsb.uia_tab_probe, "resolve_sid_by_title",
+                                   return_value=None):
+                with self._patch_cfg(True):
+                    sid, src = dsb.resolve_session_sticky(
+                        state2, [], self.data_dir, self.db_path,
+                        conn=None, probe_now=True)
+            self.assertEqual((sid, src), ("sess_tab", "sticky"))
+
+
 if __name__ == "__main__":
     unittest.main()

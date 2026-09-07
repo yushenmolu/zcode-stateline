@@ -152,6 +152,12 @@ import sys
 import time
 import traceback
 
+try:
+    # 0.8.0 实验性 UIA 标签探测（默认关）；import 失败静默降级（信号恒缺席）
+    import uia_tab_probe
+except Exception:
+    uia_tab_probe = None
+
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -181,6 +187,7 @@ LIVE_USAGE_FRESH_MS = 30 * 1000         # 流结束后精确 usage 的展示窗�
 MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（30 秒）
 DB_ACTIVE_WINDOW_MS = 60 * 1000  # db 兜底判定窗口：最近 60 秒内有模型调用才算活跃
 DB_READ_INTERVAL = 5        # 每 N 次刷新才重读一次 db（model/title 不频繁变化）
+UIA_PROBE_EVERY_TICKS = 3   # UIA 标签探测节流：每 N 拍探一次（实验性开关开启时）
 STATS_PENDING = u"\uff08\u672c\u8f6e\u7ed3\u675f\u540e\u66f4\u65b0\uff09"  # （本轮结束后更新）
 TURN_PENDING = u"\uff08\u672c\u8f6e\u7edf\u8ba1\u5f85\u66f4\u65b0\uff09"  # （本轮统计待更新）——0.4.0 第二行无已完成轮次时占位
 SESSION_UNKNOWN = u"\uff08\u4f1a\u8bdd\u672a\u8bc6\u522b\uff0c\u5f85\u9996\u8f6e\u6d3b\u52a8\uff09"  # （会话未识别，待首轮活动）
@@ -314,6 +321,10 @@ DEFAULT_CONFIG = {
     "handle_y": None,
     "refresh_ms": 1000,
     "theme": "dark",
+    # ---- 0.8.0 UIA warm 切换探测（实验性，默认关）----
+    # 开启后每 UIA_PROBE_EVERY_TICKS 拍经 UIA 探测 ZCode 选中标签标题，
+    # 反查唯一命中则以 uia 信号参与粘滞竞争（详见 scripts/uia_tab_probe.py）。
+    "enable_uia_tab_probe": False,
 }
 
 HWND_TOPMOST = ctypes.c_void_p(-1)
@@ -1023,7 +1034,42 @@ def resolve_current_session(rows, data_dir, db_path, live_session_id=None):
     return None, "none"
 
 
-def resolve_session_sticky(state, rows, data_dir, db_path, conn=None):
+def _uia_signal(db_path, conn):
+    """UIA 标签探测 -> (session_id, time_ms) 或 None（信号缺席）。
+
+    缺席条件（任一）：模块级开关 enable_uia_tab_probe 关闭；
+    uia_tab_probe import 失败；探测返回 None；标题反查未唯一命中。
+    节流（是否本拍探测）由调用方经 probe_now 控制，此处不判。
+    conn 传入时复用反查；None 时自开自关（仅此一条查询）。
+    """
+    try:
+        if not DEFAULT_CONFIG.get("enable_uia_tab_probe", False):
+            return None
+        if uia_tab_probe is None:
+            return None
+        title = uia_tab_probe.probe_active_tab_title()
+        if not title:
+            return None
+        own = conn is None
+        if own:
+            conn = _db_connect(db_path)
+        try:
+            sid = uia_tab_probe.resolve_sid_by_title(conn, title)
+        finally:
+            if own and conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if not sid:
+            return None
+        return sid, time_ms()
+    except Exception:
+        return None
+
+
+def resolve_session_sticky(state, rows, data_dir, db_path, conn=None,
+                           probe_now=False):
     """信号驱动 + 粘滞的当前会话判定。返回 (session_id, source)。
 
     候选信号（各带真实发生时间戳，禁止用读取时刻伪造）：
@@ -1032,6 +1078,12 @@ def resolve_session_sticky(state, rows, data_dir, db_path, conn=None):
       db     : db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS, conn)
                -> (sid, started_at)（窗口外/无行返回 (None, 0)；
                  conn 传入时复用不关闭，否则自开自关）
+      uia    : 仅当 cfg["enable_uia_tab_probe"] 开启且 probe_now=True
+               （节流由调用方按 UIA_PROBE_EVERY_TICKS 计算，本函数不维护
+                 计数——简单且可测）时：probe_active_tab_title() ->
+               resolve_sid_by_title(conn, title) 唯一命中 ->
+               (sid, time_ms()) 参与竞争；探测失败/歧义/未命中 -> 信号缺席；
+               uia_tab_probe import 失败 -> 信号缺席。
     state 键：sticky_sid、sticky_set_at（本函数维护）；
               tail_session_resume 另维护 log_* 键。
 
@@ -1042,6 +1094,8 @@ def resolve_session_sticky(state, rows, data_dir, db_path, conn=None):
       3. 最新信号 sid != sticky 且信号 ts > sticky_set_at -> 切换 sticky，
          source 为信号类型；
       4. 否则保持 sticky，source="sticky"（含无任何信号的空闲轮询）。
+    cfg 从模块级 DEFAULT_CONFIG 取开关（热加载后的 cfg 由调用方经
+    probe_now 决定是否探测；开关读取集中在 _uia_signal()）。
     """
     if state is None:
         state = {}
@@ -1065,6 +1119,11 @@ def resolve_session_sticky(state, rows, data_dir, db_path, conn=None):
             candidates.append((ts, "db", sid))
     except Exception:
         pass
+    if probe_now:
+        # 仅探测拍才实际调用 UIA 探测（开关检查在 _uia_signal 内）
+        uia_sig = _uia_signal(db_path, conn)
+        if uia_sig is not None:
+            candidates.append((uia_sig[1], "uia", uia_sig[0]))
     newest = max(candidates, key=lambda c: c[0]) if candidates else None
     sticky = state.get("sticky_sid")
     try:
@@ -1637,7 +1696,8 @@ def session_label(db_path, session_id, conn=None):
 
 
 def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
-                     live_session_id=None, sess_state=None, db_conn=None):
+                     live_session_id=None, sess_state=None, db_conn=None,
+                     probe_now=False):
     """
     每帧（GUI / --once）统一解析展示信息，返回 dict：
       {text, source, session_id, model, session_label, line1, line2, stats}
@@ -1672,7 +1732,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
         if sess_state is None:
             sess_state = {}  # 向后兼容：临时态退化为无粘滞（每拍走首次分支）
         sid, source = resolve_session_sticky(sess_state, rows, data_dir,
-                                             db_path, conn=db_conn)
+                                             db_path, conn=db_conn,
+                                             probe_now=probe_now)
         info["session_id"] = sid
         info["source"] = source
         if sid is None:
@@ -3651,11 +3712,18 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             # 同一只读连接，组装完毕 finally 关闭（链路内零次新开连接）。
             tick_conn = _db_connect(db_path)
             try:
+                # R5 UIA 探测节流：仅开关开启且每 UIA_PROBE_EVERY_TICKS 拍
+                # 探一次（借 db_read_count 周期性归零作拍计数）。开关关闭 /
+                # 探测失败 / 反查歧义时 probe_now 信号缺席，行为同 Stage 1/2。
+                probe_now = bool(
+                    cfg.get("enable_uia_tab_probe", False)
+                    and (state["db_read_count"] % UIA_PROBE_EVERY_TICKS == 0))
                 info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
                                         cur=cur_cache,
                                         live_session_id=None,
                                         sess_state=state,
-                                        db_conn=tick_conn)
+                                        db_conn=tick_conn,
+                                        probe_now=probe_now)
                 session_changed = (prev_info is not None
                                    and info.get("session_id") != prev_info.get("session_id"))
                 force_db = (prev_info is None
