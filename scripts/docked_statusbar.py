@@ -829,26 +829,34 @@ def _truncate(s, n):
     return s_out[:n]
 
 
-def read_mark_file(data_dir):
-    """读取 current-session.json 标记；返回 session_id 或 None（文件不存在/坏/超龄）。"""
+def read_mark_raw(data_dir):
+    """读取 current-session.json；返回 (session_id, updated_at_ms)。
+    文件不存在/坏 JSON/缺字段返回 (None, 0)。不做新鲜度判断。"""
     path = os.path.join(data_dir, MARK_FILE_NAME)
     try:
         with open(path, "r", encoding="utf-8") as f:
             obj = json.load(f)
     except Exception:
-        return None
+        return None, 0
     sid = None
     try:
         sid = obj.get("session_id")
     except Exception:
         sid = None
     if not sid or not isinstance(sid, str):
-        return None
+        return None, 0
     try:
         updated = int(obj.get("updated_at") or 0)
     except Exception:
         updated = 0
-    if not updated or (time_ms() - updated) > MARK_FRESH_MS:
+    return sid, updated
+
+
+def read_mark_file(data_dir):
+    """兼容包装：读取 current-session.json 标记；返回 session_id 或 None。
+    保留原 30 秒新鲜度语义（供既有调用点使用）。"""
+    sid, updated = read_mark_raw(data_dir)
+    if not sid or not updated or (time_ms() - updated) > MARK_FRESH_MS:
         return None
     return sid
 
