@@ -1549,7 +1549,7 @@ def db_latest_speed(db_path, conn=None):
                 pass
 
 
-def status_detector(status_state, mu_row, tu_row, now=None):
+def status_detector(status_state, mu_row, tu_row, now=None, current_sid=None):
     """状态判定（0.6.0；纯函数，可独立单测）。返回 (status, speed_tok_per_s)：
       status ∈ {'generating', 'tool', 'idle'}；speed 恒 None（生成中时由
       调用方以 db_latest_speed 填充精确速度）。
@@ -1559,6 +1559,11 @@ def status_detector(status_state, mu_row, tu_row, now=None):
            -> 'generating'（绿⚡）；
         b. 最近事件 tool 且距 now < STATUS_IDLE_AFTER_MS -> 'tool'（蓝🔧）；
         c. 否则 'idle'（无文件 / 事件超龄 / 事件未知 / 会话未识别）。
+
+      会话匹配（0.7.1，消除跨会话粘附）：status_state 记录携带的 session_id
+      与调用方传入的 current_sid（当前粘附会话）均存在且不相等 -> 直接
+      ('idle', None)——该事件属于另一会话，不采信。任一侧为 None/空 -> 采信
+      （记录无 sid 的旧数据兼容 + 无会话上下文时保持旧行为）。
 
       0.6.0 起不再读 live_stream、不再依赖代理（live_stream 即使存在也不
       作为状态来源）。mu_row / tu_row 参数保留（历史签名兼容），不再参与
@@ -1570,6 +1575,10 @@ def status_detector(status_state, mu_row, tu_row, now=None):
         event = status_state.get("event")
         ts = status_state.get("ts")
         if event and ts:
+            rec_sid = status_state.get("session_id")
+            if (rec_sid and current_sid
+                    and str(rec_sid) != str(current_sid)):
+                return "idle", None
             try:
                 elapsed_ms = (now * 1000.0) - float(ts)
             except Exception:
@@ -1596,7 +1605,8 @@ def resolve_turn_status(status_state, db_path, session_id, conn=None):
         return "idle", None, None
     mu_row = db_latest_model_usage_status(db_path, session_id, conn=conn)
     tu_row = recent_turn_stats(db_path, session_id, conn=conn)
-    status, spd = status_detector(status_state, mu_row, tu_row)
+    status, spd = status_detector(status_state, mu_row, tu_row,
+                                  current_sid=session_id)
     if status == "generating":
         spd = db_latest_speed(db_path, conn=conn)
     return status, spd, tu_row
