@@ -920,7 +920,8 @@ def tail_session_resume(state, log_dir=None):
        "context":{"appliedMessageCount":537,...}}
       即：事件名在 event 字段（非 type），时间为 ISO 8601 UTC 的 timestamp 字段，
       会话 id 在 sessionId 字段；子代理 resume 的 sessionId 以 sess_subagent_ 开头
-      （过滤在判定层做，tailer 原样上报）。
+      （tailer 单槽只记主会话：subagent resume 跳过不覆盖，判定层过滤后
+      主会话切换信号不再被 subagent 堵死）。
     """
     if state is None:
         state = {}
@@ -995,6 +996,10 @@ def tail_session_resume(state, log_dir=None):
             ts = _log_line_ts_ms(obj)
             if not ts:
                 ts = time_ms()
+            # 单槽只记主会话：subagent resume 跳过不覆盖单槽（log_offset 已
+            # 随读文件推进，跳过不等于停止读），主会话切换信号不被堵死
+            if _is_subagent_sid(sid):
+                continue
             last_sid = sid
             last_ts = ts
     state["log_last_sid"] = last_sid
@@ -1102,7 +1107,11 @@ def resolve_session_sticky(state, rows, data_dir, db_path, conn=None,
     candidates = []
     try:
         sid, ts = read_mark_raw(data_dir)
-        if sid and ts and not _is_subagent_sid(sid):
+        # mark 是瞬时确认信号：超过 MARK_FRESH_MS 的陈旧标记不入池（过期
+        # 由粘滞保持，恢复 read_mark_file 的既有新鲜度语义）——否则陈旧
+        # mark 可顶位、与 db 信号进出 60 秒窗口竞争造成切换摆动
+        if (sid and ts and not _is_subagent_sid(sid)
+                and (time_ms() - ts) <= MARK_FRESH_MS):
             candidates.append((ts, "mark", sid))
     except Exception:
         pass

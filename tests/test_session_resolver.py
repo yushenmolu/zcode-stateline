@@ -168,8 +168,11 @@ class TestDbRecentSessionActivity(unittest.TestCase):
 class TestStickyResolver(unittest.TestCase):
     """Task 1.3: 粘滞判定状态机 resolve_session_sticky（三信号全 mock，确定性）。"""
 
-    T1 = 1_000_000
-    T2 = 2_000_000
+    # 0.7.1 mark 新鲜度门槛（MARK_FRESH_MS=30s）：T1/T2 改为基于当前时刻的
+    # 「较旧/较新」对。旧值 1_000_000/2_000_000 是 1970 年代毫秒，会被门槛
+    # 正确拒绝——那批用法编码的是修复前"陈旧 mark 入池"的旧语义。
+    T1 = dsb.time_ms() - 20_000
+    T2 = dsb.time_ms() - 10_000
 
     def _run(self, state, rows, mark=(None, 0), resume=(None, 0), db=(None, 0)):
         with mock.patch.object(dsb, "read_mark_raw", return_value=mark), \
@@ -178,13 +181,15 @@ class TestStickyResolver(unittest.TestCase):
             return dsb.resolve_session_sticky(state, rows, "dummy_dir", "dummy_db")
 
     def test_sticky_keeps_session_after_mark_expires(self):
-        """R1：mark 超龄（updated 为 1 小时前）后 sticky 保持，不漂移。"""
+        """R1：mark 超龄后不入池（0.7.1 新鲜度门槛），sticky 保持，不漂移。"""
         state = {}
-        stale_mark = ("sess_a", dsb.time_ms() - 3600 * 1000)
-        sid, source = self._run(state, [], mark=stale_mark)
+        # 第一拍：新鲜 mark 建立 sticky
+        sid, source = self._run(state, [],
+                                mark=("sess_a", dsb.time_ms() - 5 * 1000))
         self.assertEqual((sid, source), ("sess_a", "mark"))
-        # 第二拍：mark 仍是过期值，无更新信号 -> 保持 sticky
-        sid, source = self._run(state, [], mark=stale_mark)
+        # 第二拍：mark 过期（1 小时前），无更新信号 -> 入池被拒，保持 sticky
+        sid, source = self._run(state, [],
+                                mark=("sess_a", dsb.time_ms() - 3600 * 1000))
         self.assertEqual((sid, source), ("sess_a", "sticky"))
         self.assertEqual(state["sticky_sid"], "sess_a")
 
