@@ -1023,14 +1023,15 @@ def resolve_current_session(rows, data_dir, db_path, live_session_id=None):
     return None, "none"
 
 
-def resolve_session_sticky(state, rows, data_dir, db_path):
+def resolve_session_sticky(state, rows, data_dir, db_path, conn=None):
     """信号驱动 + 粘滞的当前会话判定。返回 (session_id, source)。
 
     候选信号（各带真实发生时间戳，禁止用读取时刻伪造）：
       mark   : read_mark_raw(data_dir)      -> (sid, updated_at)
       resume : tail_session_resume(state)   -> (sid, ts)
-      db     : db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS)
-               -> (sid, started_at)（窗口外/无行返回 (None, 0)）
+      db     : db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS, conn)
+               -> (sid, started_at)（窗口外/无行返回 (None, 0)；
+                 conn 传入时复用不关闭，否则自开自关）
     state 键：sticky_sid、sticky_set_at（本函数维护）；
               tail_session_resume 另维护 log_* 键。
 
@@ -1058,7 +1059,8 @@ def resolve_session_sticky(state, rows, data_dir, db_path):
     except Exception:
         pass
     try:
-        sid, ts = db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS)
+        sid, ts = db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS,
+                                             conn=conn)
         if sid and ts and not _is_subagent_sid(sid):
             candidates.append((ts, "db", sid))
     except Exception:
@@ -1521,7 +1523,7 @@ def status_detector(status_state, mu_row, tu_row, now=None):
     return "idle", None
 
 
-def resolve_turn_status(status_state, db_path, session_id):
+def resolve_turn_status(status_state, db_path, session_id, conn=None):
     """0.6.0 统一解析「状态 + 本轮统计」（GUI 每帧与 --once 共用）：
     返回 (status, speed_tok_per_s, turn_stats)：
       - status 走 status_detector（ZCode 钩子时序：generating / tool / idle）；
@@ -1529,14 +1531,15 @@ def resolve_turn_status(status_state, db_path, session_id):
         非 subagent model_usage 的精确 tok/s），不再依赖实时流；
       - turn_stats = recent_turn_stats 输出（最近一轮，无数据为 None）。
     会话未识别（None）时返回 ('idle', None, None)，不猜。
+    conn 透传给 db 查询（复用不关闭）；None 时各 helper 自开自关。
     """
     if not session_id:
         return "idle", None, None
-    mu_row = db_latest_model_usage_status(db_path, session_id)
-    tu_row = recent_turn_stats(db_path, session_id)
+    mu_row = db_latest_model_usage_status(db_path, session_id, conn=conn)
+    tu_row = recent_turn_stats(db_path, session_id, conn=conn)
     status, spd = status_detector(status_state, mu_row, tu_row)
     if status == "generating":
-        spd = db_latest_speed(db_path)
+        spd = db_latest_speed(db_path, conn=conn)
     return status, spd, tu_row
 
 
@@ -1549,13 +1552,14 @@ def cumulative_text(stats):
                format_tokens(stats.get("outputTokens") or 0)))
 
 
-def build_stats_line(rows, db_path=None, session_id=None):
+def build_stats_line(rows, db_path=None, session_id=None, conn=None):
     """
     聚合统计。**数据源优先级改为 db 优先**：db 行级聚合（模型调用完成即
-    落库，快一轮）-> jsonl 该会话累计（兜底，避免冷启动显示「—」）->
+    落库，快一轮）-> jsonl 该会话累计（兜底，避免冷启动显示「—»）->
     「本轮结束后更新」。
 
     session_id 为 None 时：先 jsonl ts 最大主会话，再 db 最新活跃主会话。
+    conn 透传给 db 查询（复用不关闭）；None 时各 helper 自开自关。
 
     返回 (text, source, used_sid, stats)：
       - text  完整统计行文本（含全部指标，未按配置裁剪）；
@@ -1566,7 +1570,7 @@ def build_stats_line(rows, db_path=None, session_id=None):
     def _db_or_jsonl(sid):
         """db 主源 -> jsonl 兜底；返回 (text, source, stats) 或 None(无数据)。"""
         if db_path:
-            st = db_aggregate_session(db_path, sid)
+            st = db_aggregate_session(db_path, sid, conn=conn)
             if st is not None:
                 return _line_from_stats(st), "db", st
         agg, last = aggregate_session(rows, sid)
@@ -1598,7 +1602,7 @@ def build_stats_line(rows, db_path=None, session_id=None):
         return text, src, sid, stats
 
     if db_path:
-        cur_sid, _err = db_latest_session_id(db_path)
+        cur_sid, _err = db_latest_session_id(db_path, conn=conn)
         if cur_sid:
             got = _db_or_jsonl(cur_sid)
             if got is None:
@@ -1621,24 +1625,26 @@ def build_stats_line(rows, db_path=None, session_id=None):
     return None, "none", None, None
 
 
-def session_label(db_path, session_id):
-    """会话显示标识：session.title 截断 ~16 字符；无 title -> (未命名会话)。"""
+def session_label(db_path, session_id, conn=None):
+    """会话显示标识：session.title 截断 ~16 字符；无 title -> (未命名会话)。
+    conn 透传给 db_session_title（复用不关闭）；None 时自开自关。"""
     if not session_id:
         return u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"  # （未命名会话）
-    title = db_session_title(db_path, session_id)
+    title = db_session_title(db_path, session_id, conn=conn)
     if title:
         return _truncate(title, 16) or u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"
     return u"\uff08\u672a\u547d\u540d\u4f1a\u8bdd\uff09"
 
 
 def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
-                     live_session_id=None, sess_state=None):
+                     live_session_id=None, sess_state=None, db_conn=None):
     """
     每帧（GUI / --once）统一解析展示信息，返回 dict：
       {text, source, session_id, model, session_label, line1, line2, stats}
     其中：
       - session 判定走 resolve_session_sticky（mark/resume/db 信号竞争 + 粘滞；
         sess_state=None 时内部自建临时 dict，向后兼容、退化为无粘滞每拍重判）；
+      - db_conn 透传给全部 db 查询（拍级连接复用，不关闭）；None 时自开自关；
       - 统计按该会话 db 优先聚合（build_stats_line）；stats 为标准 dict；
       - model / title 读 db（会话判定为新会话时才重读，否则沿用 cur 缓存）；
       - line1 按配置 show_model/show_session 裁剪；model 保留完整值（tooltip）。
@@ -1665,7 +1671,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
     try:
         if sess_state is None:
             sess_state = {}  # 向后兼容：临时态退化为无粘滞（每拍走首次分支）
-        sid, source = resolve_session_sticky(sess_state, rows, data_dir, db_path)
+        sid, source = resolve_session_sticky(sess_state, rows, data_dir,
+                                             db_path, conn=db_conn)
         info["session_id"] = sid
         info["source"] = source
         if sid is None:
@@ -1683,8 +1690,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
             model = cur.get("model")
             label = cur.get("session_label")
         else:
-            model = db_latest_model_id(db_path, sid)
-            label = session_label(db_path, sid)
+            model = db_latest_model_id(db_path, sid, conn=db_conn)
+            label = session_label(db_path, sid, conn=db_conn)
             if not model:
                 model = "model?"
             if not label:
@@ -1699,7 +1706,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
             parts1.append(label)
         info["line1"] = u" \u00b7 ".join(parts1) if parts1 else u"\u2014"
 
-        text, _src, used_sid, stats = build_stats_line(rows, db_path, sid)
+        text, _src, used_sid, stats = build_stats_line(rows, db_path, sid,
+                                                       conn=db_conn)
         info["recent_note"] = (source == "jsonl" and stats is not None)
         if info["recent_note"] and text:
             text = text + u" " + SESSION_RECENT_NOTE
@@ -1708,7 +1716,7 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
         info["stats"] = stats
         # 速度（tok/s）：db 行级（jsonl 无单次 duration，速度仅 db 有数据）；
         # 附到 stats dict 供指标块渲染，同时平铺到 info 顶层供 --once 输出。
-        spd_recent, spd_avg = db_session_speed(db_path, sid)
+        spd_recent, spd_avg = db_session_speed(db_path, sid, conn=db_conn)
         info["speed_recent"] = spd_recent
         info["speed_avg"] = spd_avg
         if stats is not None:
@@ -3639,19 +3647,31 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             status_state = None
             if cfg.get("show_live", True):
                 status_state = _read_status_state(data_dir)
-            info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
-                                    cur=cur_cache,
-                                    live_session_id=None,
-                                    sess_state=state)
-            session_changed = (prev_info is not None
-                               and info.get("session_id") != prev_info.get("session_id"))
-            force_db = (prev_info is None
-                        or session_changed
-                        or state["db_read_count"] == 0)
-            state["force_db"] = force_db  # 诊断用：model/title 强刷已由 cur_cache/reuse 覆盖
-            # 钩子时序 -> 状态徽标；生成中时 speed 取 db_latest_speed 精确速度。
-            status, spd, turn_stats = resolve_turn_status(
-                status_state, db_path, info.get("session_id"))
+            # R4 拍级连接复用：一拍数据组装（会话判定 + 统计 + 状态）共用
+            # 同一只读连接，组装完毕 finally 关闭（链路内零次新开连接）。
+            tick_conn = _db_connect(db_path)
+            try:
+                info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
+                                        cur=cur_cache,
+                                        live_session_id=None,
+                                        sess_state=state,
+                                        db_conn=tick_conn)
+                session_changed = (prev_info is not None
+                                   and info.get("session_id") != prev_info.get("session_id"))
+                force_db = (prev_info is None
+                            or session_changed
+                            or state["db_read_count"] == 0)
+                state["force_db"] = force_db  # 诊断用：model/title 强刷已由 cur_cache/reuse 覆盖
+                # 钩子时序 -> 状态徽标；生成中时 speed 取 db_latest_speed 精确速度。
+                status, spd, turn_stats = resolve_turn_status(
+                    status_state, db_path, info.get("session_id"),
+                    conn=tick_conn)
+            finally:
+                if tick_conn is not None:
+                    try:
+                        tick_conn.close()
+                    except Exception:
+                        pass
             info["status"] = status
             info["status_speed"] = spd
             info["turn_stats"] = turn_stats

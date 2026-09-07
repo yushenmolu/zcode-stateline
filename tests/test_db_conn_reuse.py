@@ -126,5 +126,71 @@ class TestDbHelpersConnParam(unittest.TestCase):
                                    "sess_main"))
 
 
+class TestTickSingleConnection(unittest.TestCase):
+    """Task 2.2: 一拍数据组装链路只开一次连接（R4）。
+
+    refresh_stats 是 run_gui 的嵌套函数不可直接单测，改测同一数据组装链路：
+    resolve_gui_info(sess_state, db_conn=tick_conn) + resolve_turn_status(conn=tick_conn)。
+    monkeypatch dsb._db_connect 计数包装（内部调原函数）。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        (self.db_path, self.data_dir,
+         self.started_at) = _make_fixture(self._tmp.name)
+
+    def _counting_connect(self):
+        counter = {"n": 0}
+        orig_connect = dsb._db_connect
+
+        def counting(p):
+            counter["n"] += 1
+            return orig_connect(p)
+
+        return counter, counting
+
+    def test_gui_info_tick_single_connection(self):
+        """测试 A：tick_conn 由调用方开一次，gui_info + turn_status 链路零新开。"""
+        counter, counting = self._counting_connect()
+        with mock.patch.object(dsb, "_db_connect", side_effect=counting), \
+             mock.patch.object(dsb, "tail_session_resume",
+                               return_value=(None, 0)):
+            tick_conn = dsb._db_connect(self.db_path)  # 唯一一次连接
+            try:
+                state = {}
+                info = dsb.resolve_gui_info([], self.data_dir, self.db_path,
+                                            cfg={}, cur=None,
+                                            sess_state=state,
+                                            db_conn=tick_conn)
+                status, spd, turn_stats = dsb.resolve_turn_status(
+                    None, self.db_path, info.get("session_id"),
+                    conn=tick_conn)
+            finally:
+                if tick_conn is not None:
+                    tick_conn.close()
+        self.assertEqual(counter["n"], 1)
+        self.assertEqual(info["session_id"], "sess_main")
+        self.assertEqual(info["source"], "db")
+        self.assertEqual(info["model"], "model_a")
+        self.assertEqual(status, "idle")
+
+    def test_sticky_uses_shared_conn(self):
+        """测试 C：resolve_session_sticky 传 conn 时同样零新开连接。"""
+        counter, counting = self._counting_connect()
+        with mock.patch.object(dsb, "_db_connect", side_effect=counting), \
+             mock.patch.object(dsb, "tail_session_resume",
+                               return_value=(None, 0)):
+            tick_conn = dsb._db_connect(self.db_path)
+            try:
+                state = {}
+                sid, source = dsb.resolve_session_sticky(
+                    state, [], self.data_dir, self.db_path, conn=tick_conn)
+            finally:
+                tick_conn.close()
+        self.assertEqual(counter["n"], 1)
+        self.assertEqual((sid, source), ("sess_main", "db"))
+
+
 if __name__ == "__main__":
     unittest.main()
