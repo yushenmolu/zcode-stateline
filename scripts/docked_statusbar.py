@@ -144,6 +144,7 @@ SessionStart/UserPromptSubmit 时写入真实会话 ID）：
 import argparse
 import ctypes
 import ctypes.wintypes as wintypes
+import datetime
 import json
 import os
 import sqlite3
@@ -163,6 +164,7 @@ DATA_DIR_DEFAULT = os.path.join(
     "local", "zcode-token-stats",
 )
 DB_DEFAULT = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "db", "db.sqlite")
+LOG_DIR_DEFAULT = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "log")
 JSONL_NAME = "token-stats.jsonl"
 PID_NAME = "statusbar.pid"
 MARK_FILE_NAME = "current-session.json"
@@ -859,6 +861,136 @@ def read_mark_file(data_dir):
     if not sid or not updated or (time_ms() - updated) > MARK_FRESH_MS:
         return None
     return sid
+
+
+def _log_line_ts_ms(obj):
+    """行内时间字段（ts/time/timestamp；ISO 8601 字符串或 epoch 毫秒）-> epoch ms。
+    全部解析失败返回 0（调用方兜底 time_ms()）。"""
+    for key in ("ts", "time", "timestamp"):
+        try:
+            v = obj.get(key)
+        except Exception:
+            return 0
+        if v is None:
+            continue
+        try:
+            if isinstance(v, (int, float)):
+                return int(v)
+            s = str(v).strip()
+            if not s:
+                continue
+            if s.isdigit():
+                return int(s)
+            # fromisoformat 在 3.11 前不认 "Z" 后缀，统一替换为 +00:00
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            continue
+    return 0
+
+
+def tail_session_resume(state, log_dir=None):
+    """增量 tail 今日 zcode-YYYY-MM-DD.jsonl，返回最新 session.resumed 的 (session_id, ts_ms)。
+
+    state 键：log_date（str）、log_offset（int）、log_last_sid、log_last_ts。
+    规则：
+      - 文件名按本地日期 datetime.date.today() 生成；跨天时 offset 归零、重新打开；
+      - 从 state["log_offset"] seek（字节偏移），只读新增字节；末行不完整（无 \\n
+        结尾）时 offset 回退到最后一个完整行尾，下次再读；
+      - 逐行 json.loads，筛 event/type 字段为 "session.resumed" 的行，取 sessionId；
+        行内时间字段（ts/time/timestamp，ISO 或 epoch 毫秒）解析失败则用 time_ms()；
+      - 文件不存在/权限错/解析全败：返回 (None, 0)，不抛；
+      - 无新增字节时返回 state 记住的上次结果（log_last_sid, log_last_ts）。
+
+    日志行结构（2026-09-07 取样 ~/.zcode/cli/log/zcode-2026-09-07.jsonl 确认）：
+      {"timestamp":"2026-09-07T00:35:50.153Z","level":"info","event":"session.resumed",
+       "module":"core.runtime","message":"Session resumed","traceId":"...","spanId":"...",
+       "sessionId":"sess_6863b1b6-f165-4751-8811-b2da1420b2b5","status":"completed",
+       "context":{"appliedMessageCount":537,...}}
+      即：事件名在 event 字段（非 type），时间为 ISO 8601 UTC 的 timestamp 字段，
+      会话 id 在 sessionId 字段；子代理 resume 的 sessionId 以 sess_subagent_ 开头
+      （过滤在判定层做，tailer 原样上报）。
+    """
+    if state is None:
+        state = {}
+    if log_dir is None:
+        log_dir = LOG_DIR_DEFAULT
+    try:
+        today = datetime.date.today().isoformat()
+    except Exception:
+        return None, 0
+    # 跨天：offset 归零，重新打开新日期文件
+    if state.get("log_date") != today:
+        state["log_date"] = today
+        state["log_offset"] = 0
+    path = os.path.join(log_dir, "zcode-%s.jsonl" % today)
+    offset = state.get("log_offset") or 0
+    if not isinstance(offset, int) or offset < 0:
+        offset = 0
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        return None, 0
+    if offset > size:
+        offset = 0  # 文件被截断/轮换：从头读
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            raw = f.read()
+    except Exception:
+        return None, 0
+    new_end = offset + len(raw)
+    if raw and not raw.endswith(b"\n"):
+        # 末行不完整：offset 回退到最后一个完整行尾，残余下次再读
+        last_nl = raw.rfind(b"\n")
+        if last_nl < 0:
+            raw_complete = b""
+            new_end = offset
+        else:
+            raw_complete = raw[:last_nl + 1]
+            new_end = offset + last_nl + 1
+    else:
+        raw_complete = raw
+    state["log_offset"] = new_end
+    last_sid = state.get("log_last_sid")
+    try:
+        last_ts = int(state.get("log_last_ts") or 0)
+    except Exception:
+        last_ts = 0
+    if raw_complete:
+        try:
+            text = raw_complete.decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            try:
+                ev = obj.get("event")
+                if ev is None:
+                    ev = obj.get("type")
+            except Exception:
+                continue
+            if ev != "session.resumed":
+                continue
+            sid = obj.get("sessionId")
+            if not sid or not isinstance(sid, str):
+                continue
+            ts = _log_line_ts_ms(obj)
+            if not ts:
+                ts = time_ms()
+            last_sid = sid
+            last_ts = ts
+    state["log_last_sid"] = last_sid
+    state["log_last_ts"] = last_ts
+    if not last_sid:
+        return None, 0
+    return last_sid, last_ts
 
 
 def resolve_current_session(rows, data_dir, db_path, live_session_id=None):
