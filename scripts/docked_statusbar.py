@@ -993,6 +993,7 @@ def tail_session_resume(state, log_dir=None):
     return last_sid, last_ts
 
 
+# legacy: superseded by resolve_session_sticky（保留作向后兼容/对照，不再被刷新链路调用）
 def resolve_current_session(rows, data_dir, db_path, live_session_id=None):
     """
     综合确定「当前会话」id（fail-closed：判定不充分宁可返回 None 占位，绝不猜）。
@@ -1591,12 +1592,13 @@ def session_label(db_path, session_id):
 
 
 def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
-                     live_session_id=None):
+                     live_session_id=None, sess_state=None):
     """
     每帧（GUI / --once）统一解析展示信息，返回 dict：
       {text, source, session_id, model, session_label, line1, line2, stats}
     其中：
-      - session 判定走 resolve_current_session（live -> mark -> db -> jsonl）；
+      - session 判定走 resolve_session_sticky（mark/resume/db 信号竞争 + 粘滞；
+        sess_state=None 时内部自建临时 dict，向后兼容、退化为无粘滞每拍重判）；
       - 统计按该会话 db 优先聚合（build_stats_line）；stats 为标准 dict；
       - model / title 读 db（会话判定为新会话时才重读，否则沿用 cur 缓存）；
       - line1 按配置 show_model/show_session 裁剪；model 保留完整值（tooltip）。
@@ -1621,8 +1623,9 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
         "error": None,
     }
     try:
-        sid, source = resolve_current_session(rows, data_dir, db_path,
-                                               live_session_id=live_session_id)
+        if sess_state is None:
+            sess_state = {}  # 向后兼容：临时态退化为无粘滞（每拍走首次分支）
+        sid, source = resolve_session_sticky(sess_state, rows, data_dir, db_path)
         info["session_id"] = sid
         info["source"] = source
         if sid is None:
@@ -2730,7 +2733,6 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "last_xy": None,          # 最近一次贴边 MoveWindow 的目标（仅贴边用）
         "last_info": None,
         "db_read_count": 0,
-        "last_mark_sid": None,
         "cur_w": WINDOW_W,        # 当前生效窗口宽（自适应 + 防抖后的值）
         # ---- 配置热加载 ----
         "cfg_mtime": None,        # statusbar-config.json 上次读取的 mtime
@@ -3582,22 +3584,31 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         try:
             # N6 性能：逐秒全量解析改走指纹缓存，文件未变时复用上次结果
             rows, _err = read_jsonl_cached(os.path.join(data_dir, JSONL_NAME))
-            mark_sid = read_mark_file(data_dir)
-            mark_changed = state.get("last_mark_sid") != mark_sid
-            state["last_mark_sid"] = mark_sid
-            force_db = (state["last_info"] is None
-                        or mark_changed
-                        or state["db_read_count"] == 0)
-            cur_cache = None if force_db else state["last_info"]
+            # 会话判定改为信号驱动 + 粘滞（resolve_session_sticky，经
+            # resolve_gui_info(sess_state=state)）：不再每拍读 mark 判变化。
+            # model/title 缓存复用由 resolve_gui_info 内建 reuse 判定
+            # （cur.session_id 与判定 sid 不同即重读）；此处仅保留周期性强刷
+            # （db_read_count == 0 时每 DB_READ_INTERVAL 拍重读一次）。
+            prev_info = state["last_info"]
+            cur_cache = (None if (prev_info is None
+                                  or state["db_read_count"] == 0)
+                         else prev_info)
             # 0.6.0：状态徽标来源改为 ZCode 钩子时序 status-state.json
             # （status_event.py 写），不再读 live_stream / 不依赖代理；
-            # 会话判定走 mark -> db -> jsonl 原链（live_session_id 恒 None）。
+            # 会话判定走 sticky 信号链（live_session_id 恒 None）。
             status_state = None
             if cfg.get("show_live", True):
                 status_state = _read_status_state(data_dir)
             info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
                                     cur=cur_cache,
-                                    live_session_id=None)
+                                    live_session_id=None,
+                                    sess_state=state)
+            session_changed = (prev_info is not None
+                               and info.get("session_id") != prev_info.get("session_id"))
+            force_db = (prev_info is None
+                        or session_changed
+                        or state["db_read_count"] == 0)
+            state["force_db"] = force_db  # 诊断用：model/title 强刷已由 cur_cache/reuse 覆盖
             # 钩子时序 -> 状态徽标；生成中时 speed 取 db_latest_speed 精确速度。
             status, spd, turn_stats = resolve_turn_status(
                 status_state, db_path, info.get("session_id"))

@@ -248,5 +248,48 @@ class TestStickyResolver(unittest.TestCase):
         self.assertEqual((sid, source), (None, "none"))
 
 
+class TestGuiInfoStickyIntegration(unittest.TestCase):
+    """Task 1.4: resolve_gui_info 接入 sticky resolver 的集成测试。"""
+
+    def test_gui_info_uses_sticky_session(self):
+        """连续两次调用 resolve_gui_info：第二次 mark 过期但 session_id 不变。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            mark_path = os.path.join(d, dsb.MARK_FILE_NAME)
+            with open(mark_path, "w", encoding="utf-8") as f:
+                json.dump({"session_id": "sess_x", "updated_at": now}, f)
+            state = {}
+            # db 不存在：db 信号/model/title/统计全部静默降级
+            db_path = os.path.join(d, "nope.sqlite")
+            with mock.patch.object(dsb, "tail_session_resume",
+                                   return_value=(None, 0)):
+                info1 = dsb.resolve_gui_info([], d, db_path, sess_state=state)
+                self.assertEqual(info1["session_id"], "sess_x")
+                self.assertEqual(info1["source"], "mark")
+
+                # mark 过期（updated_at 改写为 1 小时前）：
+                # 旧机制会漂移，sticky 应保持 sess_x
+                with open(mark_path, "w", encoding="utf-8") as f:
+                    json.dump({"session_id": "sess_x",
+                               "updated_at": now - 3600 * 1000}, f)
+                info2 = dsb.resolve_gui_info([], d, db_path, sess_state=state)
+                self.assertEqual(info2["session_id"], "sess_x")
+                self.assertEqual(info2["source"], "sticky")
+
+    def test_gui_info_backward_compat_no_sess_state(self):
+        """sess_state 缺省（None）时向后兼容：内部自建临时 dict，可正常返回。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            with open(os.path.join(d, dsb.MARK_FILE_NAME), "w",
+                      encoding="utf-8") as f:
+                json.dump({"session_id": "sess_y", "updated_at": now}, f)
+            db_path = os.path.join(d, "nope.sqlite")
+            with mock.patch.object(dsb, "tail_session_resume",
+                                   return_value=(None, 0)):
+                info = dsb.resolve_gui_info([], d, db_path)
+                self.assertEqual(info["session_id"], "sess_y")
+                self.assertEqual(info["source"], "mark")
+
+
 if __name__ == "__main__":
     unittest.main()
