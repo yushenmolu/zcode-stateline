@@ -1022,6 +1022,70 @@ def resolve_current_session(rows, data_dir, db_path, live_session_id=None):
     return None, "none"
 
 
+def resolve_session_sticky(state, rows, data_dir, db_path):
+    """信号驱动 + 粘滞的当前会话判定。返回 (session_id, source)。
+
+    候选信号（各带真实发生时间戳，禁止用读取时刻伪造）：
+      mark   : read_mark_raw(data_dir)      -> (sid, updated_at)
+      resume : tail_session_resume(state)   -> (sid, ts)
+      db     : db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS)
+               -> (sid, started_at)（窗口外/无行返回 (None, 0)）
+    state 键：sticky_sid、sticky_set_at（本函数维护）；
+              tail_session_resume 另维护 log_* 键。
+
+    切换规则：
+      1. 过滤 subagent sid 后，取时间戳最新的信号（平局按 mark>resume>db 优先）；
+      2. sticky 为空（首次）：取该信号 sid；无任何信号 -> current_session(rows)
+         的 jsonl 兜底（保持旧行为，source="jsonl"）；都没有 -> (None, "none")；
+      3. 最新信号 sid != sticky 且信号 ts > sticky_set_at -> 切换 sticky，
+         source 为信号类型；
+      4. 否则保持 sticky，source="sticky"（含无任何信号的空闲轮询）。
+    """
+    if state is None:
+        state = {}
+    candidates = []
+    try:
+        sid, ts = read_mark_raw(data_dir)
+        if sid and ts and not _is_subagent_sid(sid):
+            candidates.append((ts, "mark", sid))
+    except Exception:
+        pass
+    try:
+        sid, ts = tail_session_resume(state)
+        if sid and ts and not _is_subagent_sid(sid):
+            candidates.append((ts, "resume", sid))
+    except Exception:
+        pass
+    try:
+        sid, ts = db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS)
+        if sid and ts and not _is_subagent_sid(sid):
+            candidates.append((ts, "db", sid))
+    except Exception:
+        pass
+    newest = max(candidates, key=lambda c: c[0]) if candidates else None
+    sticky = state.get("sticky_sid")
+    try:
+        sticky_set_at = int(state.get("sticky_set_at") or 0)
+    except Exception:
+        sticky_set_at = 0
+    if not sticky:
+        if newest is not None:
+            state["sticky_sid"] = newest[2]
+            state["sticky_set_at"] = newest[0]
+            return newest[2], newest[1]
+        sid = current_session(rows)
+        if sid:
+            state["sticky_sid"] = sid
+            state["sticky_set_at"] = 0  # jsonl 兜底无真实信号时刻，任何信号可校正
+            return sid, "jsonl"
+        return None, "none"
+    if newest is not None and newest[2] != sticky and newest[0] > sticky_set_at:
+        state["sticky_sid"] = newest[2]
+        state["sticky_set_at"] = newest[0]
+        return newest[2], newest[1]
+    return sticky, "sticky"
+
+
 def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
     """db 侧「最近活跃」判定：window_ms 毫秒内有 model_usage 行的最新主会话 id。
 
@@ -1047,6 +1111,39 @@ def db_recent_session_id(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
         return None
     except Exception:
         return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def db_recent_session_activity(db_path, window_ms=DB_ACTIVE_WINDOW_MS):
+    """db 侧「最近活动」信号：window_ms 毫秒内最新主会话模型调用行的
+    (session_id, started_at)。与 db_recent_session_id 同查询，但返回真实
+    活动时间戳供粘滞判定信号竞争（处置：db 候选不得用读取时刻伪造 ts）。
+    窗口外/无行/失败返回 (None, 0)。"""
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None, 0
+    try:
+        since = time_ms() - int(window_ms)
+        row = conn.execute(
+            "SELECT session_id, started_at FROM model_usage "
+            "WHERE session_id LIKE 'sess_%' "
+            "AND session_id NOT LIKE 'sess_subagent_%' "
+            "AND started_at >= ? "
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (since,),
+        ).fetchone()
+        if row and row[0]:
+            try:
+                return row[0], int(row[1] or 0)
+            except Exception:
+                return row[0], 0
+        return None, 0
+    except Exception:
+        return None, 0
     finally:
         try:
             conn.close()
