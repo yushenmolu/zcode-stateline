@@ -10,8 +10,9 @@ rem    setlocal EnableExtensions, ZCODE_PLUGIN_ROOT derived at runtime when the
 rem    env var is absent, Python resolved via PYTHON_BIN > where python > py -3,
 rem    exit /b 0 so the hook can never block.
 rem  - %~1 = event name (generating / tool / idle), %~2 = session id from
-rem    ${CLAUDE_SESSION_ID} (fallback only); stdin carries the hook input JSON
-rem    (read first by status_event.py).
+rem    ${CLAUDE_SESSION_ID} (fallback only), %~3 = platform hook name (also
+rem    fallback: status_event.py prefers stdin's hook_event_name). The hook name
+rem    lets the writer mark turn start (UserPromptSubmit) and shard per session.
 rem  - status_event.py always prints exactly one valid JSON object "{}" and
 rem    exits 0; `echo {}` covers the case where Python cannot start at all.
 rem  - stderr is appended to the data dir so stray output never pollutes stdout.
@@ -48,6 +49,6 @@ set "DATA=%USERPROFILE%\.zcode\cli\plugins\data\local\zcode-token-stats"
 
 if not exist "%DATA%" mkdir "%DATA%"
 
-%PY_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\status_event.py" "%~1" "%~2" 2>> "%DATA%\status-event-stderr.log" || echo {}
+%PY_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\status_event.py" "%~1" "%~2" "%~3" 2>> "%DATA%\status-event-stderr.log" || echo {}
 
 exit /b 0

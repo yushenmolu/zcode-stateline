@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Stage 1 信号驱动 + 粘滞判定：read_mark_raw / tail_session_resume 等单元测试。"""
+"""Stage 1 信号驱动 + 粘滞判定：read_mark_raw / tail_session_resume 等单元测试。
+
+Week 3 补充：status-state.json 候选、resume 新鲜度门槛。
+"""
+import ast
 import datetime
 import json
 import os
@@ -43,12 +47,6 @@ class TestReadMarkRaw(unittest.TestCase):
             sid, updated = dsb.read_mark_raw(d)
             self.assertIsNone(sid)
             self.assertEqual(updated, 0)
-
-            # 兼容包装 read_mark_file 保留 30 秒新鲜度语义
-            self._write_mark(d, {"session_id": "sess_fresh2", "updated_at": dsb.time_ms()})
-            self.assertEqual(dsb.read_mark_file(d), "sess_fresh2")
-            self._write_mark(d, {"session_id": "sess_old2", "updated_at": dsb.time_ms() - 60 * 1000})
-            self.assertIsNone(dsb.read_mark_file(d))
 
 
 def _iso_to_ms(ts_iso):
@@ -294,6 +292,215 @@ class TestGuiInfoStickyIntegration(unittest.TestCase):
                 info = dsb.resolve_gui_info([], d, db_path)
                 self.assertEqual(info["session_id"], "sess_y")
                 self.assertEqual(info["source"], "mark")
+
+
+class TestStickyNewSignals(unittest.TestCase):
+    """Week 3 Task 3.2 / 3.3: status-state.json 候选 + resume 新鲜度门槛
+    （status 走真实文件读取，其余信号全 mock 保证确定性）。
+
+    0.9.0：status-state.json 已改为按会话分片的 v2 文档，身份候选取
+    「全部分片中最新一条」；默认 helper 写 v2，另保留 v1 老文件兼容用例。
+    """
+
+    def _write_status_state(self, d, sid, ts):
+        """写 v2 分片文档（单会话一条）。"""
+        with open(os.path.join(d, dsb.STATUS_STATE_NAME), "w",
+                  encoding="utf-8") as f:
+            json.dump({"version": 2,
+                       "sessions": {sid: {"event": "generating", "ts": ts,
+                                          "hook": "UserPromptSubmit",
+                                          "turn_started_at": ts,
+                                          "session_id": sid}},
+                       "order": [sid]}, f)
+
+    def _write_status_shards(self, d, entries):
+        """写 v2 多分片文档：entries = [(sid, ts), ...]。"""
+        sessions = dict((sid, {"event": "generating", "ts": ts,
+                               "hook": "UserPromptSubmit",
+                               "turn_started_at": ts, "session_id": sid})
+                        for sid, ts in entries)
+        with open(os.path.join(d, dsb.STATUS_STATE_NAME), "w",
+                  encoding="utf-8") as f:
+            json.dump({"version": 2, "sessions": sessions,
+                       "order": [sid for sid, _ in entries]}, f)
+
+    def _write_status_state_v1(self, d, sid, ts):
+        """写 0.8.0 的 v1 全局单条文档（升级窗口兼容）。"""
+        with open(os.path.join(d, dsb.STATUS_STATE_NAME), "w",
+                  encoding="utf-8") as f:
+            json.dump({"event": "UserPromptSubmit", "ts": ts,
+                       "session_id": sid}, f)
+
+    def _run(self, d, state, mark=(None, 0), resume=(None, 0),
+             db=(None, 0)):
+        # db_path 指向不存在的文件：真实 db 查询不参与（避免测试污染/不确定性）
+        db_path = os.path.join(d, "nope.sqlite")
+        with mock.patch.object(dsb, "read_mark_raw", return_value=mark), \
+             mock.patch.object(dsb, "tail_session_resume", return_value=resume), \
+             mock.patch.object(dsb, "db_recent_session_activity",
+                               return_value=db):
+            return dsb.resolve_session_sticky(state, [], d, db_path,
+                                              conn=None, probe_now=False)
+
+    def test_status_signal_wins_over_older_mark(self):
+        """status-state.json（新鲜 ts，会话 X）+ 更旧 mark -> (X, "status")。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            self._write_status_state(d, "sess_x", now - 2 * 1000)
+            state = {}
+            self.assertEqual(
+                self._run(d, state, mark=("sess_m", now - 10 * 1000)),
+                ("sess_x", "status"))
+
+    def test_latest_shard_wins_among_sessions(self):
+        """多分片取最新一条：sess_b 更新 -> 候选是 b（不是文件里的第一条）。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            self._write_status_shards(d, [("sess_a", now - 20 * 1000),
+                                          ("sess_b", now - 3 * 1000)])
+            self.assertEqual(self._run(d, {}), ("sess_b", "status"))
+
+    def test_v1_flat_doc_still_adopted(self):
+        """v1 老文件兼容：无 sessions 字段的单条记录仍能作为 status 候选。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            self._write_status_state_v1(d, "sess_x", now - 2 * 1000)
+            self.assertEqual(
+                self._run(d, {}, mark=("sess_m", now - 10 * 1000)),
+                ("sess_x", "status"))
+
+    def test_stale_status_signal_rejected(self):
+        """status ts 距今超 STATUS_SIGNAL_FRESH_MS(60s) -> 该信号缺席。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            self._write_status_state(d, "sess_x", now - 61 * 1000)
+            # 无其他信号：陈旧 status 不得被采纳
+            self.assertEqual(self._run(d, {}), (None, "none"))
+            # 有新鲜 mark 时：胜出者是 mark（证明 status 缺席，而非被 mark 压制）
+            self.assertEqual(
+                self._run(d, {}, mark=("sess_m", now - 5 * 1000)),
+                ("sess_m", "mark"))
+
+    def test_stale_resume_rejected_by_freshness_gate(self):
+        """resume 距今超 RESUME_FRESH_MS(600s) -> 不采纳该信号。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            self.assertEqual(
+                self._run(d, {}, resume=("sess_r", now - 601 * 1000)),
+                (None, "none"))
+
+    def test_fresh_resume_still_adopted(self):
+        """门槛不误伤正常路径：窗口内 resume 仍正常置位 sticky。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            self.assertEqual(
+                self._run(d, {}, resume=("sess_r", now - 300 * 1000)),
+                ("sess_r", "resume"))
+
+
+class TestStickyStaticContract(unittest.TestCase):
+    """H-1 静态契约：session.time_updated 不得回流身份竞争。
+
+    背景：session.time_updated 由后台（消息/part 落库）驱动，任何会话
+    有动静都会刷新——若把它加入 resolve_session_sticky 的候选池，后台
+    刷新会顶掉真正的当前会话（误切）。已从候选中删除 time_updated，
+    本静态测试防止字段回流。
+    """
+
+    def test_resolve_session_sticky_body_has_no_time_updated(self):
+        """resolve_session_sticky 函数体（含文档串）内不得出现 time_updated。"""
+        src_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts", "docked_statusbar.py")
+        with open(src_path, encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        func = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "resolve_session_sticky")
+        body = ast.get_source_segment(src, func)
+        self.assertIsNotNone(body, "未能提取 resolve_session_sticky 函数源码")
+        self.assertNotIn("time_updated", body,
+                         "resolve_session_sticky 函数体内出现 time_updated："
+                         "session 表字段回流身份竞争，会误切当前会话")
+
+
+class TestStaleDbCandidateNoOverride(unittest.TestCase):
+    """H-1：陈旧 db 候选（model_usage.started_at 早于 sticky_set_at）
+    不得接管已设定的 sticky 会话。
+
+    db 信号走真实临时 sqlite（不 mock db_recent_session_activity），
+    覆盖「model_usage.started_at 真实取值 -> 候选池 -> 粘滞判定」全链路；
+    mark/resume 信号 mock 保证确定性。
+    """
+
+    def _mkdb(self, path, rows):
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("CREATE TABLE model_usage (session_id TEXT, started_at INTEGER)")
+            for sid, started in rows:
+                conn.execute("INSERT INTO model_usage VALUES (?, ?)", (sid, started))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_stale_db_started_at_does_not_override_sticky(self):
+        """sticky_set_at=T 时，db 候选 started_at < T -> 保持 sticky 会话。"""
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            T = now - 10 * 1000
+            db_path = os.path.join(d, "t.sqlite")
+            # sess_b 的 model_usage 行在 DB_ACTIVE_WINDOW_MS(180s) 活跃窗口内，
+            # 但 started_at（T-5s）早于 sticky_set_at（T）
+            self._mkdb(db_path, [("sess_b", T - 5 * 1000)])
+            state = {}
+            # 第一拍：mark（ts=T）建立 sticky=sess_a、sticky_set_at=T
+            with mock.patch.object(dsb, "read_mark_raw",
+                                   return_value=("sess_a", T)), \
+                 mock.patch.object(dsb, "tail_session_resume",
+                                   return_value=(None, 0)), \
+                 mock.patch.object(dsb, "db_recent_session_activity",
+                                   return_value=(None, 0)):
+                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            self.assertEqual((sid, source), ("sess_a", "mark"))
+            # 第二拍：mark 消失，真实 db 查询带回 sess_b（started_at < T）
+            # -> 陈旧候选不得覆盖 sticky
+            with mock.patch.object(dsb, "read_mark_raw",
+                                   return_value=(None, 0)), \
+                 mock.patch.object(dsb, "tail_session_resume",
+                                   return_value=(None, 0)):
+                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            self.assertEqual((sid, source), ("sess_a", "sticky"))
+            self.assertEqual(state["sticky_sid"], "sess_a")
+            self.assertEqual(state["sticky_set_at"], T)
+
+    def test_fresh_db_started_at_overrides_sticky(self):
+        """对照：started_at 晚于 sticky_set_at 的 db 候选正常接管。
+
+        证明上一条「不接管」是粘滞规则在起作用，而非 db 信号失效。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            now = dsb.time_ms()
+            T = now - 10 * 1000
+            db_path = os.path.join(d, "t.sqlite")
+            self._mkdb(db_path, [("sess_b", T + 5 * 1000)])
+            state = {}
+            with mock.patch.object(dsb, "read_mark_raw",
+                                   return_value=("sess_a", T)), \
+                 mock.patch.object(dsb, "tail_session_resume",
+                                   return_value=(None, 0)), \
+                 mock.patch.object(dsb, "db_recent_session_activity",
+                                   return_value=(None, 0)):
+                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            self.assertEqual((sid, source), ("sess_a", "mark"))
+            with mock.patch.object(dsb, "read_mark_raw",
+                                   return_value=(None, 0)), \
+                 mock.patch.object(dsb, "tail_session_resume",
+                                   return_value=(None, 0)):
+                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            self.assertEqual((sid, source), ("sess_b", "db"))
+            self.assertEqual(state["sticky_sid"], "sess_b")
+            self.assertEqual(state["sticky_set_at"], T + 5 * 1000)
 
 
 if __name__ == "__main__":

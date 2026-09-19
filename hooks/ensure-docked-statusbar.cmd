@@ -4,9 +4,12 @@ rem token status bar (scripts/docked_statusbar.py) is running.
 rem
 rem Design notes:
 rem  - Uses pythonw.exe (no console window) and `start` (fire-and-forget), so the
-rem    status bar runs detached from the hook / ZCode lifetime. If it was already
-rem    started (a live statusbar.pid exists), this is a no-op to avoid duplicate
-rem    bars.
+rem    bar is not a child of this hook process (it would die with the hook if it
+rem    were). It is NOT independent of ZCode's lifetime though: since 0.9.3 the
+rem    bar polls the process table and quits itself once no ZCode.exe has existed
+rem    for 5s, clearing statusbar.pid on the way out - which is what lets this
+rem    hook start a fresh bar for the next ZCode session. If a bar is already
+rem    running (a live statusbar.pid exists), this is a no-op to avoid duplicates.
 rem  - stdout is stdlib "{}" always, so the hook always sees valid JSON; the
 rem    status bar's own show/hide logic handles the GUI. exit /b 0 keeps
 rem    SessionStart from ever blocking.

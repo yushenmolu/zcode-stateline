@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Stage 3: UIA warm 切换探测——resolve_sid_by_title 标题反查单元测试。
+"""Stage 3: UIA warm 切换探测——标题反查 + VARIANT 布局 + 真机 COM 冒烟测。
 
-probe_active_tab_title 本体依赖真实 ZCode 窗口 UIA 树（实测标签栏不可达，
-返回 None），不做自动化断言；本文件只测与 UIA 无关的标题反查逻辑。
+probe_active_tab_title 的完整链路依赖 ZCode 窗口的实时 UIA 树（树可达、但没有
+选中态可指认当前会话，恒返回 None），不在单测里断言；本文件测三块：
+  - resolve_sid_by_title：纯 sqlite 的标题反查语义；
+  - _VARIANT / _uia_get_current_property / _uia_get_name：出参内存布局与 BSTR
+    读写。GetCurrentPropertyValue 的出参按 16 字节写回，结构体声明小了会越界
+    写坏栈（不报错、随机崩在别处），故按真实 ctypes 回调跑一遍，而不是只读代码；
+  - TestRealComBinding：真的 CoCreateInstance + AddRef/Release/CreateProperty
+    Condition。这条链路此前只被 mock 测过，`_vtbl_func` 坏了很久没人发现（每次
+    抛 TypeError 都被 except 吞成 None，看起来像「UIA 树不可达」）。
 """
+import ctypes
 import os
 import sqlite3
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 import uia_tab_probe as probe
@@ -91,6 +100,121 @@ class TestResolveSidByTitle(unittest.TestCase):
                              "sess_c")
         finally:
             conn.close()
+
+
+class TestVariantLayout(unittest.TestCase):
+    """手工 COM 绑定的出参布局：VARIANT 必须整块 16 字节。"""
+
+    def _fake_fn(self, writer):
+        """造一个真实 ctypes 回调，签名同 GetCurrentPropertyValue。"""
+        proto = ctypes.CFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, ctypes.c_int,
+                                 ctypes.POINTER(probe._VARIANT))
+        return proto(writer)
+
+    def test_struct_is_16_bytes(self):
+        self.assertEqual(ctypes.sizeof(probe._VARIANT), 16)
+        self.assertEqual(ctypes.sizeof(probe._VARIANT_UNION), 8)
+
+    def test_wrong_vt_is_rejected(self):
+        """返回类型与 vt_expect 不符 -> None（宁可不取，不硬解垃圾载荷）。"""
+        def writer(_e, _p, out):
+            out.contents.vt = probe.VT_BOOL
+            out.contents.u.boolVal = 1
+            return probe.S_OK
+        with mock.patch.object(probe, "_vtbl_func",
+                               return_value=self._fake_fn(writer)):
+            self.assertIsNone(
+                probe._uia_get_current_property(ctypes.c_void_p(1),
+                                                probe.UIA_NamePropertyId,
+                                                probe.VT_BSTR))
+
+    def test_bool_payload_roundtrip(self):
+        def writer(_e, _p, out):
+            out.contents.vt = probe.VT_BOOL
+            out.contents.u.boolVal = -1
+            return probe.S_OK
+        with mock.patch.object(probe, "_vtbl_func",
+                               return_value=self._fake_fn(writer)):
+            got = probe._uia_get_current_property(
+                ctypes.c_void_p(1), probe.UIA_IsSelectedPropertyId,
+                probe.VT_BOOL)
+        self.assertIsNotNone(got)
+        self.assertTrue(got.u.boolVal)
+
+    def test_get_name_reads_and_frees_bstr(self):
+        """_uia_get_name 走真实的 VT_BSTR 判定 + SysFreeString 收尾。"""
+        oleaut = ctypes.windll.oleaut32
+        oleaut.SysAllocString.argtypes = [ctypes.c_wchar_p]
+        oleaut.SysAllocString.restype = ctypes.c_void_p
+        bstr = oleaut.SysAllocString(u"会话甲")
+        self.assertTrue(bstr)
+
+        def writer(_e, _p, out):
+            out.contents.vt = probe.VT_BSTR
+            out.contents.u.bstrVal = bstr
+            return probe.S_OK
+        with mock.patch.object(probe, "_vtbl_func",
+                               return_value=self._fake_fn(writer)):
+            self.assertEqual(probe._uia_get_name(ctypes.c_void_p(1)),
+                             u"会话甲")
+
+    def test_garbage_element_ptr_is_none_not_raise(self):
+        self.assertIsNone(probe._uia_get_current_property(
+            ctypes.c_void_p(0), probe.UIA_IsSelectedPropertyId, probe.VT_BOOL))
+        self.assertIsNone(probe._uia_get_name(None))
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows only")
+class TestRealComBinding(unittest.TestCase):
+    """真机 COM 冒烟测：_vtbl_func / _create_uia_automation / _com_release。
+
+    这是本模块历史上唯一没有测试覆盖的环节，也正是它悄悄坏掉——
+    `cast(...).contents[slot]` 每次抛 TypeError 都被 `except Exception` 吞成
+    None，于是所有探测恒返回 None，看起来却像"ZCode 没暴露 UIA 树"。
+    用 AddRef/Release 自证：它们不需要任何窗口，计数能读回就说明绑定真的通。
+    """
+
+    def setUp(self):
+        self.ole32 = ctypes.windll.ole32
+        # S_OK=新初始化 / S_FALSE=已初始化：两者都可继续用，都要在 tearDown 配对
+        self.hr = self.ole32.CoInitializeEx(None, probe.COINIT_APARTMENTTHREADED)
+        self.assertIn(self.hr & 0xFFFFFFFF, (0x00000000, 0x00000001))
+
+    def tearDown(self):
+        self.ole32.CoUninitialize()
+
+    def test_null_pointer_binds_to_none_not_av(self):
+        # 空指针必须返回 None：真解引用地址 0 是 AV（杀进程），不是异常
+        self.assertIsNone(probe._vtbl_func(
+            ctypes.c_void_p(), 6, ctypes.HRESULT, ctypes.c_void_p))
+        self.assertIsNone(probe._vtbl_func(
+            None, 6, ctypes.HRESULT, ctypes.c_void_p))
+
+    def test_addref_release_roundtrip(self):
+        uia = probe._create_uia_automation()
+        self.assertIsNotNone(uia, "CoCreateInstance(CUIAutomation) 取不到接口")
+        try:
+            addref = probe._vtbl_func(uia, 1, ctypes.c_ulong, ctypes.c_void_p)
+            self.assertIsNotNone(addref, "AddRef 槽位绑定失败 = _vtbl_func 又坏了")
+            self.assertGreater(addref(uia), 0)
+            probe._com_release(uia)      # 配平 AddRef
+        finally:
+            probe._com_release(uia)      # 配平 CoCreateInstance 的那一次
+
+    def test_control_type_condition_binds_and_returns_object(self):
+        """CreatePropertyCondition 槽 23：真机返回条件对象（非 None）。
+
+        50000 = ControlType_Button（不依赖模块常量，测试自己钉住这个 id）。
+        """
+        uia = probe._create_uia_automation()
+        self.assertIsNotNone(uia)
+        try:
+            cond = probe._uia_create_control_type_condition(uia, 50000)
+            self.assertIsNotNone(
+                cond, "条件构造失败 = 槽位或 VARIANT 布局又被改坏了")
+            probe._com_release(cond)
+        finally:
+            probe._com_release(uia)
 
 
 if __name__ == "__main__":

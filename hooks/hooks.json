@@ -10,7 +10,7 @@
           },
           {
             "type": "command",
-            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" idle \"${CLAUDE_SESSION_ID}\"",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" idle \"${CLAUDE_SESSION_ID}\" \"Stop\"",
             "async": false
           }
         ]
@@ -53,7 +53,29 @@
           },
           {
             "type": "command",
-            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" generating \"${CLAUDE_SESSION_ID}\"",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" generating \"${CLAUDE_SESSION_ID}\" \"UserPromptSubmit\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" tool \"${CLAUDE_SESSION_ID}\" \"PreToolUse\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" tool \"${CLAUDE_SESSION_ID}\" \"PermissionRequest\"",
             "async": false
           }
         ]
@@ -64,7 +86,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" tool \"${CLAUDE_SESSION_ID}\"",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" generating \"${CLAUDE_SESSION_ID}\" \"PostToolUse\"",
+            "async": false
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ZCODE_PLUGIN_ROOT}/hooks/status-event.cmd\" generating \"${CLAUDE_SESSION_ID}\" \"PostToolUseFailure\"",
             "async": false
           }
         ]

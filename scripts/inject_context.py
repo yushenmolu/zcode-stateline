@@ -55,7 +55,7 @@ DATA_DIR_DEFAULT = os.path.join(
 LOG_FILE_NAME = "token-stats.jsonl"
 MARK_FILE_NAME = "current-session.json"   # mark_session.py 写入的当前会话标记
 MARK_FRESH_MS = 30 * 1000                 # 标记新鲜窗口（30 秒）
-DB_ACTIVE_WINDOW_MS = 60 * 1000           # db「活跃主会话」判定窗口（60 秒）
+DB_ACTIVE_WINDOW_MS = 180 * 1000           # db「活跃主会话」判定窗口（180 秒）
 
 INSTRUCTION_TEXT = (
     u"\u672c\u4f1a\u8bdd\u542f\u7528 token \u7edf\u8ba1\u3002\u8bf7\u5728\u6bcf\u6b21\u56de\u590d\u7684\u672b\u5c3e\uff0c"

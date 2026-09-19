@@ -1,8 +1,9 @@
 @echo off
-rem ensure-proxy.cmd - SessionStart hook entry: make sure the local SSE reverse
-rem proxy (scripts/proxy_server.py, 127.0.0.1:18080 -> 127.0.0.1:8080) is
-rem listening, so the docked status bar can show live "generating" token
-rem counts via live_stream.json.
+rem ensure-proxy.cmd - manual entry for the local SSE reverse proxy
+rem (scripts/proxy_server.py, 127.0.0.1:18080 -> 127.0.0.1:8080).
+rem LEGACY since 0.6.0: the status bar no longer reads live_stream.json (its
+rem badge/tok-s come from hook timing + db), so this script is no longer wired
+rem into any hook -- run it only if you deliberately want the proxy up.
 rem
 rem Design notes:
 rem  - Idempotent + version-guarded (N5): asks the running proxy to prove its

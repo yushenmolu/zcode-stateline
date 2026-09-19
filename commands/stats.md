@@ -1,6 +1,6 @@
 ---
 description: 查看本会话/历史/按模型的 token 使用量、缓存命中率与速度（耗时/TTFT）统计
-argument-hint: [会话|历史|模型|缓存|速度]
+argument-hint: [会话|历史|模型]
 ---
 
 # zcode-token-stats：token 用量 / 缓存 / 速度统计
@@ -39,7 +39,7 @@ python "$ZCODE_PLUGIN_ROOT/scripts/db_stats.py" --mode <模式> [--session-id <i
 - **用量**：model_request_count（请求数）、input_tokens / output_tokens / reasoning_tokens、error_count / cancelled_count。
 - **缓存**：cacheReadTokens（cache_read_input_tokens）、cacheCreationTokens（cache_creation_input_tokens）、cache_hit_rate。
   **口径：cache_hit_rate = cache_read_input_tokens / input_tokens**（仅输入侧，排除 cache_creation；db 中 input_tokens 已包含 cache_read 部分，无需再加）。
-- **速度**：total_duration_ms、avg_duration_ms（平均总耗时）、avg_ttft_ms（TTFT = time_to_first_token_ms，首 token 耗时均值）。
+- **速度**：total_duration_ms、avg_duration_ms（平均每次耗时）、avg_ttft_ms（TTFT = time_to_first_token_ms，首 token 耗时均值）。
 - **统计口径说明**：请求数/错误数对全部状态行计数；token 与耗时聚合仅对 status='completed' 的行。
 
 ## 长期累计记录
