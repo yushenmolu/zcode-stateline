@@ -155,7 +155,7 @@ docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对
     Name 以数据库会话标题开头，就是侧栏那些会话行）、Text=358。此前「树不可达」
     的判断来自 2026-09-07 的一次外部 dump，已失效。但探测仍取不到当前会话，
     两道闸各断一次：① IsSelected 为真的 63 项全是消息正文段，10 个会话行
-    无一选中（含正开着的 '执行既定计划刚刚'）；② 会话行的 Name 是
+    无一选中（含正开着的那个会话）；② 会话行的 Name 是
     「标题+相对时间」拼的，`resolve_sid_by_title` 只有「精确相等」和
     「截断标题按前缀 LIKE」两档，方向相反，命中不了。所以
     probe_active_tab_title 依旧恒 None，enable_uia_tab_probe 保持默认关
@@ -1207,7 +1207,7 @@ def tail_session_resume(state, log_dir=None):
     日志行结构（2026-09-07 取样 ~/.zcode/cli/log/zcode-2026-09-07.jsonl 确认）：
       {"timestamp":"2026-09-07T00:35:50.153Z","level":"info","event":"session.resumed",
        "module":"core.runtime","message":"Session resumed","traceId":"...","spanId":"...",
-       "sessionId":"sess_6863b1b6-f165-4751-8811-b2da1420b2b5","status":"completed",
+       "sessionId":"sess_xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx","status":"completed",
        "context":{"appliedMessageCount":537,...}}
       即：事件名在 event 字段（非 type），时间为 ISO 8601 UTC 的 timestamp 字段，
       会话 id 在 sessionId 字段；子代理 resume 的 sessionId 以 sess_subagent_ 开头

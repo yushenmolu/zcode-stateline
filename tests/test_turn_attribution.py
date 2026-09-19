@@ -309,7 +309,7 @@ class TestSpeedWhileBusyFamily(unittest.TestCase):
 class TestTurnWindowFromDbClock(unittest.TestCase):
     """0.9.1：本轮窗口左沿改用「上一轮 turn 行的收尾时刻」，不再用钩子 ts。
 
-    实测（本机 sess_14beadb4，turn_7e48a610）：UserPromptSubmit 落盘的
+    实测（本机一个主会话轮次，id 不外抄）：UserPromptSubmit 落盘的
     turn_started_at 比该轮 turn_usage/model_usage 的 started_at 晚 **17.0s**，
     而 0.9.0 的归属容差 TURN_ATTRIB_SLACK_MS 只有 15s。滞后量随机器负载变化
     （钩子是宿主异步拉起的 python 进程），任何固定容差都会踩穿，表现为：
