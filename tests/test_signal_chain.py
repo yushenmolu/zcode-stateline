@@ -16,7 +16,6 @@ import os
 import sys
 import tempfile
 import unittest
-import unittest.mock as mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 import docked_statusbar as dsb
@@ -59,10 +58,13 @@ class TestMarkFreshnessGate(unittest.TestCase):
 
     def _sticky(self, d, state, resume=(None, 0)):
         db_path = os.path.join(d, "nope.sqlite")  # db 信号缺席（静默降级）
-        with mock.patch.object(dsb, "tail_session_resume",
-                               return_value=resume):
-            return dsb.resolve_session_sticky(state, [], d, db_path,
-                                              conn=None)
+        # 依赖注入（round2 step4 起）：resume 注入确定性信号；mark 走真实
+        # 文件读取（本组测试验的就是 mark 文件与注入 resume 的竞争规则）。
+        # 抽离后 patch.object(dsb, "tail_session_resume") 不再截获
+        # statusbar_session 的模块全局名——注入是更直接的契约。
+        return dsb.resolve_session_sticky(
+            state, [], d, db_path, conn=None,
+            read_resume=lambda _s: resume)
 
     def test_stale_mark_does_not_override_sticky(self):
         """陈旧 mark（14 分钟前）不得顶掉既有粘滞。

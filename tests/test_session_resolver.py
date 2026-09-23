@@ -173,10 +173,15 @@ class TestStickyResolver(unittest.TestCase):
     T2 = dsb.time_ms() - 10_000
 
     def _run(self, state, rows, mark=(None, 0), resume=(None, 0), db=(None, 0)):
-        with mock.patch.object(dsb, "read_mark_raw", return_value=mark), \
-             mock.patch.object(dsb, "tail_session_resume", return_value=resume), \
-             mock.patch.object(dsb, "db_recent_session_activity", return_value=db):
-            return dsb.resolve_session_sticky(state, rows, "dummy_dir", "dummy_db")
+        # 依赖注入（round2 step4 起 resolve_session_sticky 支持可选注入
+        # 参数）：不经 mock 直接注入确定性信号。抽离后函数在
+        # statusbar_session 解析其模块全局名，patch.object(dsb, ...) 不再
+        # 截获——注入是更直接的契约（不依赖打补丁命名空间）。
+        return dsb.resolve_session_sticky(
+            state, rows, "dummy_dir", "dummy_db",
+            read_mark=lambda _d: mark,
+            read_resume=lambda _s: resume,
+            db_activity=lambda _p, _w, conn=None: db)
 
     def test_sticky_keeps_session_after_mark_expires(self):
         """R1：mark 超龄后不入池（0.7.1 新鲜度门槛），sticky 保持，不漂移。"""
@@ -333,14 +338,15 @@ class TestStickyNewSignals(unittest.TestCase):
 
     def _run(self, d, state, mark=(None, 0), resume=(None, 0),
              db=(None, 0)):
-        # db_path 指向不存在的文件：真实 db 查询不参与（避免测试污染/不确定性）
+        # db_path 指向不存在的文件：真实 db 查询不参与（避免测试污染/不确定性）。
+        # 依赖注入（round2 step4 起）：不经 mock 直接注入确定性信号——抽离后
+        # patch.object(dsb, ...) 不再截获 statusbar_session 的模块全局名。
         db_path = os.path.join(d, "nope.sqlite")
-        with mock.patch.object(dsb, "read_mark_raw", return_value=mark), \
-             mock.patch.object(dsb, "tail_session_resume", return_value=resume), \
-             mock.patch.object(dsb, "db_recent_session_activity",
-                               return_value=db):
-            return dsb.resolve_session_sticky(state, [], d, db_path,
-                                              conn=None)
+        return dsb.resolve_session_sticky(
+            state, [], d, db_path, conn=None,
+            read_mark=lambda _d: mark,
+            read_resume=lambda _s: resume,
+            db_activity=lambda _p, _w, conn=None: db)
 
     def test_status_signal_wins_over_older_mark(self):
         """status-state.json（新鲜 ts，会话 X）+ 更旧 mark -> (X, "status")。"""
@@ -409,9 +415,11 @@ class TestStickyStaticContract(unittest.TestCase):
 
     def test_resolve_session_sticky_body_has_no_time_updated(self):
         """resolve_session_sticky 函数体（含文档串）内不得出现 time_updated。"""
+        # round2 step4 起函数定义已移至 statusbar_session.py（docked_statusbar
+        # 经 import * re-export 旧名）；静态契约跟随定义点走。
         src_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "scripts", "docked_statusbar.py")
+            "scripts", "statusbar_session.py")
         with open(src_path, encoding="utf-8") as f:
             src = f.read()
         tree = ast.parse(src)
@@ -454,22 +462,21 @@ class TestStaleDbCandidateNoOverride(unittest.TestCase):
             # 但 started_at（T-5s）早于 sticky_set_at（T）
             self._mkdb(db_path, [("sess_b", T - 5 * 1000)])
             state = {}
+            # 依赖注入（round2 step4 起）：mark/resume 注入确定性信号；
+            # db_activity 不传 -> 走真实 statusbar_db 查询（本测试的另一半
+            # 要验证的就是真实 db 行与粘滞规则交互）。
             # 第一拍：mark（ts=T）建立 sticky=sess_a、sticky_set_at=T
-            with mock.patch.object(dsb, "read_mark_raw",
-                                   return_value=("sess_a", T)), \
-                 mock.patch.object(dsb, "tail_session_resume",
-                                   return_value=(None, 0)), \
-                 mock.patch.object(dsb, "db_recent_session_activity",
-                                   return_value=(None, 0)):
-                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            sid, source = dsb.resolve_session_sticky(
+                state, [], d, db_path,
+                read_mark=lambda _d: ("sess_a", T),
+                read_resume=lambda _s: (None, 0))
             self.assertEqual((sid, source), ("sess_a", "mark"))
             # 第二拍：mark 消失，真实 db 查询带回 sess_b（started_at < T）
             # -> 陈旧候选不得覆盖 sticky
-            with mock.patch.object(dsb, "read_mark_raw",
-                                   return_value=(None, 0)), \
-                 mock.patch.object(dsb, "tail_session_resume",
-                                   return_value=(None, 0)):
-                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            sid, source = dsb.resolve_session_sticky(
+                state, [], d, db_path,
+                read_mark=lambda _d: (None, 0),
+                read_resume=lambda _s: (None, 0))
             self.assertEqual((sid, source), ("sess_a", "sticky"))
             self.assertEqual(state["sticky_sid"], "sess_a")
             self.assertEqual(state["sticky_set_at"], T)
@@ -485,19 +492,23 @@ class TestStaleDbCandidateNoOverride(unittest.TestCase):
             db_path = os.path.join(d, "t.sqlite")
             self._mkdb(db_path, [("sess_b", T + 5 * 1000)])
             state = {}
-            with mock.patch.object(dsb, "read_mark_raw",
-                                   return_value=("sess_a", T)), \
-                 mock.patch.object(dsb, "tail_session_resume",
-                                   return_value=(None, 0)), \
-                 mock.patch.object(dsb, "db_recent_session_activity",
-                                   return_value=(None, 0)):
-                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            # 第一拍：mark（ts=T）建立 sticky=sess_a、sticky_set_at=T。
+            # db_activity 也注入 (None, 0)：本拍只验「mark 建立 sticky」，
+            # 真实 db 行（ts 与 mark 接近）若入池会按信号竞争规则取胜，
+            # 与第一拍要验的契约无关——原 mock 版本同样屏蔽了 db。
+            sid, source = dsb.resolve_session_sticky(
+                state, [], d, db_path,
+                read_mark=lambda _d: ("sess_a", T),
+                read_resume=lambda _s: (None, 0),
+                db_activity=lambda _p, _w, conn=None: (None, 0))
             self.assertEqual((sid, source), ("sess_a", "mark"))
-            with mock.patch.object(dsb, "read_mark_raw",
-                                   return_value=(None, 0)), \
-                 mock.patch.object(dsb, "tail_session_resume",
-                                   return_value=(None, 0)):
-                sid, source = dsb.resolve_session_sticky(state, [], d, db_path)
+            # 第二拍：mark 消失，db_activity 不注入 -> 走真实 db 查询带回
+            # sess_b（started_at > T）-> 新鲜候选正常接管（本测试的另一半
+            # 要验的就是真实 db 行与粘滞规则交互）。
+            sid, source = dsb.resolve_session_sticky(
+                state, [], d, db_path,
+                read_mark=lambda _d: (None, 0),
+                read_resume=lambda _s: (None, 0))
             self.assertEqual((sid, source), ("sess_b", "db"))
             self.assertEqual(state["sticky_sid"], "sess_b")
             self.assertEqual(state["sticky_set_at"], T + 5 * 1000)

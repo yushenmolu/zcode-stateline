@@ -387,6 +387,17 @@ from statusbar_db import __all__ as _db_all
 # statusbar_status，经下方 import * re-export，旧名 dsb.* 全部保留。
 from statusbar_status import *
 from statusbar_status import __all__ as _status_all
+# 会话判定层（read_mark_raw / _log_line_ts_ms / tail_session_resume /
+# current_session / resolve_session_sticky 及 MARK_FRESH_MS 等判定常量）已移至
+# statusbar_session，经下方 import * re-export，旧名 dsb.* 全部保留。
+from statusbar_session import *
+from statusbar_session import __all__ as _session_all
+# 配置层（DEFAULT_CONFIG / load_config / _apply_raw_config / hot_reload_config /
+# save_config_keys / save_config_show_keys / SHOW_MENU_ITEMS / _log_err /
+# DATA_DIR_DEFAULT / CONFIG_FILE_NAME）已移至 statusbar_config，
+# 经下方 import * re-export，旧名 dsb.* 全部保留。
+from statusbar_config import *
+from statusbar_config import __all__ as _config_all
 
 try:
     # 0.8.0 目录监听（事件驱动刷新）；import 失败静默降级为 None，
@@ -401,22 +412,16 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 STATUSBAR_VERSION = "0.10.0"  # 自证版本：肉眼可确认状态条运行的是本版代码
-DATA_DIR_DEFAULT = os.path.join(
-    os.path.expanduser(r"~/.zcode/cli/plugins/data"),
-    "local", "zcode-token-stats",
-)
+# DATA_DIR_DEFAULT / LOG_DIR_DEFAULT / MARK_FILE_NAME / CONFIG_FILE_NAME
+# 已移至 statusbar_config / statusbar_session（经上方 import * re-export）。
 DB_DEFAULT = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "db", "db.sqlite")
-LOG_DIR_DEFAULT = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "log")
 JSONL_NAME = "token-stats.jsonl"
 PID_NAME = "statusbar.pid"
-MARK_FILE_NAME = "current-session.json"
-CONFIG_FILE_NAME = "statusbar-config.json"
 # STATUS_STATE_NAME / STATUS_IDLE_AFTER_MS* / GENERATING_MAX_LIFETIME_MS /
 # BUSY_FAMILY / STATUS_DWELL_MS / TURN_END_TIE_MS / OUTCOME_HOLD_MS /
 # SPEED_HOLD_MS 已移至 statusbar_status（经上方 import * re-export）。
-MARK_FRESH_MS = 30 * 1000  # current-session.json 标记的 freshness 窗口（30 秒）
-STATUS_SIGNAL_FRESH_MS = 60 * 1000       # status-state.json 事件作为会话信号的 freshness 窗口
-RESUME_FRESH_MS = 600 * 1000             # resume 信号 freshness 窗口：超此值的陈旧 resume 不入候选池
+# MARK_FRESH_MS / STATUS_SIGNAL_FRESH_MS / RESUME_FRESH_MS 已移至
+# statusbar_session（经上方 import * re-export）。
 DB_READ_INTERVAL = 1        # 每拍重读 db（查询实测亚毫秒，换取刷新及时性）
 STATS_PENDING = u"\uff08\u672c\u8f6e\u7ed3\u675f\u540e\u66f4\u65b0\uff09"  # （本轮结束后更新）
 TURN_PENDING = u"\uff08\u672c\u8f6e\u7edf\u8ba1\u5f85\u66f4\u65b0\uff09"  # （本轮统计待更新）——0.4.0 第二行无已完成轮次时占位
@@ -506,28 +511,7 @@ HANDLE_TIP = (u"\u5df2\u6536\u8d77\u2014\u2014"
               u"\u60ac\u505c\u6216\u5355\u51fb\u5c55\u5f00\u5b8c\u6574\u7edf\u8ba1")
               # 已收起——悬停或单击展开完整统计
 
-# 默认显示项配置（写 statusbar-config.json 用）
-DEFAULT_CONFIG = {
-    "show_model": True,
-    "show_session": True,
-    "show_avg_duration": True,
-    "show_input": True,
-    "show_output": True,
-    "show_cache_read": True,
-    "show_cache_hit": True,
-    "show_speed": True,
-    "show_reasoning": False,
-    "show_live": True,
-    # ---- 0.4.0 对话级三区（状态徽标 / 本轮统计 / 会话累计）----
-    "show_status": True,
-    "show_recent_turn": True,
-    "show_cumulative": True,
-    "collapsed": False,
-    "handle_x": None,
-    "handle_y": None,
-    "refresh_ms": 1000,
-    "theme": "dark",
-}
+# 默认显示项配置（DEFAULT_CONFIG）已移至 statusbar_config（经上方 import * re-export）。
 
 HWND_TOPMOST = ctypes.c_void_p(-1)
 GWL_EXSTYLE = -20
@@ -574,18 +558,10 @@ class _PROCESSENTRY32W(ctypes.Structure):
 
 # ---------------------------------------------------------------------------
 # 配置读取（容错：坏 JSON / 缺字段 -> 默认值 + err 日志，不崩）
+# _log_err / load_config / _apply_raw_config / hot_reload_config /
+# SHOW_MENU_ITEMS / save_config_keys / save_config_show_keys 已移至
+# statusbar_config（经上方 import * re-export，旧名 dsb.* 全部保留）。
 # ---------------------------------------------------------------------------
-
-def _log_err(data_dir, msg):
-    """写一条调试/错误日志到数据目录 docked-statusbar-err.log；失败忽略。"""
-    try:
-        os.makedirs(data_dir, exist_ok=True)
-        path = os.path.join(data_dir, "docked-statusbar-err.log")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
-    except Exception:
-        pass
-
 
 def _throttled_collapsed_err(state, data_dir, name):
     """收起把手判定失败诊断日志（0.2.2）：同因连续失败只记一行，不刷屏；
@@ -596,185 +572,6 @@ def _throttled_collapsed_err(state, data_dir, name):
     _log_err(data_dir,
              "collapsed-handle: %s failed, fallback=default-dock" % name)
     return True
-
-
-def load_config(config_path):
-    """
-    读取状态条显示配置。返回 (config_dict, source_path)。
-    容错规则：
-      - 文件不存在 -> 自动生成默认配置文件（DEFAULT_CONFIG）并返回默认值；
-      - 坏 JSON / 值类型不对 / 未知键 -> 回退默认值并写一条日志（不崩）；
-      - refresh_ms 截断极性、clamp 到 [250, 60000]。
-    """
-    cfg = dict(DEFAULT_CONFIG)
-    if not config_path or not os.path.exists(config_path):
-        # 缺省：自动生成默认配置文件，供用户在数据目录手改
-        if config_path:
-            try:
-                os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
-                if not os.path.exists(config_path):
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(cfg, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-        return cfg, config_path
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception as e:
-        _log_err(os.path.dirname(config_path) or DATA_DIR_DEFAULT,
-                 "statusbar-config.json parse error, using defaults: %r" % (e,))
-        return cfg, config_path
-    if not isinstance(raw, dict):
-        _log_err(os.path.dirname(config_path) or DATA_DIR_DEFAULT,
-                 "statusbar-config.json not an object, using defaults")
-        return cfg, config_path
-
-    _apply_raw_config(cfg, raw)
-    # 0.5.0 配置显式化：补齐缺失键（show_live / show_status /
-    # show_recent_turn / show_cumulative / show_speed 等）写回文件，
-    # 只补默认值，不覆盖用户已有值。
-    missing_keys = [k for k in DEFAULT_CONFIG if k not in raw]
-    if missing_keys:
-        for _k in missing_keys:
-            raw[_k] = DEFAULT_CONFIG[_k]
-        try:
-            os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
-            _tmp = config_path + ".tmp"
-            with open(_tmp, "w", encoding="utf-8") as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            os.replace(_tmp, config_path)
-        except Exception:
-            pass
-    return cfg, config_path
-
-
-def _apply_raw_config(cfg, raw, skip_collapsed=False):
-    """把已解析的 raw dict 按 schema 原地合并进 cfg（load_config 与热加载共用）。
-
-    skip_collapsed=True 时跳过 collapsed 键（默认合并——load_config 启动恢复用）：
-    热加载只同步其它键，collapsed 的写权只留给 collapse_bar/expand_bar（用户主动
-    双击/点击展开时原子写回），避免热加载重读 mtime 边缘把 cfg["collapsed"] 翻
-    回 false，导致下次写回盘上 collapsed 被误清（热加载竞态自恢复源之一）。
-    """
-    for key in ("show_model", "show_session", "show_avg_duration", "show_input",
-                "show_output", "show_cache_read", "show_cache_hit", "show_speed",
-                "show_reasoning", "show_live",
-                "show_status", "show_recent_turn", "show_cumulative",
-                "collapsed"):
-        if skip_collapsed and key == "collapsed":
-            continue
-        if key in raw:
-            v = raw[key]
-            if isinstance(v, bool):
-                cfg[key] = v
-            elif isinstance(v, int) and v in (0, 1):
-                cfg[key] = bool(v)
-    if "refresh_ms" in raw:
-        try:
-            rms = int(raw["refresh_ms"])
-            if rms > 0:
-                cfg["refresh_ms"] = min(max(rms, 250), 60000)
-        except Exception:
-            pass
-    for _hk in ("handle_x", "handle_y"):
-        if _hk in raw:
-            _hv = raw[_hk]
-            if isinstance(_hv, bool):
-                continue  # True/False 不是有效坐标
-            try:
-                _iv = int(_hv)
-            except Exception:
-                _iv = None
-            if _iv is not None:
-                cfg[_hk] = _iv
-            else:
-                cfg[_hk] = None
-    if "theme" in raw and isinstance(raw.get("theme"), str) and raw["theme"]:
-        cfg["theme"] = raw["theme"]
-
-
-def hot_reload_config(cfg, config_path, data_dir, prev_mtime):
-    """配置热加载：mtime 变化则重读并合并进 cfg（原地改，调用方持有的引用不换）。
-
-    返回最新 mtime（供调用方下次比对）：
-      - 文件不存在 / mtime 未变 -> 原样返回 prev_mtime；
-      - 坏 JSON / 非 object -> 写一行 err 日志、**保留当前配置**，
-        但返回新 mtime（避免每帧重读坏文件刷日志；用户再保存才重试）；
-      - 正常 -> 合并生效（refresh_ms 变化由调用方从 cfg 读取应用）。
-    """
-    if not config_path:
-        return prev_mtime
-    try:
-        mtime = os.path.getmtime(config_path)
-    except Exception:
-        return prev_mtime
-    if mtime == prev_mtime:
-        return prev_mtime
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            raise ValueError("config root is not an object")
-    except Exception as e:
-        _log_err(data_dir, "config hot-reload failed, keep current config: %r" % (e,))
-        return mtime
-    _apply_raw_config(cfg, raw, skip_collapsed=True)
-    return mtime
-
-
-# 右键「显示项」子菜单的开关项：(中文标签, 配置键)，顺序即菜单顺序。
-# 0.4.0 改版为对话级三区：状态徽标 / 本轮统计 / 会话累计（旧指标块时代的
-# show_* 键仍保留在配置中兼容旧配置文件，但不再对应可见区域）。
-SHOW_MENU_ITEMS = (
-    (u"\u72b6\u6001\u5fbd\u6807", "show_status"),         # 状态徽标
-    (u"\u672c\u8f6e\u7edf\u8ba1", "show_recent_turn"),    # 本轮统计
-    (u"\u4f1a\u8bdd\u7d2f\u8ba1", "show_cumulative"),    # 会话累计
-)
-
-
-def save_config_keys(config_path, cfg, data_dir, keys):
-    """把 cfg 中指定 keys 原子写回 statusbar-config.json（右键菜单 / 收起展开用）。
-
-    - 文件里其它字段（含未知键、refresh_ms、theme、collapsed）原样保留；
-    - 原子写：先写 .tmp 再 os.replace；
-    - 任何失败只记 err 日志、返回 False，绝不抛出（菜单点击不能崩小条）。
-    """
-    try:
-        raw = {}
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    obj = json.load(f)
-                if isinstance(obj, dict):
-                    raw = obj
-            except Exception:
-                raw = {}
-        for key in keys:
-            v = cfg.get(key)
-            if isinstance(v, bool):
-                raw[key] = v
-            else:
-                raw[key] = v
-        os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
-        tmp = config_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, config_path)
-        return True
-    except Exception as e:
-        try:
-            _log_err(data_dir, "save statusbar-config.json failed: %r" % (e,))
-        except Exception:
-            pass
-        return False
-
-
-def save_config_show_keys(config_path, cfg, data_dir):
-    """兼容包装：写回全部显示项开关（show_*）。"""
-    return save_config_keys(config_path, cfg, data_dir,
-                            [k for _label, k in SHOW_MENU_ITEMS])
 
 
 # ---------------------------------------------------------------------------
@@ -830,16 +627,7 @@ def read_jsonl_cached(path):
     return rows, err
 
 
-def current_session(rows):
-    """取 ts 最大记录的**主会话** id（subagent 会话一律跳过；sessionId 为空退 slug）。"""
-    candidates = [r for r in rows if not _is_subagent_sid(r.get("sessionId"))]
-    if not candidates:
-        return None
-    latest = max(candidates, key=lambda r: _num(r.get("ts")))
-    sid = latest.get("sessionId")
-    if not sid:
-        sid = latest.get("slug")
-    return sid or None
+# current_session（jsonl 兜底判定）已移至 statusbar_session（经上方 import * re-export）。
 
 
 def aggregate_session(rows, session_id):
@@ -932,278 +720,8 @@ def _truncate(s, n):
     return s_out[:n]
 
 
-def read_mark_raw(data_dir):
-    """读取 current-session.json；返回 (session_id, updated_at_ms)。
-    文件不存在/坏 JSON/缺字段返回 (None, 0)。不做新鲜度判断。"""
-    path = os.path.join(data_dir, MARK_FILE_NAME)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-    except Exception:
-        return None, 0
-    sid = None
-    try:
-        sid = obj.get("session_id")
-    except Exception:
-        sid = None
-    if not sid or not isinstance(sid, str):
-        return None, 0
-    try:
-        updated = int(obj.get("updated_at") or 0)
-    except Exception:
-        updated = 0
-    return sid, updated
-
-
-
-
-def _log_line_ts_ms(obj):
-    """行内时间字段（ts/time/timestamp；ISO 8601 字符串或 epoch 毫秒）-> epoch ms。
-    全部解析失败返回 0（调用方兜底 time_ms()）。"""
-    for key in ("ts", "time", "timestamp"):
-        try:
-            v = obj.get(key)
-        except Exception:
-            return 0
-        if v is None:
-            continue
-        try:
-            if isinstance(v, (int, float)):
-                return int(v)
-            s = str(v).strip()
-            if not s:
-                continue
-            if s.isdigit():
-                return int(s)
-            # fromisoformat 在 3.11 前不认 "Z" 后缀，统一替换为 +00:00
-            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return int(dt.timestamp() * 1000)
-        except Exception:
-            continue
-    return 0
-
-
-def tail_session_resume(state, log_dir=None):
-    """增量 tail 今日 zcode-YYYY-MM-DD.jsonl，返回最新 session.resumed 的 (session_id, ts_ms)。
-
-    state 键：log_date（str）、log_offset（int）、log_last_sid、log_last_ts。
-    规则：
-      - 文件名按本地日期 datetime.date.today() 生成；跨天时 offset 归零、重新打开；
-      - 从 state["log_offset"] seek（字节偏移），只读新增字节；末行不完整（无 \\n
-        结尾）时 offset 回退到最后一个完整行尾，下次再读；
-      - 逐行 json.loads，筛 event/type 字段为 "session.resumed" 的行，取 sessionId；
-        行内时间字段（ts/time/timestamp，ISO 或 epoch 毫秒）解析失败则用 time_ms()；
-      - 文件不存在/权限错/解析全败：返回 (None, 0)，不抛；
-      - 无新增字节时返回 state 记住的上次结果（log_last_sid, log_last_ts）。
-
-    日志行结构（2026-09-07 取样 ~/.zcode/cli/log/zcode-2026-09-07.jsonl 确认）：
-      {"timestamp":"2026-09-07T00:35:50.153Z","level":"info","event":"session.resumed",
-       "module":"core.runtime","message":"Session resumed","traceId":"...","spanId":"...",
-       "sessionId":"sess_xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx","status":"completed",
-       "context":{"appliedMessageCount":537,...}}
-      即：事件名在 event 字段（非 type），时间为 ISO 8601 UTC 的 timestamp 字段，
-      会话 id 在 sessionId 字段；子代理 resume 的 sessionId 以 sess_subagent_ 开头
-      （tailer 单槽只记主会话：subagent resume 跳过不覆盖，判定层过滤后
-      主会话切换信号不再被 subagent 堵死）。
-    """
-    if state is None:
-        state = {}
-    if log_dir is None:
-        log_dir = LOG_DIR_DEFAULT
-    try:
-        today = datetime.date.today().isoformat()
-    except Exception:
-        return None, 0
-    # 跨天：offset 归零，重新打开新日期文件
-    if state.get("log_date") != today:
-        state["log_date"] = today
-        state["log_offset"] = 0
-    path = os.path.join(log_dir, "zcode-%s.jsonl" % today)
-    offset = state.get("log_offset") or 0
-    if not isinstance(offset, int) or offset < 0:
-        offset = 0
-    try:
-        size = os.path.getsize(path)
-    except Exception:
-        return None, 0
-    if offset > size:
-        offset = 0  # 文件被截断/轮换：从头读
-    try:
-        with open(path, "rb") as f:
-            f.seek(offset)
-            raw = f.read()
-    except Exception:
-        return None, 0
-    new_end = offset + len(raw)
-    if raw and not raw.endswith(b"\n"):
-        # 末行不完整：offset 回退到最后一个完整行尾，残余下次再读
-        last_nl = raw.rfind(b"\n")
-        if last_nl < 0:
-            raw_complete = b""
-            new_end = offset
-        else:
-            raw_complete = raw[:last_nl + 1]
-            new_end = offset + last_nl + 1
-    else:
-        raw_complete = raw
-    state["log_offset"] = new_end
-    last_sid = state.get("log_last_sid")
-    try:
-        last_ts = int(state.get("log_last_ts") or 0)
-    except Exception:
-        last_ts = 0
-    if raw_complete:
-        try:
-            text = raw_complete.decode("utf-8", errors="replace")
-        except Exception:
-            text = ""
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            try:
-                ev = obj.get("event")
-                if ev is None:
-                    ev = obj.get("type")
-            except Exception:
-                continue
-            if ev != "session.resumed":
-                continue
-            sid = obj.get("sessionId")
-            if not sid or not isinstance(sid, str):
-                continue
-            ts = _log_line_ts_ms(obj)
-            if not ts:
-                ts = time_ms()
-            # 单槽只记主会话：subagent resume 跳过不覆盖单槽（log_offset 已
-            # 随读文件推进，跳过不等于停止读），主会话切换信号不被堵死
-            if _is_subagent_sid(sid):
-                continue
-            last_sid = sid
-            last_ts = ts
-    state["log_last_sid"] = last_sid
-    state["log_last_ts"] = last_ts
-    if not last_sid:
-        return None, 0
-    return last_sid, last_ts
-
-
-
-
-def resolve_session_sticky(state, rows, data_dir, db_path, conn=None,
-                           cfg=None):
-    """信号驱动 + 粘滞的当前会话判定。返回 (session_id, source)。
-
-    候选信号（各带真实发生时间戳，禁止用读取时刻伪造）：
-      mark   : read_mark_raw(data_dir)      -> (sid, updated_at)；
-               仅当 updated_at 在 MARK_FRESH_MS 内入池（陈旧标记不参与竞争）
-      status : status_state_latest(_read_status_state(data_dir)) -> (sid, ts)；
-               钩子时序文件 status-state.json 中最新一条记录的 session_id + ts
-               （真实事件时刻），
-               仅当 ts 在 STATUS_SIGNAL_FRESH_MS 内入池。该文件在
-               UserPromptSubmit / PreToolUse / PostToolUse / PostToolUseFailure
-               都会刷新 —— 等于「每次消息与每次工具调用」都刷新会话信号
-      resume : tail_session_resume(state)   -> (sid, ts)；
-               仅当 ts 在 RESUME_FRESH_MS 内入池（重启后 log_offset 归零会重读
-               当天整个日志，陈旧 resume 不得在冷启动时抢占 sticky）
-      db     : db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS, conn)
-               -> (sid, started_at)（窗口外/无行返回 (None, 0)；
-                 conn 传入时复用不关闭，否则自开自关）
-      tool   : db_recent_tool_activity(db_path, conn=conn) -> (sid, started_at)
-               （窗口 TOOL_LIVE_MAX_MS）：起点在窗口内且**仍 running** 的最近
-               一把工具（0.9.2 新增）。mark/status/db 三路同时过窗时（长工具
-               运行）它是唯一仍在生效的活跃证据；无符合行 -> (None, 0)。
-    state 键：sticky_sid、sticky_set_at（本函数维护）；
-              tail_session_resume 另维护 log_* 键。
-
-    切换规则：
-      1. 过滤 subagent sid 后，取时间戳最新的信号（平局按
-         mark>status>resume>db>tool 优先——max() 并列取先出现者）；
-      2. sticky 为空（首次）：取该信号 sid；无任何信号 -> current_session(rows)
-         的 jsonl 兜底（保持旧行为，source="jsonl"）；都没有 -> (None, "none")；
-      3. 最新信号 sid != sticky 且信号 ts > sticky_set_at -> 切换 sticky，
-         source 为信号类型；
-      4. 否则保持 sticky，source="sticky"（含无任何信号的空闲轮询）。
-    """
-    if state is None:
-        state = {}
-    candidates = []
-    try:
-        sid, ts = read_mark_raw(data_dir)
-        # mark 是瞬时确认信号：超过 MARK_FRESH_MS 的陈旧标记不入池（过期
-        # 由粘滞保持，沿用标记 30 秒新鲜度的既有语义）——否则陈旧
-        # mark 可顶位、与 db 信号进出 60 秒窗口竞争造成切换摆动
-        if (sid and ts and not _is_subagent_sid(sid)
-                and (time_ms() - ts) <= MARK_FRESH_MS):
-            candidates.append((ts, "mark", sid))
-    except Exception:
-        pass
-    try:
-        # status-state.json 候选（钩子时序文件，UserPromptSubmit / PreToolUse /
-        # PostToolUse / PostToolUseFailure 都会刷新 -> 每次消息与每次工具调用
-        # 都刷新会话信号）。用文件里的 ts（真实事件时刻）入池，不得用读取时刻。
-        # 0.9.0 分片后取「最新一条」而非顶层字段；身份竞争要的就是「最近哪个
-        # 会话有动静」，所以跨会话取最新，不必按 current sid 过滤。
-        st_sid, st_ts = status_state_latest(_read_status_state(data_dir))
-        if (st_sid and st_ts and not _is_subagent_sid(st_sid)
-                and (time_ms() - float(st_ts)) <= STATUS_SIGNAL_FRESH_MS):
-            candidates.append((float(st_ts), "status", st_sid))
-    except Exception:
-        pass
-    try:
-        sid, ts = tail_session_resume(state)
-        # resume 补新鲜度门槛：现状无 TTL，状态条重启后 log_offset 归零会重读
-        # 当天整个日志，若最后一条 session.resumed 是数小时前的旧会话，会在
-        # 冷启动时抢占 sticky（sticky_set_at=0 时任何信号都能置位）。
-        if (sid and ts and not _is_subagent_sid(sid)
-                and (time_ms() - float(ts)) <= RESUME_FRESH_MS):
-            candidates.append((ts, "resume", sid))
-    except Exception:
-        pass
-    try:
-        sid, ts = db_recent_session_activity(db_path, DB_ACTIVE_WINDOW_MS,
-                                             conn=conn)
-        if sid and ts and not _is_subagent_sid(sid):
-            candidates.append((ts, "db", sid))
-    except Exception:
-        pass
-    try:
-        # tool（0.9.2）：起点在窗口内且仍 status='running' 的 tool_usage 行 ->
-        # (sid, started_at)。上面三路信号在一把长工具面前会**同时**过窗（实测
-        # 154s 的 TaskOutput 期间：mark 超 30s、钩子事件超 60s、model_usage 超
-        # 180s 无新行），此时它是唯一还在说「这个会话在干活」的证据。行的
-        # started_at 是真实时刻，不用读取时刻伪造。
-        sid, ts = db_recent_tool_activity(db_path, conn=conn)
-        if sid and ts and not _is_subagent_sid(sid):
-            candidates.append((ts, "tool", sid))
-    except Exception:
-        pass
-    newest = max(candidates, key=lambda c: c[0]) if candidates else None
-    sticky = state.get("sticky_sid")
-    try:
-        sticky_set_at = int(state.get("sticky_set_at") or 0)
-    except Exception:
-        sticky_set_at = 0
-    if not sticky:
-        if newest is not None:
-            state["sticky_sid"] = newest[2]
-            state["sticky_set_at"] = newest[0]
-            return newest[2], newest[1]
-        sid = current_session(rows)
-        if sid:
-            state["sticky_sid"] = sid
-            state["sticky_set_at"] = 0  # jsonl 兜底无真实信号时刻，任何信号可校正
-            return sid, "jsonl"
-        return None, "none"
-    if newest is not None and newest[2] != sticky and newest[0] > sticky_set_at:
-        state["sticky_sid"] = newest[2]
-        state["sticky_set_at"] = newest[0]
-        return newest[2], newest[1]
-    return sticky, "sticky"
+# read_mark_raw / _log_line_ts_ms / tail_session_resume / resolve_session_sticky
+# 已移至 statusbar_session（经上方 import * re-export，旧名 dsb.* 全部保留）。
 
 
 
@@ -1490,8 +1008,14 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
     try:
         if sess_state is None:
             sess_state = {}  # 向后兼容：临时态退化为无粘滞（每拍走首次分支）
-        sid, source = resolve_session_sticky(sess_state, rows, data_dir,
-                                             db_path, conn=db_conn, cfg=cfg)
+        sid, source = resolve_session_sticky(
+            sess_state, rows, data_dir, db_path, conn=db_conn, cfg=cfg,
+            # 显式透传 dsb 命名空间的同名函数：保留「往 dsb 打补丁即生效」
+            # 的旧 mock 语义（抽离前车与函数同模块；抽离后函数在
+            # statusbar_session 解析其全局名，patch.object(dsb, ...) 会
+            # 落空——注入把取数通道指回 dsb，行为与抽离前一致）。
+            read_mark=read_mark_raw, read_resume=tail_session_resume,
+            db_activity=db_recent_session_activity)
         info["session_id"] = sid
         info["source"] = source
         if sid is None:

@@ -60,6 +60,28 @@ NAMES_STATUS = [
     "resolve_turn_status",
 ]
 
+# Round2 Step 4：statusbar_session（会话判定层）
+NAMES_SESSION = [
+    # 判定常量
+    "MARK_FILE_NAME", "LOG_DIR_DEFAULT",
+    "MARK_FRESH_MS", "STATUS_SIGNAL_FRESH_MS", "RESUME_FRESH_MS",
+    # mark / 日志解析 / resume tail（下划线私有名也必须 re-export）
+    "read_mark_raw", "_log_line_ts_ms", "tail_session_resume",
+    # jsonl 兜底判定与信号竞争 + 粘滞
+    "current_session", "resolve_session_sticky",
+]
+
+# Round2 Step 4：statusbar_config（配置层）
+NAMES_CONFIG = [
+    # 常量
+    "DEFAULT_CONFIG", "CONFIG_FILE_NAME", "DATA_DIR_DEFAULT", "SHOW_MENU_ITEMS",
+    # 错误日志（配置层与主文件共用，下划线私有名也必须 re-export）
+    "_log_err",
+    # 配置读写
+    "load_config", "_apply_raw_config", "hot_reload_config",
+    "save_config_keys", "save_config_show_keys",
+]
+
 
 def _assert_all_present(testcase, names, module_label):
     """逐个断言 dsb.<name> 存在；缺失时一次性列出全部缺名（不第一个就停）。"""
@@ -82,23 +104,36 @@ class TestReexportCompat(unittest.TestCase):
     def test_status_names_reexported(self):
         _assert_all_present(self, NAMES_STATUS, "statusbar_status")
 
+    def test_session_names_reexported(self):
+        _assert_all_present(self, NAMES_SESSION, "statusbar_session")
+
+    def test_config_names_reexported(self):
+        _assert_all_present(self, NAMES_CONFIG, "statusbar_config")
+
     def test_private_underscore_names_reexported(self):
         """下划线私有名是 import * 的盲区，单列一组盯住（P1-001 教训）。"""
-        private = [n for n in (NAMES_LAYOUT + NAMES_DB + NAMES_STATUS)
+        private = [n for n in (NAMES_LAYOUT + NAMES_DB + NAMES_STATUS
+                               + NAMES_SESSION + NAMES_CONFIG)
                    if n.startswith("_")]
         # 至少要有我们已知的私有名；清单里若一个都没有，说明清单本身漏了
         self.assertTrue(private, "清单里应至少包含一个下划线私有名")
         _assert_all_present(self, private, "private names")
 
     def test_module_all_lists_match_expectation(self):
-        """statusbar_status.__all__ 无多余、无缺失（与 NAMES_STATUS 双向对齐）。"""
+        """各抽离模块的 __all__ 无多余、无缺失（与对应 NAMES_* 双向对齐）。"""
         import statusbar_status
-        declared = set(statusbar_status.__all__)
-        expected = set(NAMES_STATUS)
-        self.assertEqual(declared - expected, set(),
-                         "__all__ 里多出了清单外的名字")
-        self.assertEqual(expected - declared, set(),
-                         "__all__ 漏掉了清单里的名字")
+        import statusbar_session
+        import statusbar_config
+        for mod, expected, label in (
+                (statusbar_status, NAMES_STATUS, "statusbar_status"),
+                (statusbar_session, NAMES_SESSION, "statusbar_session"),
+                (statusbar_config, NAMES_CONFIG, "statusbar_config")):
+            declared = set(mod.__all__)
+            want = set(expected)
+            self.assertEqual(declared - want, set(),
+                             "%s.__all__ 里多出了清单外的名字" % label)
+            self.assertEqual(want - declared, set(),
+                             "%s.__all__ 漏掉了清单里的名字" % label)
 
 
 if __name__ == "__main__":
