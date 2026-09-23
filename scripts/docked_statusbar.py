@@ -24,18 +24,17 @@ docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对
   db     : model_usage 最近 180 秒内有交互调用的主会话（取行的 started_at）
   tool   : tool_usage 起点在 600 秒内且仍 running 的主会话（0.9.2 新增——一把
            长工具运行期间 mark/status/db 会同时过窗，只有它还在动）
-  uia    : 标签标题反查（实验开关 enable_uia_tab_probe，默认关；UIA 树已可达，
-           但侧栏会话行无一携带选中态，实测恒为信号缺席）
 全部信号都过窗时沿用粘滞值；首次就无任何信号才退到 token-stats.jsonl 兜底，
 并在行尾标注「（最近会话累计）」；连兜底也没有 -> 「（会话未识别，待首轮
 活动）」占位。
 
 边界（拿不到可靠信号，不是判定链缺陷）：切到另一个标签但**不发消息**时没有
 任何事件源（ZCode 不给 UI 事件，`current-session.json` 只在发消息时写；数据库
-里也不存在 UI 状态）。0.9.2 真机复核过 UIA 这条路：内容已在树里（侧栏会话行
-连标题都读得到），但那些行无一携带选中态、Name 又是「标题+相对时间」拼的，
-指认不出「当前是哪个」——详见 scripts/uia_tab_probe.py 的复核记录。粘滞因此会
-沿用旧会话，直到新会话重新出现任一信号。发消息后由 mark/status 立即跟随。
+里也不存在 UI 状态）。UIA 标签标题反查这条路 0.9.2 真机复核过：内容已在树里
+（侧栏会话行连标题都读得到），但那些行无一携带选中态、Name 又是「标题+相对
+时间」拼的，指认不出「当前是哪个」——实验代码已于 0.9.6 后移除（归档在
+docs/archive/bak/uia_tab_probe.py）。粘滞因此会沿用旧会话，直到新会话重新
+出现任一信号。发消息后由 mark/status 立即跟随。
 
 0.4.2 变更（fix-20260824）：
   - 会话跟随：live_stream active 且 sessionId 存在时以其为当前会话（最高
@@ -374,12 +373,6 @@ import time
 import traceback
 
 try:
-    # 0.8.0 实验性 UIA 标签探测（默认关）；import 失败静默降级（信号恒缺席）
-    import uia_tab_probe
-except Exception:
-    uia_tab_probe = None
-
-try:
     # 0.8.0 目录监听（事件驱动刷新）；import 失败静默降级为 None，
     # 调用方（run_gui）据此退回纯轮询，绝不影响主流程。
     import dir_watcher
@@ -443,7 +436,6 @@ DB_ACTIVE_WINDOW_MS = 180 * 1000  # db 兜底判定窗口：最近 180 秒内有
 STATUS_SIGNAL_FRESH_MS = 60 * 1000       # status-state.json 事件作为会话信号的 freshness 窗口
 RESUME_FRESH_MS = 600 * 1000             # resume 信号 freshness 窗口：超此值的陈旧 resume 不入候选池
 DB_READ_INTERVAL = 1        # 每拍重读 db（查询实测亚毫秒，换取刷新及时性）
-UIA_PROBE_EVERY_TICKS = 3   # UIA 标签探测节流：每 N 拍探一次（实验性开关开启时）
 STATS_PENDING = u"\uff08\u672c\u8f6e\u7ed3\u675f\u540e\u66f4\u65b0\uff09"  # （本轮结束后更新）
 TURN_PENDING = u"\uff08\u672c\u8f6e\u7edf\u8ba1\u5f85\u66f4\u65b0\uff09"  # （本轮统计待更新）——0.4.0 第二行无已完成轮次时占位
 SESSION_UNKNOWN = u"\uff08\u4f1a\u8bdd\u672a\u8bc6\u522b\uff0c\u5f85\u9996\u8f6e\u6d3b\u52a8\uff09"  # （会话未识别，待首轮活动）
@@ -593,13 +585,6 @@ DEFAULT_CONFIG = {
     "handle_y": None,
     "refresh_ms": 1000,
     "theme": "dark",
-    # ---- 0.8.0 UIA warm 切换探测（实验性，默认关）----
-    # 开启后每 UIA_PROBE_EVERY_TICKS 拍经 UIA 探测 ZCode 选中标签标题，
-    # 反查唯一命中则以 uia 信号参与粘滞竞争（详见 scripts/uia_tab_probe.py）。
-    # 0.9.2 真机复核：UIA 树已可达（189 个按钮、84 个 ListItem 含会话标题），
-    # 但没有哪项的选中态能指认当前会话 -> 信号恒缺席；且单次 85ms，
-    # 开着就是每 3 拍多卡 85ms。
-    "enable_uia_tab_probe": False,
 }
 
 HWND_TOPMOST = ctypes.c_void_p(-1)
@@ -1447,45 +1432,8 @@ def tail_session_resume(state, log_dir=None):
 
 
 
-def _uia_signal(db_path, conn, cfg=None):
-    """UIA 标签探测 -> (session_id, time_ms) 或 None（信号缺席）。
-
-    缺席条件（任一）：开关 enable_uia_tab_probe 关闭；
-    uia_tab_probe import 失败；探测返回 None；标题反查未唯一命中。
-    节流（是否本拍探测）由调用方经 probe_now 控制，此处不判。
-    cfg 传入时按**热加载后的实际配置**判开关（不读 DEFAULT_CONFIG，否则
-    配置文件里的 enable_uia_tab_probe 永远打不开这条路径）；None 时退回默认。
-    conn 传入时复用反查；None 时自开自关（仅此一条查询）。
-    """
-    try:
-        if not (cfg if cfg is not None else DEFAULT_CONFIG).get(
-                "enable_uia_tab_probe", False):
-            return None
-        if uia_tab_probe is None:
-            return None
-        title = uia_tab_probe.probe_active_tab_title()
-        if not title:
-            return None
-        own = conn is None
-        if own:
-            conn = _db_connect(db_path)
-        try:
-            sid = uia_tab_probe.resolve_sid_by_title(conn, title)
-        finally:
-            if own and conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-        if not sid:
-            return None
-        return sid, time_ms()
-    except Exception:
-        return None
-
-
 def resolve_session_sticky(state, rows, data_dir, db_path, conn=None,
-                           probe_now=False, cfg=None):
+                           cfg=None):
     """信号驱动 + 粘滞的当前会话判定。返回 (session_id, source)。
 
     候选信号（各带真实发生时间戳，禁止用读取时刻伪造）：
@@ -1507,25 +1455,17 @@ def resolve_session_sticky(state, rows, data_dir, db_path, conn=None,
                （窗口 TOOL_LIVE_MAX_MS）：起点在窗口内且**仍 running** 的最近
                一把工具（0.9.2 新增）。mark/status/db 三路同时过窗时（长工具
                运行）它是唯一仍在生效的活跃证据；无符合行 -> (None, 0)。
-      uia    : 仅当 cfg["enable_uia_tab_probe"] 开启且 probe_now=True
-               （节流由调用方按 UIA_PROBE_EVERY_TICKS 计算，本函数不维护
-                 计数——简单且可测）时：probe_active_tab_title() ->
-               resolve_sid_by_title(conn, title) 唯一命中 ->
-               (sid, time_ms()) 参与竞争；探测失败/歧义/未命中 -> 信号缺席；
-               uia_tab_probe import 失败 -> 信号缺席。
     state 键：sticky_sid、sticky_set_at（本函数维护）；
               tail_session_resume 另维护 log_* 键。
 
     切换规则：
       1. 过滤 subagent sid 后，取时间戳最新的信号（平局按
-         mark>status>resume>db>tool>uia 优先——max() 并列取先出现者）；
+         mark>status>resume>db>tool 优先——max() 并列取先出现者）；
       2. sticky 为空（首次）：取该信号 sid；无任何信号 -> current_session(rows)
          的 jsonl 兜底（保持旧行为，source="jsonl"）；都没有 -> (None, "none")；
       3. 最新信号 sid != sticky 且信号 ts > sticky_set_at -> 切换 sticky，
          source 为信号类型；
       4. 否则保持 sticky，source="sticky"（含无任何信号的空闲轮询）。
-    cfg 只用于 UIA 开关判定：传入时按热加载后的实际配置决定探测与否（None 时
-    退回 DEFAULT_CONFIG）；是否本拍探测另由调用方经 probe_now 节流。
     """
     if state is None:
         state = {}
@@ -1580,11 +1520,6 @@ def resolve_session_sticky(state, rows, data_dir, db_path, conn=None,
             candidates.append((ts, "tool", sid))
     except Exception:
         pass
-    if probe_now:
-        # 仅探测拍才实际调用 UIA 探测（开关检查在 _uia_signal 内）
-        uia_sig = _uia_signal(db_path, conn, cfg)
-        if uia_sig is not None:
-            candidates.append((uia_sig[1], "uia", uia_sig[0]))
     newest = max(candidates, key=lambda c: c[0]) if candidates else None
     sticky = state.get("sticky_sid")
     try:
@@ -2954,7 +2889,7 @@ def session_label(db_path, session_id, conn=None):
 
 
 def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
-                     sess_state=None, db_conn=None, probe_now=False):
+                     sess_state=None, db_conn=None):
     """
     每帧（GUI / --once）统一解析展示信息，返回 dict：
       {text, source, session_id, model, session_label, line1, line2, stats}
@@ -2987,8 +2922,7 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
         if sess_state is None:
             sess_state = {}  # 向后兼容：临时态退化为无粘滞（每拍走首次分支）
         sid, source = resolve_session_sticky(sess_state, rows, data_dir,
-                                             db_path, conn=db_conn,
-                                             probe_now=probe_now, cfg=cfg)
+                                             db_path, conn=db_conn, cfg=cfg)
         info["session_id"] = sid
         info["source"] = source
         if sid is None:
@@ -4900,17 +4834,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             # 同一只读连接，组装完毕 finally 关闭（链路内零次新开连接）。
             tick_conn = _db_connect(db_path)
             try:
-                # R5 UIA 探测节流：仅开关开启且每 UIA_PROBE_EVERY_TICKS 拍
-                # 探一次（借 db_read_count 周期性归零作拍计数）。开关关闭 /
-                # 探测失败 / 反查歧义时 probe_now 信号缺席，行为同 Stage 1/2。
-                probe_now = bool(
-                    cfg.get("enable_uia_tab_probe", False)
-                    and (state["db_read_count"] % UIA_PROBE_EVERY_TICKS == 0))
                 info = resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
                                         cur=cur_cache,
                                         sess_state=state,
-                                        db_conn=tick_conn,
-                                        probe_now=probe_now)
+                                        db_conn=tick_conn)
                 session_changed = (prev_info is not None
                                    and info.get("session_id") != prev_info.get("session_id"))
                 if session_changed:

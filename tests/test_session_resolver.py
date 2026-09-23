@@ -340,7 +340,7 @@ class TestStickyNewSignals(unittest.TestCase):
              mock.patch.object(dsb, "db_recent_session_activity",
                                return_value=db):
             return dsb.resolve_session_sticky(state, [], d, db_path,
-                                              conn=None, probe_now=False)
+                                              conn=None)
 
     def test_status_signal_wins_over_older_mark(self):
         """status-state.json（新鲜 ts，会话 X）+ 更旧 mark -> (X, "status")。"""

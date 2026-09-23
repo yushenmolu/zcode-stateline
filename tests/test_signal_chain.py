@@ -62,7 +62,7 @@ class TestMarkFreshnessGate(unittest.TestCase):
         with mock.patch.object(dsb, "tail_session_resume",
                                return_value=resume):
             return dsb.resolve_session_sticky(state, [], d, db_path,
-                                              conn=None, probe_now=False)
+                                              conn=None)
 
     def test_stale_mark_does_not_override_sticky(self):
         """陈旧 mark（14 分钟前）不得顶掉既有粘滞。
