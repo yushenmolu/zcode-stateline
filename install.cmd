@@ -24,7 +24,7 @@ rem   PYTHON_BIN   Python interpreter. Default: python on PATH, then py -3
 setlocal EnableExtensions
 
 rem Keep in sync with .zcode-plugin\plugin.json
-set "VERSION=0.9.5"
+set "VERSION=0.9.6"
 
 set "DRY=0"
 if /i "%~1"=="/dry" set "DRY=1"

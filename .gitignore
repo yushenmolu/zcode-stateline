@@ -22,3 +22,5 @@ env.json
 
 # Misc test artifacts
 ab-open.log
+
+status-state.json

@@ -190,6 +190,40 @@ docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对
     就是新版本了）。判定与真机进程表各有一组测试（tests/
     test_lifecycle_binding.py，12 条），含结构体 568 字节/字段偏移的实测断言。
 
+0.9.6 变更（三处闭包判定外提为可测纯函数；顺带修掉外提时撞到的收起把手拖不动）：
+  - 动机是覆盖问题，不是手感问题：外提前本文件 5113 行，run_gui 从 3733 行起
+    占 1381 行、内含 39 个直接子闭包，而 262 条既有测试只能触达模块级纯函数
+    ——完整态显隐/贴边、悬停展开守卫、拖动落点这三处判定从来没有一个断言钉过
+    （0.2.1 那个「点一下小条它就自己消失」的 bug 正是这么漏掉的）。沿用
+    collapsed_poll_decision 已有的路子：依赖全部显式注入，闭包只留副作用。
+  - 新增 expanded_poll_decision（完整态 iff 窗口存在+未最小化+矩形可得，前台
+    只降级贴边锚点）、hover_expand_should_schedule（冷却窗 / 未武装 / 按压或
+    拖动中三闸）、drag_target_xy（收起态与完整态两条拖动路径原先各抄一遍
+    「根坐标减偏移 + 伪矩形夹取」，现合并）。
+  - 刻意不做物理拆文件：钩子与注册表按 ${ZCODE_PLUGIN_ROOT} 直引这个脚本的
+    路径，拆成包要同步改 hooks 命令行、install.cmd 的复制清单和 sys.path 兜底，
+    收益不抵风险——外提纯函数已经拿到「可测」这一项，剩下的只是行长。
+  - **修 bug：收起把手拖不动**（合并那两条拖动路径时看清的算术，不是新加的
+    需求）。drag_move 收起支每帧现算 `off = 指针 - 当前窗口坐标`，代进去得
+    `new = 指针 - off = 当前坐标`——恒等式，把手被 MoveWindow 回它已经在的
+    地方；指针怎么走都不动，松开时 on_persist 把这个没动过的坐标写进
+    handle_x/handle_y。完整态没这问题，因为它在 drag_start 就冻结了
+    drag_offset。三处改动缺一不可：
+      - drag_grab_offset：一次拖拽内把抓取偏移冻结（首帧不跳变，其后按指针
+        增量走）；缓存判定用 `is not None`，偏移恰为 (0,0)（按在把手左上角）
+        是合法抓取量，真值判断会把它当「还没抓过」；
+      - drag_start 收起支：新的一次按下作废上次的抓取偏移；
+      - poll 的拖动守卫补上 hand_gesture.dragging：收起分支原先只判
+        state["dragging"]（完整态专用，收起态恒 False），于是 poll 每拍（~1
+        秒）按记忆/默认位把手拽回去——只修偏移的话，症状会从「拖不动」变成
+        「拖一下、弹回一下」。
+    README 里「把手可拖动且不出屏」这句从 0.2.0（引入把手拖动的那次提交，算式
+    与本次修前逐字相同）起就是错的，现在才成立。
+  - 除上述修复外行为逐条等价；唯一非等价的小处是 poll 里 _apply_noactivate
+    挪到 move_window 之前——它带 SWP_NOMOVE|SWP_NOSIZE，不动位置也不动尺寸，
+    先后无涉。新增 tests/test_poll_decisions.py 33 条（全库 295 条），含把旧
+    算式原样重放一遍的负面证据，和「GUI 侧确实用了纯函数/守卫已补」的源码断言。
+
 0.9.5 变更（纯文档勘误，运行时行为与 0.9.4 完全一致）：
   - 清掉「ZCode 最小化或切到其他程序时自动隐藏」这类写反的显隐描述，README 与
     本 docstring 共 6 处。实际判据：完整态自 0.2.1 起只看「ZCode 窗口存在 + 未
@@ -259,7 +293,9 @@ docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对
     manual_position=True，poll 的贴边分支若 manual_position 为真则**跳过
     MoveWindow 吸回**（显隐判定照常：仍随 ZCode 窗口存在/未最小化）。右键
     菜单「重新贴边」清除 manual_position，恢复智能自动贴边。拖动中
-    （dragging=True）poll 也不吸回，避免拖到一半被抢。
+    （poll 守卫 `state["dragging"] or hand_gesture.dragging`）poll 也不吸回，
+    避免拖到一半被抢；0.9.6 起这条同样罩住收起态把手——原先只判完整态那个
+    标志（收起态恒 False），poll 每拍把正在拖的把手拽回记忆/默认位。
   - 悬停提示（tooltip）：鼠标悬停在第二行各指标块（或第一行模型/会话）上
     ~400ms 后显示一个无边框置顶小气泡，移开即隐藏。摆放**永远避开小条自己**
     （0.9.4）：优先落在小条正上方，上方放不下退到正下方，横向跟随指针并夹进
@@ -301,7 +337,9 @@ docked_statusbar.py — ZCode token-stats「智能贴边底部状态条」（对
     附近）；把手悬停 ~0.5s（Move 刷新计时）或单击 -> 展开回完整状态条
     （重新贴边）。collapsed 字段持久化（save_config_keys 原子写），重启
     恢复原状态；收起态显隐只看「ZCode 进程在否 + 真句柄可查时是否最小化」，
-    不依赖窗口找不找得到、也不随前台变化；把手可拖动且钳制工作区。
+    不依赖窗口找不找得到、也不随前台变化；把手可拖动（0.9.6 起才真的跟手：
+    抓取偏移在一次拖拽内冻结，此前每帧现算偏移 => 恒等式，拖不动）且钳制
+    工作区。
   - 防多开：数据目录 statusbar.pid 记录本进程 pid；已有存活实例直接退出；
     退出时若 pid 仍是自己的则删除。
   - 生命周期绑定（0.9.3）：每拍拍进程表，ZCode.exe 连续缺席满
@@ -353,7 +391,7 @@ except Exception:
 # 常量
 # ---------------------------------------------------------------------------
 
-STATUSBAR_VERSION = "0.9.5"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.9.6"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
@@ -956,6 +994,113 @@ def collapsed_poll_decision(state, cfg, bar_w, alive, zcode_hwnd,
             return False, None
         return True, hxy
     return True, hxy
+
+
+def expanded_poll_decision(state, bar_w, zcode_hwnd, is_iconic, rect_of,
+                           foreground, dock, clamp,
+                           window_h=WINDOW_H, margin=MARGIN):
+    """完整态 poll 显隐/贴边判定（0.9.6 抽为模块级纯函数，可独立重放测试；
+    副作用 show/move 仍由调用方 run_gui.poll 执行，本函数只做裁决）。
+
+    显示口径（0.2.1 起，与收起态刻意不同）：完整条可见 iff「ZCode 窗口存在
+    + 未最小化 + 窗口矩形可得」三条，**切到其他程序不隐藏**——前台判定只让
+    贴边锚点退一级，不作为隐藏条件（旧逻辑这里 SW_HIDE 会把完整条藏没，
+    表现为「点一下小条它就自己消失」）。
+
+    参数（全部显式注入，不隐式依赖闭包/全局）：
+      - state:          run_gui state（读 manual_position）
+      - bar_w:          完整条当前宽度
+      - zcode_hwnd:     ZCode 顶层窗口句柄；0/None -> 藏
+      - is_iconic(h):   该窗口是否最小化（True -> 藏）
+      - rect_of(h):     该窗口屏幕矩形；取不到返回 None（-> 藏）
+      - foreground():   ZCode 是否前台（只决定贴边锚点，不决定显隐）
+      - dock(zrect, bar_w, bar_h):         前台贴边坐标
+      - clamp(xy, bar_w, bar_h, zrect):    工作区夹取；xy 为 None 时返回 None
+      - window_h / margin: 条高与非前台贴边的额外留白
+
+    返回 (visible, xy)：
+      - (False, None)   -> 调用方 SW_HIDE
+      - (True, None)    -> 调用方 SW_SHOW（manual_position：停在用户放下的位置，
+                           不动坐标、也不改 last_xy）
+      - (True, (x, y))  -> 调用方 move_window 到 (x,y) 后 SW_SHOW
+    """
+    if not zcode_hwnd:
+        return False, None
+    if is_iconic(zcode_hwnd):          # 最小化 -> 隐藏
+        return False, None
+    zrect = rect_of(zcode_hwnd)
+    if zrect is None:
+        return False, None
+    # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回（仍受目标
+    # 存在/最小化/矩形可得显示逻辑控制）。
+    if state.get("manual_position"):
+        return True, None
+    if foreground():
+        xy = dock(zrect, bar_w, window_h)
+    else:
+        # 非前台退一级贴边：y 取 bottom（zrect[3]）+ margin，与 dock_rect
+        # below 模式（y = bottom + margin）同口径。
+        xy = clamp((zrect[0], zrect[3] + margin), bar_w, window_h, zrect)
+    xy = clamp(xy, bar_w, window_h, zrect)
+    if xy is None:
+        return False, None
+    return True, xy
+
+
+def hover_expand_should_schedule(state, now_ms, pressing, dragging):
+    """把手悬停自动展开的排程守卫（0.9.6 抽为纯函数；计时器副作用仍留在
+    _schedule_hover_expand 闭包里）。
+
+    三条互斥守卫，任一命中都不排程：
+      - 收起冷却窗内（collapse_bar 后 COLLAPSE_HOVER_GRACE_MS）—— 防双击收起
+        后把手恰在指针下立即自展开；
+      - 未武装（handle_armed=False，收起瞬间被 disarm）—— 悬停展开要求指针先
+        离开把手再重新进入（leave->enter）才再次武装；
+      - 手势按压/拖动进行中 —— 按下即取消悬停，避免与单击/双击/拖动裁决冲突。
+    """
+    if now_ms < int(state.get("hover_grace_until") or 0):
+        return False
+    if not state.get("handle_armed", False):
+        return False
+    if pressing or dragging:
+        return False
+    return True
+
+
+def drag_target_xy(root_xy, offset, bar_w, bar_h, clamp):
+    """拖动落点：指针根坐标减按下偏移，再按**目标位置**所在显示器的工作区
+    夹取（以目标坐标构造伪矩形定显示器，防止拖出屏幕无法自救）。完整态与
+    收起态两条拖动路径同用（0.9.6 合并去重）。
+
+    clamp 返回 None（工作区不可得）时保留未夹取值——与合并前两处一致。
+    """
+    x = root_xy[0] - offset[0]
+    y = root_xy[1] - offset[1]
+    clamped = clamp((x, y), bar_w, bar_h, (x, y, x + bar_w, y + bar_h))
+    if clamped:
+        x, y = clamped
+    return x, y
+
+
+def drag_grab_offset(root_xy, cur_xy, cached):
+    """一次抓取只算一次的偏移（0.9.6：修收起把手拖不动）。
+
+    完整态在 drag_start 里记 `drag_offset`，所以本来就跟手；收起态原先每帧
+    现算 `off = 指针 - 当前窗口坐标`，代进 drag_target_xy 得 `new = 指针 - off
+    = 当前坐标`——恒等式，把手被 move 回它已经在的地方，看上去完全拖不动。
+    偏移必须在一次拖拽内冻结，于是：cached 有值就直接用（本帧沿用抓取那次），
+    没有则用当帧的 cur_xy 现算并交回调用方缓存（首帧 new == 当前位置，不跳
+    变；之后的帧按指针增量走）。cur_xy 取不到（窗口坐标瞬时失败）返回 None，
+    调用方本帧不移动。
+
+    缓存判定用 `is not None` 而非真值：偏移恰为 (0, 0)（按在把手左上角）是
+    合法抓取量，`if cached:` 会把它当「还没抓过」重新现算，那个按点又变回不跟手。
+    """
+    if cached is not None:
+        return cached
+    if cur_xy is None:
+        return None
+    return (root_xy[0] - cur_xy[0], root_xy[1] - cur_xy[1])
 
 
 # ---------------------------------------------------------------------------
@@ -3864,6 +4009,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         "manual_handle": False,   # 收起态把手被手动拖过 -> poll 不再吸回（直到展开）
         "press_xy": None,         # 完整态按下时指针屏幕坐标（区分「单击」与「拖动」）
         "last_drag_xy": None,     # 收起态拖动最近一次被 clamp 后的目标坐标
+        "handle_drag_offset": None,   # 收起态本次拖动的抓取偏移（一次拖拽内冻结）
         "hover_grace_until": 0,   # 收起冷却截止（epoch 毫秒）：此之前悬停展开不排程
         "ignore_click_until": 0,  # 双击尾巴遮蔽截止（epoch 毫秒）：此之前收起态
                                   # 释放事件不喂手势机（防收起后残余 release 又展开）
@@ -4189,7 +4335,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
     def _schedule_hover_expand():
         """（重新）启动悬停 0.5s 自动展开计时（Move 事件刷新 = 重置计时）。
 
-        守卫（互斥清晰）：
+        守卫（互斥清晰，判定抽为模块级 hover_expand_should_schedule）：
           - 收起冷却期内（collapse_bar 后 COLLAPSE_HOVER_GRACE_MS 内）不排程
             —— 防双击收起后把手恰在指针下的立即自展开；
           - 未武装（handle_armed=False，收起瞬间被 disarm）不排程 ——
@@ -4198,11 +4344,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             单击/双击/拖动裁决冲突）。
         排程成功后 consume 武装（handle_armed=False），一次 leave->enter 只武装一次。"""
         nonlocal hover_expand_id
-        if time_ms() < state.get("hover_grace_until", 0):
-            return
-        if not state.get("handle_armed", False):
-            return
-        if hand_gesture.press_xy is not None or hand_gesture.dragging:
+        if not hover_expand_should_schedule(state, time_ms(),
+                                            hand_gesture.press_xy is not None,
+                                            hand_gesture.dragging):
             return
         state["handle_armed"] = False   # 武装只消费一次
         _cancel_hover_expand()
@@ -4579,6 +4723,9 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             return
         if state.get("collapsed"):
             _cancel_hover_expand()   # 按下即取消悬停展开，交手势裁决
+            # 新的一次按下 = 新的一次抓取：作废上次拖动的偏移，避免复用陈旧
+            # 抓取量（release 不按时到达时尤其要紧）。
+            state["handle_drag_offset"] = None
             hand_gesture.press(event.x_root, event.y_root)
             return
         xy = current_window_xy()
@@ -4600,19 +4747,18 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                 return
             # 拖动态：目标坐标 clamp_to_work_area（以目标位置构造伪矩形
             # 定显示器），防止拖出屏幕无法自救，移动后记录把手位置。
-            xy = current_window_xy()
-            if xy is None:
-                return
-            ox = event.x_root - xy[0]
-            oy = event.y_root - xy[1]
-            new_x = event.x_root - ox
-            new_y = event.y_root - oy
             bar_w = state.get("cur_w") or HANDLE_W_DEFAULT
             bar_h = HANDLE_H
-            pseudo = (new_x, new_y, new_x + bar_w, new_y + bar_h)
-            clamped = clamp_to_work_area((new_x, new_y), bar_w, bar_h, pseudo)
-            if clamped:
-                new_x, new_y = clamped
+            # 抓取偏移在一次拖拽内冻结（0.9.6 前每帧现算 -> new == 当前位置，
+            # 恒等式，把手拖不动）。
+            off = drag_grab_offset((event.x_root, event.y_root),
+                                   current_window_xy(),
+                                   state.get("handle_drag_offset"))
+            if off is None:
+                return            # 窗口坐标瞬时取不到：本帧不移动
+            state["handle_drag_offset"] = off
+            new_x, new_y = drag_target_xy((event.x_root, event.y_root), off,
+                                          bar_w, bar_h, clamp_to_work_area)
             try:
                 if hwnd:
                     win().move_window(hwnd, new_x, new_y, bar_w, bar_h, True)
@@ -4625,15 +4771,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         off = state.get("drag_offset")
         if not off:
             return
-        ox, oy = off
-        new_x = event.x_root - ox
-        new_y = event.y_root - oy
         bar_w = state.get("cur_w") or WINDOW_W
         bar_h = WINDOW_H
-        pseudo = (new_x, new_y, new_x + bar_w, new_y + bar_h)
-        clamped = clamp_to_work_area((new_x, new_y), bar_w, bar_h, pseudo)
-        if clamped:
-            new_x, new_y = clamped
+        new_x, new_y = drag_target_xy((event.x_root, event.y_root), off,
+                                      bar_w, bar_h, clamp_to_work_area)
         try:
             if hwnd:
                 win().move_window(hwnd, new_x, new_y, bar_w, bar_h, True)
@@ -4658,12 +4799,12 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                 hand_gesture.cancel_click()
                 state["last_drag_xy"] = None
                 return
-            act = hand_gesture.release({"x_root": event.x_root,
-                                        "y_root": event.y_root}, cur_xy)
+            hand_gesture.release({"x_root": event.x_root,
+                                  "y_root": event.y_root}, cur_xy)
             state["last_drag_xy"] = None
-            if act == E_ACTION_PERSIST:
-                # on_persist 已写配置 + manual_handle；此处补记真实当前位置
-                pass
+            # 拖动裁决（E_ACTION_PERSIST）不必在这里再处理：release() 内部已按
+            # cur_xy 回调 on_persist 写过 handle_x/handle_y 并置 manual_handle
+            # =True，poll 下一拍起不再吸回；拖动的落点本身就是真实位置。
             return
         if not state.get("dragging"):
             return
@@ -4898,7 +5039,11 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             # 正在拖动：跳过前台/最小化/找窗等全部隐藏判定（拖动中绝不
             # withdraw，否则拖动会被自隐藏打断），也不贴边 MoveWindow；
             # 释放后恢复完整显隐判定 + manual_position 接管停靠位置。
-            if state.get("dragging"):
+            # 0.9.6：条件补上手势机的 hand_gesture.dragging（收起态拖动）。
+            # 收起分支原先只判 state["dragging"]（完整态专用，收起态恒 False），
+            # 于是 poll 每拍（~1 秒）都按记忆/默认位 MoveWindow 把手拽回去
+            # ——拖动刚改好就会变成「拖一下、弹回一下」。
+            if state.get("dragging") or hand_gesture.dragging:
                 _apply_noactivate()   # 拖动中显示同样持续保障 NOACTIVATE
                 set_visible(True)
                 return
@@ -4946,47 +5091,33 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                     state["last_xy"] = hxy
                 set_visible(True)
                 return
-            hz = find_zcode_window()
-            if not hz:
-                set_visible(False)
-                return
-            if win().is_iconic(hz):          # 最小化 -> 隐藏
-                set_visible(False)
-                return
-            # 0.2.1 判活改判：完整态可见性只由「公开目标（ZCode）存在且非
-            # 最小化且窗口矩形可得」决定——贴边/拖动后点击或拖动会激活 pythonw
-            # 自身（is_foreground_zcode 变 False，pythonw exe 不含 zcode 匹配
-            # 不到），旧逻辑这里 SW_HIDE 会把完整条藏没。现在不再因前台非
-            # ZCode 就隐藏；前台仅降级为辅助贴边（见下），不决定窗口死活。
-            zrect = window_rect_of(hz)
-            if zrect is None:
-                set_visible(False)
-                return
-            # 手动定位：拖动过的小条停在用户放下的位置，不再贴边/吸回
-            # （仍受目标存在/最小化/矩形可得显示逻辑控制）。
-            if state.get("manual_position"):
-                _apply_noactivate()
-                set_visible(True)
-                return
             # 完整态（未收起）：贴 ZCode 底部外沿（水平居中），钳制工作区。
-            # 前台判定仅用于「贴边锚点退一级」（ZCode 非前台但窗口存在时用
-            # 当前矩形贴边，仍保持可见），不再作为隐藏条件。
+            # 0.2.1 判活改判：可见性只由「ZCode 窗口存在 + 未最小化 + 矩形
+            # 可得」决定，前台判定仅用于「贴边锚点退一级」（ZCode 非前台但
+            # 窗口存在时用当前矩形贴边，仍保持可见），不作为隐藏条件。
+            # 判定抽为模块级 expanded_poll_decision（依赖显式注入，可独立
+            # 重放测试），本闭包只做副作用：_apply_noactivate 持续保障不抢
+            # 焦点（SWP_NOMOVE|SWP_NOSIZE，与 move_window 先后无涉）、
+            # move_window 吸边、set_visible。
             bar_w = state.get("cur_w") or WINDOW_W
-            if is_foreground_zcode():
-                xy = dock_rect(zrect, bar_w, WINDOW_H)
-            else:
-                # 非前台退一级贴边：y 取 bottom（zrect[3]）+ margin，与
-                # dock_rect below 模式（y = bottom + margin）同口径。
-                xy = clamp_to_work_area((zrect[0], zrect[3] + MARGIN),
-                                        bar_w, WINDOW_H, zrect)
-            xy = clamp_to_work_area(xy, bar_w, WINDOW_H, zrect)
-            if xy is None:
+            visible, xy = expanded_poll_decision(
+                state, bar_w,
+                zcode_hwnd=find_zcode_window(),
+                is_iconic=win().is_iconic,
+                rect_of=window_rect_of,
+                foreground=is_foreground_zcode,
+                dock=dock_rect,
+                clamp=clamp_to_work_area,
+            )
+            if not visible:
                 set_visible(False)
                 return
-            if xy != state["last_xy"]:
+            _apply_noactivate()
+            # xy is None：manual_position，停在用户放下的位置，不动坐标也不记
+            # last_xy（与外提前同一支路）。
+            if xy is not None and xy != state["last_xy"]:
                 win().move_window(hwnd, xy[0], xy[1], bar_w, WINDOW_H, True)
                 state["last_xy"] = xy
-            _apply_noactivate()
             set_visible(True)
         except Exception:
             # 任何异常只隐藏或保持现状，绝不让小条抢焦点、绝不弹错。
