@@ -4,7 +4,7 @@
 
 > English in one sentence: A ZCode plugin that shows real-time token usage, cache hit rate and speed (duration/TTFT) per conversation — as an in-chat stats line plus a docked status bar, with a `/stats` command for full reports.
 
-- 版本：0.10.0
+- 版本：0.10.1
 - 许可：MIT
 - 平台：Windows（ZCode 桌面版 + Python 3.10+，仅标准库，无第三方依赖）
 
@@ -115,6 +115,11 @@
 - **退出 statusbar**：关闭状态条。
 
 ## 变更日志
+
+### 0.10.1
+- 继续拆分主脚本：抽出 `statusbar_status`（状态机）、`statusbar_session`（会话解析）、`statusbar_config`（配置读写）模块，主脚本进一步减重。
+- 新增 `test_reexport_compat` 兼容性断言：保证主脚本对拆分模块的再导出与旧引用路径一致。
+- 补齐 `test_hot_reload_config` 配置热重载测试覆盖。
 
 ### 0.10.0
 - 死代码清理：移除 `proxy_server.py` 与 `uia_tab_probe` 实验代码。
