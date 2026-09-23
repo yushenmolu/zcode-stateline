@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+"""re-export 兼容性回归：docked_statusbar 抽离模块后，旧名 dsb.<name> 全部仍可访问。
+
+背景：statusbar_layout / statusbar_db / statusbar_status 相继从
+docked_statusbar 抽离，主文件靠 `from <mod> import *` 保留旧名。
+`import *` 默认不带下划线私有名，所以各模块必须在 `__all__` 里显式列全；
+本文件把「对外契约名清单」固化成测试，任一名字从 re-export 链上掉落即红。
+
+结构：每个抽离模块一个 NAMES_* 列表 + 通用断言函数；后续 Stage 继续抽离时
+直接在对应列表追加（或新增 NAMES_* 列表 + 一个 test 方法）即可。
+"""
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "scripts"))
+import docked_statusbar as dsb
+
+
+# Round2 Step 1：statusbar_layout（几何/布局纯函数与小常量）
+NAMES_LAYOUT = [
+    "WINDOW_H", "MARGIN", "TIP_EDGE_GAP", "HANDLE_H", "HANDLE_W_DEFAULT",
+    "HANDLE_FALLBACK_MARGIN",
+    "tooltip_placement", "default_handle_xy", "valid_and_clamped_handle_xy",
+    "hidden_skip_refresh", "collapsed_poll_decision", "expanded_poll_decision",
+    "hover_expand_should_schedule", "drag_target_xy", "drag_grab_offset",
+]
+
+# Round2 Step 2：statusbar_db（db.sqlite 只读查询层）
+NAMES_DB = [
+    "BACKGROUND_QUERY_SOURCES", "INTERACTIVE_SOURCE_SQL", "ACTIVITY_GRACE_MS",
+    "TOOL_LIVE_MAX_MS", "DB_ACTIVE_WINDOW_MS",
+    "COLD_READ_RATIO", "COLD_READ_COUNT_SQL",
+    "_num", "time_ms", "_is_subagent_sid",
+    "_db_connect",
+    "db_recent_session_activity", "db_latest_session_id", "db_latest_model_id",
+    "db_session_title", "db_aggregate_session", "db_session_speed",
+    "recent_turn_stats", "turn_window_left_edge", "live_turn_stats",
+    "db_turn_request_profile", "db_session_model_activity_ts",
+    "db_tool_activity", "db_recent_tool_activity", "tool_live_ms",
+    "db_latest_speed",
+]
+
+# Round2 Step 3：statusbar_status（状态机与状态徽标段）
+NAMES_STATUS = [
+    # 状态常量（含时间窗）
+    "STATUS_STATE_NAME", "STATUS_IDLE_AFTER_MS", "STATUS_IDLE_AFTER_MS_DEFAULT",
+    "GENERATING_MAX_LIFETIME_MS", "BUSY_FAMILY", "STATUS_DWELL_MS",
+    "TURN_END_TIE_MS", "OUTCOME_HOLD_MS", "SPEED_HOLD_MS",
+    # 徽标文案 / 颜色 / tooltip 常量
+    "STATUS_TEXT", "STATUS_COLORS", "STATUS_TIPS", "BADGE_TOOL_NAME_MAX",
+    # 状态文件读取与分片视图（下划线私有名也必须 re-export）
+    "_read_status_state", "_status_slots",
+    "status_state_for", "status_state_latest", "status_turn_started_at",
+    # 状态判定 / 去抖 / 速度
+    "status_detector", "status_debounce", "speed_hold", "speed_display",
+    # 徽标文案 / tooltip 与统一解析
+    "format_elapsed_ms", "status_badge_text", "status_badge_tip",
+    "resolve_turn_status",
+]
+
+
+def _assert_all_present(testcase, names, module_label):
+    """逐个断言 dsb.<name> 存在；缺失时一次性列出全部缺名（不第一个就停）。"""
+    missing = [n for n in names if not hasattr(dsb, n)]
+    testcase.assertEqual(
+        [], missing,
+        "%s 有 %d 个旧名未从 docked_statusbar re-export：%s"
+        % (module_label, len(missing), missing))
+
+
+class TestReexportCompat(unittest.TestCase):
+    """抽离模块的旧名 re-export 契约（逐模块一个用例，便于定位是哪一层掉了）。"""
+
+    def test_layout_names_reexported(self):
+        _assert_all_present(self, NAMES_LAYOUT, "statusbar_layout")
+
+    def test_db_names_reexported(self):
+        _assert_all_present(self, NAMES_DB, "statusbar_db")
+
+    def test_status_names_reexported(self):
+        _assert_all_present(self, NAMES_STATUS, "statusbar_status")
+
+    def test_private_underscore_names_reexported(self):
+        """下划线私有名是 import * 的盲区，单列一组盯住（P1-001 教训）。"""
+        private = [n for n in (NAMES_LAYOUT + NAMES_DB + NAMES_STATUS)
+                   if n.startswith("_")]
+        # 至少要有我们已知的私有名；清单里若一个都没有，说明清单本身漏了
+        self.assertTrue(private, "清单里应至少包含一个下划线私有名")
+        _assert_all_present(self, private, "private names")
+
+    def test_module_all_lists_match_expectation(self):
+        """statusbar_status.__all__ 无多余、无缺失（与 NAMES_STATUS 双向对齐）。"""
+        import statusbar_status
+        declared = set(statusbar_status.__all__)
+        expected = set(NAMES_STATUS)
+        self.assertEqual(declared - expected, set(),
+                         "__all__ 里多出了清单外的名字")
+        self.assertEqual(expected - declared, set(),
+                         "__all__ 漏掉了清单里的名字")
+
+
+if __name__ == "__main__":
+    unittest.main()
