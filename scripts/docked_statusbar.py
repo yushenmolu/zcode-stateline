@@ -930,6 +930,23 @@ def format_tokens(n):
     return str(n)
 
 
+def format_tokens_exact(n):
+    """精确千分位值（tooltip 补充行用）：2,046,123；主显示仍用 format_tokens 缩写。"""
+    try:
+        return "{:,}".format(int(n))
+    except Exception:
+        return str(n)
+
+
+def _exact_io_line(stats):
+    """tooltip 补充行：「精确：in 2,046,123 · out 5,678」（stats 为 None 返回 u""）。"""
+    if not stats:
+        return u""
+    return (u"精确：in %s · out %s"
+            % (format_tokens_exact(stats.get("inputTokens") or 0),
+               format_tokens_exact(stats.get("outputTokens") or 0)))
+
+
 def _hit_rate(stats):
     """缓存命中率 = cacheRead / input（db 的 input_tokens 已含 cacheRead 部分）。"""
     denom = stats.get("inputTokens", 0)
@@ -1619,9 +1636,25 @@ def turn_request_profile_text(ts):
 
 
 def turn_tooltip(ts):
-    """本轮段 tooltip：固定说明 + 该轮的请求级画像（无计数时只有固定说明）。"""
+    """本轮段 tooltip：固定说明 + 精确千分位 in/out + 该轮的请求级画像
+    （无计数时只有固定说明）。"""
+    tip = TIP_TURN
+    exact = _exact_io_line(ts)
+    if exact:
+        tip += u"\n" + exact
     extra = turn_request_profile_text(ts)
-    return TIP_TURN + ((u"\n" + extra) if extra else u"")
+    if extra:
+        tip += u"\n" + extra
+    return tip
+
+
+def cum_tooltip(stats):
+    """会话累计 tooltip：固定说明 + 精确千分位 in/out（stats 为 None 只有固定说明）。"""
+    tip = TIP_CUM
+    exact = _exact_io_line(stats)
+    if exact:
+        tip += u"\n" + exact
+    return tip
 
 
 BADGE_TOOL_NAME_MAX = 12   # 徽标内联工具名的长度上限（徽标槽永不裁剪，见布局
@@ -1817,6 +1850,64 @@ def cumulative_text(stats, show_hit=True):
     if show_hit and (stats.get("inputTokens") or 0) > 0:
         txt += u" \u00b7 hit %.1f%%" % _hit_rate(stats)
     return txt
+
+
+def build_copy_text(info, cfg=None):
+    """右键「复制当前统计到剪贴板」的文本：状态栏当前显示的两行等价文本。
+
+    info 为 run_gui 的 state["last_info"]（缺字段容错）：第一行 = 状态徽标
+    文案 + 会话名（+模型），第二行 = 本轮统计全文 + 会话累计。均无数据时
+    返回 u""。纯函数（不碰 tkinter），菜单命令负责 clipboard 调用。
+    """
+    info = info or {}
+    if not info:
+        return u""
+    cfg = cfg or {}
+    status = info.get("status") or "idle"
+    line1 = status_badge_text(status, info.get("turn_stats"))
+    label = info.get("session_label")
+    if label:
+        line1 += u" · " + label
+    if cfg.get("show_model", True) and info.get("model"):
+        line1 += u" · " + info["model"]
+    parts = [line1]
+    cum = info.get("stats")
+    if cum:
+        parts.append(_line_from_stats(cum))
+        cum_txt = cumulative_text(cum)
+        if cum_txt:
+            parts.append(u"累计：" + cum_txt)
+    elif info.get("text"):
+        parts.append(info["text"])
+    return u"\n".join(parts)
+
+
+def build_report_text(db_path, session_id=None):
+    """右键「打开统计报告」的文本：db_stats 当前会话报告（表格式纯文本）。
+
+    懒加载 db_stats（GUI 路径才用到）；无 db / 查询失败返回错误说明行
+    （不向上抛——菜单命令直接展示该文本）。
+    """
+    try:
+        import db_stats
+    except Exception as e:
+        return u"无法加载 db_stats：%s" % e
+    try:
+        if session_id:
+            agg = db_stats.query_session_stats(db_path, session_id=session_id)
+            head = u"会话报告：%s" % session_id
+        else:
+            agg = db_stats.query_session_stats(db_path)
+            head = u"会话报告（最近会话）"
+        return head + u"\n\n" + db_stats._fmt_table(agg)
+    except Exception as e:
+        return u"统计报告生成失败：%s" % e
+
+
+def handle_status_color(info):
+    """收起把手 ◐ 图标的颜色：跟随当前状态色（收起态也能看出当前状态）。"""
+    status = (info or {}).get("status") or "idle"
+    return STATUS_COLORS.get(status, STATUS_COLORS["idle"])
 
 
 def build_stats_line(rows, db_path=None, session_id=None, conn=None):
@@ -2864,6 +2955,11 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
     menu.add_command(label=u"\u6536\u8d77\u5230\u8fb9\u7f18",
                      command=lambda: collapse_bar())
     menu.add_separator()
+    menu.add_command(label=u"复制当前统计到剪贴板",
+                     command=lambda: copy_current_stats())
+    menu.add_command(label=u"打开统计报告",
+                     command=lambda: show_report_window())
+    menu.add_separator()
 
     # 「显示项」子菜单：每个 show_* 一项，checkbutton 勾选态绑定当前配置；
     # 点击即切换 -> 立即重画 -> 原子写回 statusbar-config.json（失败只记 err 日志）。
@@ -2888,6 +2984,61 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
 
     # 右键菜单绑到 Canvas（全区域可呼出）
     canvas.bind("<Button-3>", on_right_click)
+
+    def copy_current_stats():
+        """右键「复制当前统计到剪贴板」：取最近一拍 info 拼两行文本进剪贴板。
+        无数据 / 剪贴板异常只记 err 日志，不打断 GUI。"""
+        try:
+            text = build_copy_text(state.get("last_info"), cfg)
+            if not text:
+                return
+            root.clipboard_clear()
+            root.clipboard_append(text)
+        except Exception:
+            _log_err(data_dir, "copy_current_stats error:\n%s"
+                     % traceback.format_exc())
+
+    report_win = None
+
+    def show_report_window():
+        """右键「打开统计报告」：db_stats 当前会话报告，Toplevel + 滚动文本框
+        （单实例复用；风格沿用 tooltip 的深底色）。任何异常只记日志。"""
+        nonlocal report_win
+        try:
+            info = state.get("last_info") or {}
+            text = build_report_text(db_path, info.get("session_id"))
+            if report_win is not None:
+                try:
+                    report_win.destroy()
+                except Exception:
+                    pass
+                report_win = None
+            win = tk.Toplevel(root)
+            report_win = win
+            win.title(u"统计报告")
+            win.configure(bg=BG_SECOND)
+            win.geometry("460x420")
+            txt = tk.Text(win, bg=BG_SECOND, fg=FG, font=FONT_DIM,
+                          relief="flat", wrap="none")
+            sb = tk.Scrollbar(win, command=txt.yview)
+            txt.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            txt.pack(side="left", fill="both", expand=True)
+            txt.insert("1.0", text)
+            txt.configure(state="disabled")
+
+            def _on_close():
+                nonlocal report_win
+                try:
+                    win.destroy()
+                finally:
+                    report_win = None
+
+            win.protocol("WM_DELETE_WINDOW", _on_close)
+        except Exception:
+            report_win = None
+            _log_err(data_dir, "show_report_window error:\n%s"
+                     % traceback.format_exc())
 
     def quit_app():
         # 先停 watcher（幂等；失败不阻塞退出）再销毁窗口：避免回调线程在
@@ -3425,14 +3576,17 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         ~72x18 深底小把手 + 顶部 1px 分隔线 + 「◐ 84.9%」浓缩缓存命中率
         （绿字）；悬停 0.5s / 单击展开（单击经 drag_stop 位移判定走 expand）。"""
         stats = (info or {}).get("stats")
-        hit_txt = (u"%.1f%%" % _hit_rate(stats)) if stats else u"\u2014"
+        hit_txt = (u"%.1f%%" % _hit_rate(stats)) if stats else u"—"
+        # ◐ 图标颜色跟随当前状态色（STATUS_COLORS）：收起态也能看出当前状态；
+        # 命中率数字保持绿字（与展开态口径一致）。
+        icon_color = handle_status_color(info)
         w = BLOCK_PAD * 2 + f_icon.measure(ICON_HIT) + 5 + f_num.measure(hit_txt)
         _apply_handle_geometry(w)
         canvas.create_rectangle(0, 0, w, 1, fill=EDGE_LINE, outline="")
         tx = BLOCK_PAD
         cy = HANDLE_H / 2.0
         canvas.create_text(tx, cy, text=ICON_HIT, font=ICON_FONT,
-                           fill=ACCENT_GREEN, anchor="w", tags=("hdl",))
+                           fill=icon_color, anchor="w", tags=("hdl",))
         tx += f_icon.measure(ICON_HIT) + 5
         canvas.create_text(tx, cy, text=hit_txt, font=FONT_NUM,
                            fill=ACCENT_GREEN, anchor="w", tags=("hdl",))
@@ -3618,7 +3772,7 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
             cx = win_w - CLOSE_RESERVE_W - 6
             canvas.create_text(cx, ROW2_TURN_Y, text=cum_txt, font=FONT_DIM,
                                fill=FG_DIM, anchor="e", tags=("m_cum",))
-            bind_hover("m_cum", TIP_CUM)
+            bind_hover("m_cum", cum_tooltip(cum))
             if show_note_now:
                 canvas.create_text(cx - f_dim.measure(cum_txt) - 6,
                                    ROW2_TURN_Y, text=SESSION_RECENT_NOTE,
