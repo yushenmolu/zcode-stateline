@@ -4,7 +4,7 @@
 
 > English in one sentence: A ZCode plugin that shows real-time token usage, cache hit rate and speed (duration/TTFT) per conversation — as an in-chat stats line plus a docked status bar, with a `/stats` command for full reports.
 
-- 版本：0.9.6
+- 版本：0.10.0
 - 许可：MIT
 - 平台：Windows（ZCode 桌面版 + Python 3.10+，仅标准库，无第三方依赖）
 
@@ -114,10 +114,20 @@
 - **收起到边缘**：把状态条收成屏幕底部迷你把手（双击状态条同效）。
 - **退出 statusbar**：关闭状态条。
 
+## 变更日志
+
+### 0.10.0
+- 死代码清理：移除 `proxy_server.py` 与 `uia_tab_probe` 实验代码。
+- 状态条隐藏时跳过数据库轮询，空闲不再空转读库。
+- 拆分 `statusbar_layout` / `statusbar_db` 模块，主脚本减重、纯函数可测。
+- 右键新增「复制统计」与「统计报告」。
+- 收起把手按缓存命中率显示状态色。
+- tooltip 数字加千分位，命中率按档位配色。
+- README 与代码行为对齐。
+
 ## 系统要求
 
-- Windows（Win32 API + tkinter，其余平台未适配）。
-- ZCode 桌面版。
+- Windows（Win32 API + tkinter，其余平台未适配）。- ZCode 桌面版。
 - Python 3.10+，仅标准库（json / sqlite3 / tkinter / ctypes），无需 pip 安装任何包。
 - 默认假设 ZCode 数据目录位于 `%USERPROFILE%\.zcode`（数据库 `~\.zcode\cli\db\db.sqlite`）；不一致时用 `ZCODE_HOME` 环境变量（安装脚本）或 `--db-path` 参数（状态条）覆盖。
 

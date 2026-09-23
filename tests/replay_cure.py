@@ -26,6 +26,7 @@ import tempfile
 
 MOD = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    os.pardir, "scripts", "docked_statusbar.py")
+sys.path.insert(0, os.path.dirname(MOD))
 spec = importlib.util.spec_from_file_location("docked_statusbar_test_mod", MOD)
 m = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = m

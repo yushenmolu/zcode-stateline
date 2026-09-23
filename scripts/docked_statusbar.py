@@ -394,7 +394,7 @@ except Exception:
 # 常量
 # ---------------------------------------------------------------------------
 
-STATUSBAR_VERSION = "0.9.6"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.10.0"  # 自证版本：肉眼可确认状态条运行的是本版代码
 DATA_DIR_DEFAULT = os.path.join(
     os.path.expanduser(r"~/.zcode/cli/plugins/data"),
     "local", "zcode-token-stats",
