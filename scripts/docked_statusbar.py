@@ -915,6 +915,16 @@ def valid_and_clamped_handle_xy(xy, work_area,
     return fx, fy
 
 
+def hidden_skip_refresh(state):
+    """完全不可见（state["shown"] 为假）时跳过数据组装（Stage 2 性能）：
+    窗口被 set_visible(False)/SW_HIDE 后，每秒一拍仍全量跑 6-8 条 DB 查询
+    纯属浪费。判定只认 shown——收起把手（collapsed）时把手仍要显示缓存率
+    数字，依赖本拍数据，此时 shown 恒为 True，不会被跳过。隐藏期间
+    last_info/db_read_count 保持不动；恢复可见由 set_visible 置
+    db_read_count=0，下一拍自然全量重读，不残留旧数据。"""
+    return not state.get("shown", True)
+
+
 def collapsed_poll_decision(state, cfg, bar_w, alive, zcode_hwnd,
                             is_iconic, current_xy, work_area,
                             valid_and_clamped, default_dock, on_err):
@@ -4810,6 +4820,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                     pass
         except Exception:
             pass
+        # 完全不可见（SW_HIDE）：配置热加载照走，数据组装（jsonl/DB 共 6-8
+        # 条查询/拍）整段跳过。收起把手不在此列——把手 shown 恒为 True。
+        if hidden_skip_refresh(state):
+            return
         try:
             # N6 性能：逐秒全量解析改走指纹缓存，文件未变时复用上次结果
             rows, _err = read_jsonl_cached(os.path.join(data_dir, JSONL_NAME))
@@ -4933,6 +4947,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         if show == state["shown"]:
             return
         state["shown"] = show
+        if show:
+            # 恢复可见：强制下一拍全量重读（隐藏期间跳过数据组装，model/title
+            # 等缓存可能陈旧），自然补读出新数据，不残留旧值
+            state["db_read_count"] = 0
         try:
             if show:
                 win().show_window(hwnd, SW_SHOWNOACTIVATE)
