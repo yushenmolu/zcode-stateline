@@ -22,6 +22,8 @@ import docked_statusbar as dsb
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "scripts", "docked_statusbar.py")
+_SRC_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "scripts", "statusbar_db.py")
 
 S = dsb.time_ms  # 便于按「距今多少秒」构造时刻
 
@@ -556,12 +558,17 @@ class TestSourceFilterContract(unittest.TestCase):
 
     @staticmethod
     def _body(name):
-        with open(_SRC, encoding="utf-8") as f:
-            src = f.read()
-        tree = ast.parse(src)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == name)
-        return ast.get_source_segment(src, fn) or ""
+        # DB 查询层已抽至 scripts/statusbar_db.py（Stage 3 Step 2）：函数可能在
+        # 两个源文件之一，两处都找，锁定的是「函数体含/不含某口径」这一契约。
+        for path in (_SRC, _SRC_DB):
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            tree = ast.parse(src)
+            fn = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == name), None)
+            if fn is not None:
+                return ast.get_source_segment(src, fn) or ""
+        raise AssertionError("函数 %s 在 docked_statusbar.py 与 statusbar_db.py 均未找到" % name)
 
     def test_speed_and_live_queries_filter_sources(self):
         for name in ("db_latest_speed", "db_session_speed", "live_turn_stats",
