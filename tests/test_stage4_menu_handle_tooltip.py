@@ -17,13 +17,17 @@ import docked_statusbar as dsb
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "scripts", "docked_statusbar.py")
+# Round2 Step 5：右键菜单与其 handler 随 run_gui 闭包提为
+# statusbar_gui.StatusBarApp 方法，存在性静态断言改钉 statusbar_gui 源码。
+_SRC_GUI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "scripts", "statusbar_gui.py")
 
 
 class TestMenuItemsExist(unittest.TestCase):
     """右键菜单必须包含两个新项，并接到对应 handler（静态断言）。"""
 
     def setUp(self):
-        with open(_SRC, "r", encoding="utf-8") as f:
+        with open(_SRC_GUI, "r", encoding="utf-8") as f:
             self.src = f.read()
 
     def test_copy_menu_item(self):

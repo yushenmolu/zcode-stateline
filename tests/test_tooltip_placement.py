@@ -147,7 +147,10 @@ class TestShowTooltipWiring(unittest.TestCase):
 
     def test_source_uses_the_pure_placer(self):
         import inspect
-        src = inspect.getsource(dsb.run_gui)
+        import statusbar_gui
+        # Round2 Step 5：show_tooltip 随 run_gui 闭包提为 StatusBarApp 方法，
+        # 接线断言改钉 statusbar_gui 源码（原 dsb.run_gui 函数体已搬迁）。
+        src = inspect.getsource(statusbar_gui)
         self.assertIn("tooltip_placement(", src)
         self.assertNotIn("wb - th - 4", src)
 

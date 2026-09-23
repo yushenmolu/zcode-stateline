@@ -22,6 +22,10 @@ import docked_statusbar as dsb
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "scripts", "docked_statusbar.py")
+# Round2 Step 5：refresh_once / render_ui 随 run_gui 闭包提为
+# statusbar_gui.StatusBarApp 方法，AST 接线断言改钉 statusbar_gui 源码。
+_SRC_GUI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "scripts", "statusbar_gui.py")
 
 
 class TestSpeedHold(unittest.TestCase):
@@ -141,7 +145,7 @@ class TestWiring(unittest.TestCase):
 
     @staticmethod
     def _body(name):
-        with open(_SRC, encoding="utf-8") as f:
+        with open(_SRC_GUI, encoding="utf-8") as f:
             src = f.read()
         tree = ast.parse(src)
         fn = next(n for n in ast.walk(tree)

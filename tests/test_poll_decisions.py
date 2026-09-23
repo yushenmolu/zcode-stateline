@@ -297,7 +297,10 @@ class TestWiring(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.src = inspect.getsource(dsb.run_gui)
+        # Round2 Step 5：run_gui 闭包提为 statusbar_gui.StatusBarApp 方法，
+        # 接线断言改钉 statusbar_gui 模块源码（原 dsb.run_gui 函数体已搬迁）。
+        import statusbar_gui
+        cls.src = inspect.getsource(statusbar_gui)
 
     def test_poll_uses_the_pure_decisions(self):
         self.assertIn("expanded_poll_decision(", self.src)
@@ -313,12 +316,15 @@ class TestWiring(unittest.TestCase):
             self.assertNotIn(dead, self.src)
 
     def test_gesture_and_dock_dependencies_are_injected(self):
-        """判定不再隐式读闭包：手势/工作区/dock 全部由调用方喂进来。"""
-        self.assertIn("is_iconic=win().is_iconic", self.src)
-        self.assertIn("rect_of=window_rect_of", self.src)
-        self.assertIn("foreground=is_foreground_zcode", self.src)
-        self.assertIn("dock=dock_rect", self.src)
-        self.assertIn("hand_gesture.press_xy is not None", self.src)
+        """判定不再隐式读闭包：手势/工作区/dock 全部由调用方喂进来。
+        Round2 Step 5 方法化后：win()/模块函数经 deps 桥接（deps.win() /
+        deps.window_rect_of / deps.is_foreground_zcode / deps.dock_rect），
+        手势状态机经 self.hand_gesture 访问。"""
+        self.assertIn("is_iconic=self._win().is_iconic", self.src)
+        self.assertIn("rect_of=deps.window_rect_of", self.src)
+        self.assertIn("foreground=deps.is_foreground_zcode", self.src)
+        self.assertIn("dock=deps.dock_rect", self.src)
+        self.assertIn("self.hand_gesture.press_xy is not None", self.src)
 
     def test_collapsed_drag_fix_is_wired(self):
         """修好跟手要同时满足三件事：偏移冻结、按下作废、poll 拖动期不吸回。"""
@@ -326,8 +332,9 @@ class TestWiring(unittest.TestCase):
         self.assertIn('state["handle_drag_offset"] = None', self.src)   # drag_start
         self.assertIn('state["handle_drag_offset"] = off', self.src)    # drag_move
         # poll 的拖动守卫原先只看 state["dragging"]（完整态），收起态每拍都会
-        # 把手拽回记忆/默认位；0.9.6 起补上手势机的 dragging。
-        self.assertIn('if state.get("dragging") or hand_gesture.dragging:',
+        # 把手拽回记忆/默认位；0.9.6 起补上手势机的 dragging（方法化后经
+        # self.hand_gesture / 局部别名 hg 访问，语义等价）。
+        self.assertIn('if state.get("dragging") or hg.dragging:',
                       self.src)
 
 

@@ -82,6 +82,22 @@ NAMES_CONFIG = [
     "save_config_keys", "save_config_show_keys",
 ]
 
+# Round2 Step 5：statusbar_gui（GUI 应用层：原 run_gui 闭包提为 StatusBarApp）
+NAMES_GUI = [
+    "StatusBarApp",
+    "_run_gui_impl",
+]
+
+# statusbar_gui 只能经 deps 桥接访问的主文件助手名（R3-001 回归）：
+# 抽类时这些名字曾被裸用（漏 deps. 前缀），运行即 NameError——但单测全绿，
+# 因为 re-export 测试不覆盖 gui 模块内部裸名。此处固化为 AST 级契约：
+# statusbar_gui.py 源码中禁止出现这些名字的裸 Load（必须 deps.<name>）。
+GUI_DEPS_ONLY_NAMES = [
+    "clamp_to_work_area", "work_area_of_rect",
+    "_cleanup_pid", "_hit_rate", "_truncate", "format_tokens",
+    "round_rect", "plan_statusbar_layout_3zone",
+]
+
 
 def _assert_all_present(testcase, names, module_label):
     """逐个断言 dsb.<name> 存在；缺失时一次性列出全部缺名（不第一个就停）。"""
@@ -110,10 +126,13 @@ class TestReexportCompat(unittest.TestCase):
     def test_config_names_reexported(self):
         _assert_all_present(self, NAMES_CONFIG, "statusbar_config")
 
+    def test_gui_names_reexported(self):
+        _assert_all_present(self, NAMES_GUI, "statusbar_gui")
+
     def test_private_underscore_names_reexported(self):
         """下划线私有名是 import * 的盲区，单列一组盯住（P1-001 教训）。"""
         private = [n for n in (NAMES_LAYOUT + NAMES_DB + NAMES_STATUS
-                               + NAMES_SESSION + NAMES_CONFIG)
+                               + NAMES_SESSION + NAMES_CONFIG + NAMES_GUI)
                    if n.startswith("_")]
         # 至少要有我们已知的私有名；清单里若一个都没有，说明清单本身漏了
         self.assertTrue(private, "清单里应至少包含一个下划线私有名")
@@ -124,16 +143,43 @@ class TestReexportCompat(unittest.TestCase):
         import statusbar_status
         import statusbar_session
         import statusbar_config
+        import statusbar_gui
         for mod, expected, label in (
                 (statusbar_status, NAMES_STATUS, "statusbar_status"),
                 (statusbar_session, NAMES_SESSION, "statusbar_session"),
-                (statusbar_config, NAMES_CONFIG, "statusbar_config")):
+                (statusbar_config, NAMES_CONFIG, "statusbar_config"),
+                (statusbar_gui, NAMES_GUI, "statusbar_gui")):
             declared = set(mod.__all__)
             want = set(expected)
             self.assertEqual(declared - want, set(),
                              "%s.__all__ 里多出了清单外的名字" % label)
             self.assertEqual(want - declared, set(),
                              "%s.__all__ 漏掉了清单里的名字" % label)
+
+    def test_gui_uses_deps_prefix_for_mainfile_helpers(self):
+        """statusbar_gui 对主文件助手名必须 deps. 前缀（R3-001：裸名运行即
+        NameError，bar 永远 hidden at (0,0)，但单测全绿——AST 级补盲）。"""
+        import ast
+        gui_path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "scripts", "statusbar_gui.py")
+        with open(gui_path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        bare = sorted({n.id for n in ast.walk(tree)
+                       if isinstance(n, ast.Name)
+                       and isinstance(n.ctx, ast.Load)
+                       and n.id in GUI_DEPS_ONLY_NAMES})
+        self.assertEqual([], bare,
+                         "statusbar_gui 裸用了主文件助手名（应 deps. 前缀）：%s"
+                         % bare)
+        # 反向：deps.<name> 访问的名字必须真在 docked_statusbar 上存在
+        accessed = sorted({n.attr for n in ast.walk(tree)
+                           if isinstance(n, ast.Attribute)
+                           and isinstance(n.value, ast.Name)
+                           and n.value.id == "deps"})
+        missing = [a for a in accessed if not hasattr(dsb, a)]
+        self.assertEqual([], missing,
+                         "statusbar_gui 经 deps 访问了主文件不存在的名字：%s"
+                         % missing)
 
 
 if __name__ == "__main__":
