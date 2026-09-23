@@ -93,23 +93,23 @@
 
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
-| `show_model` | `true` | 第一行显示模型名 |
+| `show_status` | `true` | 状态徽标段开关（右键「显示项」可切换） |
+| `show_recent_turn` | `true` | 本轮统计段开关（右键「显示项」可切换） |
+| `show_cumulative` | `true` | 会话累计段开关（右键「显示项」可切换） |
+| `show_model` | `true` | 第一行徽标旁显示模型名 |
 | `show_session` | `true` | 第一行显示会话标题 |
-| `show_avg_duration` | `true` | 第二行显示平均耗时 ⏱ |
-| `show_input` | `true` | 第二行显示输入 token 累计（in） |
-| `show_output` | `true` | 第二行显示输出 token 累计（out） |
-| `show_cache_read` | `true` | 第二行显示缓存读取 token（cache read） |
-| `show_cache_hit` | `true` | 第二行显示缓存命中率（绿色，含微型进度条）；0.9.4 起同一个开关也控制右侧会话累计段的 `hit` |
-| `show_speed` | `true` | ⚡ 数值段开关（0.9.1 起真的生效）：生成中 / 工具中在第二行「本轮统计」尾部显示 ⚡ X.X tok/s（最近一次完成回复的输出 token ÷ 耗时；小号灰字，0.4.3 起不再用橙色主显示） |
-| `show_reasoning` | `false` | 第二行显示思考 token（reasoning，紫色） |
+| `show_cache_hit` | `true` | 会话累计段的 `hit x.x%` 开关（命中率数字按档位分色：<50% 黄、50–80% 绿、≥80% 亮绿） |
+| `show_speed` | `true` | ⚡ 数值段开关（0.9.1 起真的生效）：生成中 / 工具中在第二行「本轮统计」尾部显示 ⚡ X.X tok/s（最近一次完成回复的输出 token ÷ 耗时；小号灰字） |
 | `show_live` | `true` | 状态徽标与生成中速度段的显示开关（0.6.0 起，默认开；0.3.0 的实时流视图已停用） |
 | `collapsed` | `false` | 状态条收起为底部迷你把手（双击/右键收起，悬停/单击展开；重启保持） |
 | `refresh_ms` | `1000` | 刷新/贴边轮询间隔毫秒（250–60000） |
 | `theme` | `"dark"` | 主题（当前仅 dark） |
 
+> 旧指标块时代的 `show_avg_duration` / `show_input` / `show_output` / `show_cache_read` / `show_reasoning` 键仍保留在配置文件中兼容旧配置，但 0.4.0 三区改版后不再对应状态栏可见区域（仅 `--once` CLI 输出仍按这些键裁剪），已从本表移除。
+
 ### 右键菜单
 
-- **显示项**：10 个指标开关（模型/会话/耗时/输入/输出/缓存命中/缓存读取/速度 tok/s/推理/状态徽标），勾选即显隐，立即重画并自动写回配置。
+- **显示项**：3 个三区开关（状态徽标 / 本轮统计 / 会话累计，对应配置键 `show_status` / `show_recent_turn` / `show_cumulative`），勾选即显隐，立即重画并自动写回配置。
 - **重新贴边**：拖动过后恢复自动跟随 ZCode 窗口底部。
 - **收起到边缘**：把状态条收成屏幕底部迷你把手（双击状态条同效）。
 - **退出 statusbar**：关闭状态条。

@@ -457,6 +457,8 @@ FG = "#e6e8eb"          # 主文字（对 BG 对比度 ~13:1，过 AA）
 FG_DIM = "#9aa1aa"      # 次要文字 / 标签（~5.8:1，过 AA）
 ACCENT_BLUE = "#4f9cf7" # 强调色（模型名 / 第一行小圆点）
 ACCENT_GREEN = "#3fb68b"# 命中率 / 省钱（绿）
+ACCENT_GREEN_HI = "#56d364"  # 命中率高档（>=80%，亮绿）
+ACCENT_YELLOW = "#d29922"    # 命中率低档（<50%，黄）
 SEP_COLOR = "#3a4048"   # 分隔线 / `·` 灰
 EDGE_LINE = "#2a2f38"   # 顶部 1px 分隔线（提质感）
 CLOSE_HOVER_BG = "#e5534b"  # close 悬停红
@@ -1910,6 +1912,17 @@ def handle_status_color(info):
     return STATUS_COLORS.get(status, STATUS_COLORS["idle"])
 
 
+def cache_hit_color(pct):
+    """命中率数字的分档配色（纯函数）：<50% 黄、50-80% 维持原绿、>=80% 亮绿。
+    主显示（build_line2_parts）与收起把手（_render_handle）统一走这里，
+    与把手 ◐ 图标的状态色（handle_status_color）互不干扰。"""
+    if pct < 50.0:
+        return ACCENT_YELLOW
+    if pct < 80.0:
+        return ACCENT_GREEN
+    return ACCENT_GREEN_HI
+
+
 def build_stats_line(rows, db_path=None, session_id=None, conn=None):
     """
     聚合统计。**数据源优先级改为 db 优先**：db 行级聚合（模型调用完成即
@@ -2151,7 +2164,8 @@ def build_line2_parts(stats, cfg):
                       u"\u7f13\u5b58\u8bfb\u53d6 \u00f7 \u8f93\u5165\u603b\u91cf"
                       u"\uff08\u8f93\u5165\u5df2\u542b\u7f13\u5b58\u8bfb\u53d6"
                       u"\u90e8\u5206\uff09\uff0c\u8d8a\u9ad8\u8d8a\u7701\u94b1"))
-        parts.append(("cache", u"hit %.1f%%" % hit, FONT_NUM, ACCENT_GREEN, None))
+        parts.append(("cache", u"hit %.1f%%" % hit, FONT_NUM,
+                      cache_hit_color(hit), None))
     if show_cache_read:
         # cache read 与 cache hit 独立开关：两者都开时分开显示（红/蓝数字），
         # 均符合"关键数字等宽 + 主题色"规范。
@@ -3576,9 +3590,10 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
         ~72x18 深底小把手 + 顶部 1px 分隔线 + 「◐ 84.9%」浓缩缓存命中率
         （绿字）；悬停 0.5s / 单击展开（单击经 drag_stop 位移判定走 expand）。"""
         stats = (info or {}).get("stats")
-        hit_txt = (u"%.1f%%" % _hit_rate(stats)) if stats else u"—"
+        hit_pct = _hit_rate(stats) if stats else 0.0
+        hit_txt = (u"%.1f%%" % hit_pct) if stats else u"—"
         # ◐ 图标颜色跟随当前状态色（STATUS_COLORS）：收起态也能看出当前状态；
-        # 命中率数字保持绿字（与展开态口径一致）。
+        # 命中率数字按命中率档位分色（cache_hit_color，与展开态口径一致）。
         icon_color = handle_status_color(info)
         w = BLOCK_PAD * 2 + f_icon.measure(ICON_HIT) + 5 + f_num.measure(hit_txt)
         _apply_handle_geometry(w)
@@ -3589,7 +3604,8 @@ def run_gui(data_dir, db_path, refresh_ms, cfg, config_path=None,
                            fill=icon_color, anchor="w", tags=("hdl",))
         tx += f_icon.measure(ICON_HIT) + 5
         canvas.create_text(tx, cy, text=hit_txt, font=FONT_NUM,
-                           fill=ACCENT_GREEN, anchor="w", tags=("hdl",))
+                           fill=cache_hit_color(hit_pct), anchor="w",
+                           tags=("hdl",))
 
         def _enter(_e):
             # 仅当已武装（leave->enter 后）才排悬停展开；arm 事件会立刻 consume，
