@@ -265,42 +265,43 @@ class TestRequestProfileText(unittest.TestCase):
         self.assertIn(u"本轮 4 次请求", txt)
         self.assertIn(u"无冷读", txt)
 
-    def test_turn_tooltip_always_keeps_the_static_part(self):
-        self.assertEqual(dsb.turn_tooltip(None), dsb.TIP_TURN)
-        self.assertEqual(dsb.turn_tooltip({}), dsb.TIP_TURN)
+    def test_turn_tooltip_no_legend_line(self):
+        """0.11.2：口径说明行彻底删除，无数据时 tooltip 为空串（不弹气泡）。"""
+        self.assertEqual(dsb.turn_tooltip(None), u"")
+        self.assertEqual(dsb.turn_tooltip({}), u"")
         full = dsb.turn_tooltip({"modelCallCount": 2, "coldReadCount": 1})
-        self.assertTrue(full.endswith(dsb.TIP_TURN))  # 0.11.1：口径说明置底
+        self.assertNotIn(u"口径：", full)
         self.assertIn(u"本轮 2 次请求", full)
 
-    def test_turn_tooltip_numbers_before_legend(self):
-        """0.11.1：精确值/占用/成本/请求画像都在口径说明之前。"""
+    def test_turn_tooltip_numbers_only(self):
+        """0.11.2：tooltip 只剩数字行——精确/占用/成本/请求画像都在，无口径行。"""
         cfg = {"show_cost": True, "context_window": {"kimi-k3": 262144},
                "model_prices": {"kimi-k3": {"input": 4.0, "output": 16.0}}}
         ts = {"inputTokens": 1000000, "outputTokens": 500000,
               "modelCallCount": 2, "coldReadCount": 1}
         tip = dsb.turn_tooltip(ts, latest_input=131072, model="kimi-k3", cfg=cfg)
-        legend_pos = tip.index(dsb.TIP_TURN)
-        self.assertLess(tip.index(u"精确：in 1,000,000"), legend_pos)
-        self.assertLess(tip.index(u"50.0%"), legend_pos)
-        self.assertLess(tip.index(u"≈¥12.00"), legend_pos)
-        self.assertLess(tip.index(u"本轮 2 次请求"), legend_pos)
-        # 口径说明压缩为一行
-        self.assertEqual(tip.count(u"\n\n"), 1)
-        self.assertNotIn(u"\n", dsb.TIP_TURN)
+        self.assertNotIn(u"口径：", tip)
+        self.assertIn(u"精确：in 1,000,000", tip)
+        self.assertIn(u"50.0%", tip)
+        self.assertIn(u"≈¥12.00", tip)
+        self.assertIn(u"本轮 2 次请求", tip)
+        # 数字行之间不夹空行
+        self.assertNotIn(u"\n\n", tip)
 
-    def test_cum_tooltip_numbers_before_legend(self):
-        """0.11.1：今日行/精确行/成本都在口径说明之前。"""
+    def test_cum_tooltip_numbers_only(self):
+        """0.11.2：tooltip 只剩数字行——今日/精确/成本都在，无口径行。"""
         cfg = {"show_cost": True,
                "model_prices": {"kimi-k3": {"input": 4.0, "output": 16.0}}}
         st = {"inputTokens": 1000000, "outputTokens": 500000}
         td = {"inputTokens": 3000, "outputTokens": 1000, "cacheReadTokens": 1500}
         tip = dsb.cum_tooltip(st, today=td, model="kimi-k3", cfg=cfg)
-        legend_pos = tip.index(dsb.TIP_CUM)
-        self.assertLess(tip.index(u"今日"), legend_pos)
-        self.assertLess(tip.index(u"精确：in 1,000,000"), legend_pos)
-        self.assertLess(tip.index(u"≈¥12.00"), legend_pos)
-        self.assertTrue(tip.endswith(dsb.TIP_CUM))
-        self.assertNotIn(u"\n", dsb.TIP_CUM)
+        self.assertNotIn(u"口径：", tip)
+        self.assertIn(u"今日", tip)
+        self.assertIn(u"精确：in 1,000,000", tip)
+        self.assertIn(u"≈¥12.00", tip)
+        self.assertNotIn(u"\n\n", tip)
+        # 无数据时为空串（不弹气泡）
+        self.assertEqual(dsb.cum_tooltip(None), u"")
 
 
 class TestCumulativeHit(unittest.TestCase):

@@ -103,9 +103,10 @@ class TestPlacementFallbacks(unittest.TestCase):
 class TestTipCopyBudget(unittest.TestCase):
     """文案闸：气泡不再压住小条，但一屏长的段落照样读不动（同一反馈的另一半）。"""
 
-    def test_static_tips_fit_the_budget(self):
-        self.assertLessEqual(len(dsb.TIP_TURN), dsb.TIP_MAX_CHARS)
-        self.assertLessEqual(len(dsb.TIP_CUM), dsb.TIP_MAX_CHARS)
+    def test_no_data_tooltip_is_empty(self):
+        """0.11.2：口径说明行已删，无数据时 tooltip 为空串（不弹气泡）。"""
+        self.assertEqual(dsb.turn_tooltip(None), u"")
+        self.assertEqual(dsb.cum_tooltip(None), u"")
 
     def test_profile_line_stays_one_short_sentence(self):
         txt = dsb.turn_request_profile_text({"modelCallCount": 12,
@@ -125,7 +126,8 @@ class TestTipCopyBudget(unittest.TestCase):
             self.skipTest("无可用显示（Tk 初始化失败）")
         try:
             texts = [dsb.turn_tooltip({"modelCallCount": 2, "coldReadCount": 1}),
-                     dsb.TIP_CUM,
+                     dsb.cum_tooltip({"inputTokens": 1000000,
+                                      "outputTokens": 500000}),
                      dsb.status_badge_tip(
                          "error", {"status": "error",
                                    "errorType": "upstream_stream_disconnected",

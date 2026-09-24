@@ -480,10 +480,6 @@ BADGE_GAP_STEPS = (8, 6, 4)   # 徽标-标题间距收缩档位（超宽时其�
 
 # ---- 本轮统计 / 会话累计（0.4.0 第二行 + 右侧小字）----
 ROW2_TURN_Y = 40              # 第二行（本轮统计 / 累计小字）文字垂直中心
-TIP_TURN = (u"口径：「实时」即时聚合 / 无标记权威统计 /「上一轮」未落库 /"
-            u"「上次」收尾保留 60s；⚡为最近完成调用速度；「工具 N · 错 M」为本轮工具数与报错数。")
-TIP_CUM = (u"口径：hit = 缓存读取 ÷ 输入总量，只算 completed 行；"
-           u"累计含 compact 等后台调用，与中转面板（含全部流量）口径不同。")
 # TIP_EDGE_GAP 已移至 statusbar_layout。
 # 文案长度上限（0.9.4：气泡不再压住小条后，第二道闸是「别长到占半屏」）。
 # 520px 换行 + FONT_DIM 实测：175 字 ≈ 4 行 ≈ 82px，加冷读画像句 ≈ 116px。
@@ -924,11 +920,9 @@ def turn_request_profile_text(ts):
 
 
 def turn_tooltip(ts, latest_input=None, model=None, cfg=None):
-    """本轮段 tooltip：关键数字前置，口径说明压缩为一行置底。
+    """本轮段 tooltip：只留数字行（0.11.2 起删去垫底口径说明行）。
 
-    0.11.1 重排（同一反馈：数字沉底读不到）：
-      精确行 -> 占用率 -> 成本 -> 请求画像 ->（空行）口径一行。
-      无数据时只剩口径说明一行。
+      精确行 -> 占用率 -> 成本 -> 请求画像。无数据时为空串，不弹气泡。
     """
     parts = []
     exact = _exact_io_line(ts)
@@ -943,17 +937,13 @@ def turn_tooltip(ts, latest_input=None, model=None, cfg=None):
     extra = turn_request_profile_text(ts)
     if extra:
         parts.append(extra)
-    if parts:
-        parts.append(u"")  # 数字与口径说明之间空一行
-    parts.append(TIP_TURN)
     return u"\n".join(parts)
 
 
 def cum_tooltip(stats, today=None, model=None, cfg=None):
-    """会话累计 tooltip：关键数字前置，口径说明压缩为一行置底。
+    """会话累计 tooltip：只留数字行（0.11.2 起删去垫底口径说明行）。
 
-    0.11.1 重排：今日行 -> 精确行（会话累计）-> 成本 ->（空行）口径一行。
-    无数据时只剩口径说明一行。
+      今日行 -> 精确行（会话累计）-> 成本。无数据时为空串，不弹气泡。
     """
     parts = []
     tt = today_text(today)
@@ -965,9 +955,6 @@ def cum_tooltip(stats, today=None, model=None, cfg=None):
     c = estimate_cost(stats, model, cfg)
     if c is not None:
         parts.append(u"累计成本 " + cost_text(c) + u"（按单价表估算）。")
-    if parts:
-        parts.append(u"")  # 数字与口径说明之间空一行
-    parts.append(TIP_CUM)
     return u"\n".join(parts)
 
 

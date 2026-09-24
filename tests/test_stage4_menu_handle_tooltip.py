@@ -119,8 +119,9 @@ class TestTooltipThousandSeparators(unittest.TestCase):
         self.assertIn("2,046,123", tip)
         self.assertIn("5,678", tip)
 
-    def test_cum_tooltip_none_is_plain_tip(self):
-        self.assertEqual(dsb.cum_tooltip(None), dsb.TIP_CUM)
+    def test_cum_tooltip_none_is_empty(self):
+        """0.11.2：口径说明行已删，无数据时 tooltip 为空串（不弹气泡）。"""
+        self.assertEqual(dsb.cum_tooltip(None), u"")
 
     def test_main_display_still_abbreviated(self):
         self.assertEqual(dsb.format_tokens(2046123), "2.0M")
