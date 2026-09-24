@@ -350,10 +350,12 @@ class TestStickyUsesToolSignal(unittest.TestCase):
                                  started_ago=150)] if with_tool else [])
 
     def _resolve(self, rows=()):
-        with mock.patch.object(dsb, "tail_session_resume",
-                               return_value=(None, 0)):
-            return dsb.resolve_session_sticky({}, list(rows), self.data,
-                                              self.db)
+        # 直接调 resolve_session_sticky 不经 resolve_gui_info 的 dsb 透传，
+        # patch.object(dsb, "tail_session_resume") 落空会读真实日志目录——
+        # 注入确定性 read_resume 让测试与机器环境状态无关。
+        return dsb.resolve_session_sticky({}, list(rows), self.data,
+                                          self.db,
+                                          read_resume=lambda state: (None, 0))
 
     def test_all_other_signals_expired_tool_signal_wins(self):
         self.assertEqual(self._resolve(), ("sess_a", "tool"))
