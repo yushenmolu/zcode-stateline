@@ -480,17 +480,10 @@ BADGE_GAP_STEPS = (8, 6, 4)   # 徽标-标题间距收缩档位（超宽时其�
 
 # ---- 本轮统计 / 会话累计（0.4.0 第二行 + 右侧小字）----
 ROW2_TURN_Y = 40              # 第二行（本轮统计 / 累计小字）文字垂直中心
-TIP_TURN = (u"本轮统计：本轮的耗时 / in / out / cache hit（不是会话累计）。"
-            u"「实时」= 本轮已完成调用的即时聚合；无标记 = 本轮权威统计；"
-            u"「上一轮」= 本轮还没有数据落库；「上次」= 收尾后 60 秒内保留的末值。"
-            u"⚡ = 本轮最近一次已完成调用的 tok/s（不是当前流的实时速度）；"
-            u"「工具 N · 错 M」= 本轮工具调用数与其中报错数。")
-TIP_CUM = (u"会话累计：本会话全部轮次的 in / out / hit。"
-           u"hit = 缓存读取 ÷ 输入总量，与本轮段同一公式，只算 completed 行；"
-           u"靠边收起后把手上的 ◐ 就是这一个数。"
-           u"累计含 compact / 会话标题这类后台调用（本轮段把它们滤掉了）。"
-           u"与中转面板不等是总体不同：那边含全部流量（subagent 占大半、"
-           u"命中率普遍更高），这边只算当前会话。")
+TIP_TURN = (u"口径：「实时」即时聚合 / 无标记权威统计 /「上一轮」未落库 /"
+            u"「上次」收尾保留 60s；⚡为最近完成调用速度；「工具 N · 错 M」为本轮工具数与报错数。")
+TIP_CUM = (u"口径：hit = 缓存读取 ÷ 输入总量，只算 completed 行；"
+           u"累计含 compact 等后台调用，与中转面板（含全部流量）口径不同。")
 # TIP_EDGE_GAP 已移至 statusbar_layout。
 # 文案长度上限（0.9.4：气泡不再压住小条后，第二道闸是「别长到占半屏」）。
 # 520px 换行 + FONT_DIM 实测：175 字 ≈ 4 行 ≈ 82px，加冷读画像句 ≈ 116px。
@@ -931,47 +924,51 @@ def turn_request_profile_text(ts):
 
 
 def turn_tooltip(ts, latest_input=None, model=None, cfg=None):
-    """本轮段 tooltip：固定说明 + 精确千分位 in/out + 该轮的请求级画像
-    （无计数时只有固定说明）。
+    """本轮段 tooltip：关键数字前置，口径说明压缩为一行置底。
 
-    0.11.0 追加（全部可选、缺省不改变旧行为）：
-      - latest_input + cfg 给出时追加「最近一次调用 input 占上下文窗口 N%」；
-      - cfg["show_cost"] 开且能按 model_prices 估价时追加「≈¥X.XX」（本轮成本）。
+    0.11.1 重排（同一反馈：数字沉底读不到）：
+      精确行 -> 占用率 -> 成本 -> 请求画像 ->（空行）口径一行。
+      无数据时只剩口径说明一行。
     """
-    tip = TIP_TURN
+    parts = []
     exact = _exact_io_line(ts)
     if exact:
-        tip += u"\n" + exact
-    extra = turn_request_profile_text(ts)
-    if extra:
-        tip += u"\n" + extra
+        parts.append(exact)
     occ = context_occupancy_text(latest_input, model, cfg)
     if occ:
-        tip += u"\n" + occ
+        parts.append(occ)
     c = estimate_cost(ts, model, cfg)
     if c is not None:
-        tip += u"\n" + u"本轮成本 " + cost_text(c) + u"（按单价表估算）。"
-    return tip
+        parts.append(u"本轮成本 " + cost_text(c) + u"（按单价表估算）。")
+    extra = turn_request_profile_text(ts)
+    if extra:
+        parts.append(extra)
+    if parts:
+        parts.append(u"")  # 数字与口径说明之间空一行
+    parts.append(TIP_TURN)
+    return u"\n".join(parts)
 
 
 def cum_tooltip(stats, today=None, model=None, cfg=None):
-    """会话累计 tooltip：固定说明 + 精确千分位 in/out（stats 为 None 只有固定说明）。
+    """会话累计 tooltip：关键数字前置，口径说明压缩为一行置底。
 
-    0.11.0 追加（全部可选、缺省不改变旧行为）：
-      - today 给出时追加「今日：in X · out Y · hit Z%」（全库今日聚合，跨会话）；
-      - cfg["show_cost"] 开且能按 model_prices 估价时追加「≈¥X.XX」（会话累计成本）。
+    0.11.1 重排：今日行 -> 精确行（会话累计）-> 成本 ->（空行）口径一行。
+    无数据时只剩口径说明一行。
     """
-    tip = TIP_CUM
-    exact = _exact_io_line(stats)
-    if exact:
-        tip += u"\n" + exact
+    parts = []
     tt = today_text(today)
     if tt:
-        tip += u"\n" + tt
+        parts.append(tt)
+    exact = _exact_io_line(stats)
+    if exact:
+        parts.append(exact + u"（会话累计）")
     c = estimate_cost(stats, model, cfg)
     if c is not None:
-        tip += u"\n" + u"累计成本 " + cost_text(c) + u"（按单价表估算）。"
-    return tip
+        parts.append(u"累计成本 " + cost_text(c) + u"（按单价表估算）。")
+    if parts:
+        parts.append(u"")  # 数字与口径说明之间空一行
+    parts.append(TIP_CUM)
+    return u"\n".join(parts)
 
 
 def cumulative_text(stats, show_hit=True):
