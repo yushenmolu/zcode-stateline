@@ -840,18 +840,21 @@ class StatusBarApp(object):
                            fill=deps.cache_hit_color(hit_pct), anchor="w",
                            tags=("hdl",))
 
+        # 把手 tooltip：固定说明 + 今日用量（今日聚合取自 info，无数据时只有固定说明）
+        handle_tip_txt = deps.handle_tip((info or {}).get("today_stats"))
+
         def _enter(_e):
             # 仅当已武装（leave->enter 后）才排悬停展开；冷却期内的 enter
             # 因冷却守卫不排程，小幅度移动不重复武装。
             if state.get("handle_armed", False):
                 self._schedule_hover_expand()      # 悬停 0.5s 自动展开
-            self.tooltip_enter(deps.HANDLE_TIP)    # 「已收起——悬停或单击展开」
+            self.tooltip_enter(handle_tip_txt)     # 「已收起——悬停或单击展开」+今日
 
         def _motion(e):
             if state.get("handle_armed", False):
                 self._schedule_hover_expand()      # Move 刷新（重置）展开计时
             if self._tip_visible():
-                self.show_tooltip(deps.HANDLE_TIP, e.x_root, e.y_root)
+                self.show_tooltip(handle_tip_txt, e.x_root, e.y_root)
 
         def _leave(_e):
             self._cancel_hover_expand()
@@ -935,7 +938,8 @@ class StatusBarApp(object):
                 canvas.create_text(x, y, text=t, font=f, fill=c,
                                    anchor="w", tags=("m_turn",))
                 x += _fmap[f].measure(t)
-            self.bind_hover("m_turn", deps.turn_tooltip(ts))
+            self.bind_hover("m_turn", deps.turn_tooltip(
+                ts, latest_input=info.get("latest_input"), model=model, cfg=cfg))
 
         # ---- 文本拼装 ----
         badge_txt = status_badge_text(status, turn)
@@ -1022,7 +1026,8 @@ class StatusBarApp(object):
             canvas.create_text(cx, deps.ROW2_TURN_Y, text=cum_txt,
                                font=deps.FONT_DIM, fill=deps.FG_DIM, anchor="e",
                                tags=("m_cum",))
-            self.bind_hover("m_cum", deps.cum_tooltip(cum))
+            self.bind_hover("m_cum", deps.cum_tooltip(
+                cum, today=info.get("today_stats"), model=model, cfg=cfg))
             if show_note_now:
                 canvas.create_text(cx - self.f_dim.measure(cum_txt) - 6,
                                    deps.ROW2_TURN_Y,

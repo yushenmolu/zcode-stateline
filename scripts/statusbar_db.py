@@ -29,7 +29,8 @@ __all__ = [
     "recent_turn_stats", "turn_window_left_edge", "live_turn_stats",
     "db_turn_request_profile", "db_session_model_activity_ts",
     "db_tool_activity", "db_recent_tool_activity", "tool_live_ms",
-    "db_latest_speed",
+    "db_latest_speed", "db_today_stats", "db_latest_model_input",
+    "today_start_ms",
 ]
 
 # ---- DB 常量（被本模块查询引用；docked_statusbar 其他部分经 re-export 沿用）----
@@ -771,6 +772,117 @@ def db_latest_speed(db_path, session_id=None, conn=None, since_ms=None):
         if not outp or not dur:
             return None
         return outp / (dur / 1000.0)
+    except Exception:
+        return None
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def today_start_ms(now_ms=None):
+    """今日 0 点的 epoch 毫秒（本地时间）。
+
+    「今日用量」按自然日聚合，边界是本地时区的 0 点——用户看「今天用了多少」
+    对的是日历上的今天，不是 UTC 日。now_ms 缺省取当前时刻（注入便于测试
+    跨日边界）。
+    """
+    import datetime
+    if now_ms is None:
+        now_ms = time_ms()
+    dt = datetime.datetime.fromtimestamp(now_ms / 1000.0)
+    midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.timestamp() * 1000)
+
+
+def db_today_stats(db_path, conn=None, now_ms=None):
+    """今日（本地 0 点起）全库交互来源调用的聚合：in / out / cacheRead / cacheCreation。
+
+    「今日用量」是会话无关的全库口径——用户一天内可能跨多个会话，想知道的是
+    今天总共烧了多少 token，不是某单个会话的。来源过滤同 INTERACTIVE_SOURCE_SQL
+    （排除 subagent / compact / session_title 后台调用），与主显示口径一致。
+
+    返回标准 stats dict 或 None（今日无数据 / 读取失败）：
+      {inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens,
+       reasoningTokens, avgDurationMs}
+    conn 传入时复用（不关闭），否则自开自关。
+    """
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        since = today_start_ms(now_ms)
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+            "COALESCE(SUM(cache_read_input_tokens),0), "
+            "COALESCE(SUM(cache_creation_input_tokens),0), "
+            "COALESCE(SUM(reasoning_tokens),0), "
+            "COALESCE(AVG(duration_ms),0) "
+            "FROM model_usage WHERE status='completed' "
+            "AND started_at >= ? "
+            + INTERACTIVE_SOURCE_SQL,
+            (since,),
+        ).fetchone()
+        if row is None:
+            return None
+        inp, outp, cache_rd, cache_cre, reas, avg_dur = row
+        inp = int(inp or 0)
+        outp = int(outp or 0)
+        cache_rd = int(cache_rd or 0)
+        cache_cre = int(cache_cre or 0)
+        reas = int(reas or 0)
+        if inp == 0 and outp == 0 and cache_rd == 0 and cache_cre == 0:
+            return None
+        return {
+            "inputTokens": inp,
+            "outputTokens": outp,
+            "cacheReadTokens": cache_rd,
+            "cacheCreationTokens": cache_cre,
+            "reasoningTokens": reas,
+            "avgDurationMs": float(avg_dur or 0.0),
+        }
+    except Exception:
+        return None
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def db_latest_model_input(db_path, session_id, conn=None):
+    """该会话最近一次真实模型调用的 input_tokens（int 或 None）。
+
+    「上下文占用率」的分子：一次调用送进模型的 prompt token 数（input_tokens 已含
+    cache_read 部分），占该模型上下文窗口的比例就是「这一轮塞了多满」。取最新一条
+    交互来源 completed 行（ORDER BY started_at DESC, rowid DESC LIMIT 1）。
+
+    返回 None = 无该会话 / 无数据 / 读取失败；返回 0 是合法值（空 prompt 行）。
+    conn 传入时复用（不关闭），否则自开自关。
+    """
+    if not session_id or _is_subagent_sid(session_id):
+        return None
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT input_tokens FROM model_usage WHERE session_id = ? "
+            "AND status='completed' "
+            + INTERACTIVE_SOURCE_SQL +
+            "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
     except Exception:
         return None
     finally:

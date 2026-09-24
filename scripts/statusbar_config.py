@@ -19,6 +19,7 @@ import time
 __all__ = [
     # 常量
     "DEFAULT_CONFIG", "CONFIG_FILE_NAME", "DATA_DIR_DEFAULT", "SHOW_MENU_ITEMS",
+    "DEFAULT_CONTEXT_WINDOW",
     # 错误日志（配置层与 docked_statusbar 其余部分共用，经 re-export 沿用旧名）
     "_log_err",
     # 配置读写
@@ -55,7 +56,28 @@ DEFAULT_CONFIG = {
     "handle_y": None,
     "refresh_ms": 1000,
     "theme": "dark",
+    # ---- 0.11.0 成本估算（默认关）：开启后 tooltip 追加 ≈¥X.XX ----
+    "show_cost": False,
+    # 模型上下文窗口映射（token 数）；查不到用 DEFAULT_CONTEXT_WINDOW。
+    "context_window": {
+        "kimi-k3": 262144,
+        "kimi-k2": 262144,
+        "gpt-5": 400000,
+        "gpt-5.6": 400000,
+        "claude-sonnet-4": 200000,
+        "claude-opus-4": 200000,
+    },
+    # 各模型单价（每百万 token 人民币）：{"model": {"input": x, "output": y}}。
+    # 留示例，用户可按实际改；缺某模型单价时该模型不显示价格（不报错）。
+    "model_prices": {
+        "kimi-k3": {"input": 4.0, "output": 16.0},
+        "gpt-5": {"input": 10.0, "output": 30.0},
+        "claude-sonnet-4": {"input": 22.0, "output": 110.0},
+    },
 }
+
+# 缺省上下文窗口：model 不在 context_window 映射里时的回落值。
+DEFAULT_CONTEXT_WINDOW = 200000
 
 
 def _log_err(data_dir, msg):
@@ -133,6 +155,7 @@ def _apply_raw_config(cfg, raw, skip_collapsed=False):
                 "show_output", "show_cache_read", "show_cache_hit", "show_speed",
                 "show_reasoning", "show_live",
                 "show_status", "show_recent_turn", "show_cumulative",
+                "show_cost",
                 "collapsed"):
         if skip_collapsed and key == "collapsed":
             continue
@@ -164,6 +187,31 @@ def _apply_raw_config(cfg, raw, skip_collapsed=False):
                 cfg[_hk] = None
     if "theme" in raw and isinstance(raw.get("theme"), str) and raw["theme"]:
         cfg["theme"] = raw["theme"]
+    # context_window / model_prices：dict 逐项合并（用户可覆盖单项或加新模型，
+    # 不整体替换默认值）。值类型不对（非 dict）忽略保留默认。
+    if isinstance(raw.get("context_window"), dict):
+        merged = dict(cfg.get("context_window") or {})
+        for _mk, _mv in raw["context_window"].items():
+            try:
+                _iv = int(_mv)
+                if _iv > 0:
+                    merged[str(_mk)] = _iv
+            except Exception:
+                pass
+        cfg["context_window"] = merged
+    if isinstance(raw.get("model_prices"), dict):
+        merged = dict(cfg.get("model_prices") or {})
+        for _mk, _mv in raw["model_prices"].items():
+            if not isinstance(_mv, dict):
+                continue
+            try:
+                _inp = float(_mv.get("input"))
+                _out = float(_mv.get("output"))
+                if _inp >= 0 and _out >= 0:
+                    merged[str(_mk)] = {"input": _inp, "output": _out}
+            except Exception:
+                pass
+        cfg["model_prices"] = merged
 
 
 def hot_reload_config(cfg, config_path, data_dir, prev_mtime):

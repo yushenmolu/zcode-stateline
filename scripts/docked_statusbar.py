@@ -707,6 +707,146 @@ def _hit_rate(stats):
     return (stats.get("cacheReadTokens", 0) / denom if denom > 0 else 0.0) * 100.0
 
 
+def context_window_for(model, cfg):
+    """模型的上下文窗口 token 数（查 cfg["context_window"]，缺省回落
+    DEFAULT_CONTEXT_WINDOW；cfg 缺省或值非法也给缺省）。
+
+    匹配规则：先精确匹配 model 名；匹配不到再试「前缀匹配」（配置键是 model 的
+    前缀，取最长命中）——配置里写 "gpt-5" 就能覆盖 "gpt-5.6-terra" 这类带后缀的
+    具体型号。model 为空直接用缺省。
+    """
+    default = DEFAULT_CONTEXT_WINDOW
+    cw_map = (cfg or {}).get("context_window")
+    if not model or not isinstance(cw_map, dict) or not cw_map:
+        return default
+    model = str(model)
+    if model in cw_map:
+        try:
+            v = int(cw_map[model])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    # 前缀匹配：取最长的命中键（"gpt-5.6" 优先于 "gpt-5"）
+    best = None
+    for k, v in cw_map.items():
+        k = str(k)
+        if model.startswith(k) and (best is None or len(k) > len(best[0])):
+            try:
+                iv = int(v)
+                if iv > 0:
+                    best = (k, iv)
+            except Exception:
+                continue
+    return best[1] if best else default
+
+
+def context_occupancy_text(latest_input, model, cfg):
+    """「最近一次调用 input 占上下文窗口 N%」文本；缺数据返回 u""。
+
+    latest_input 为该会话最近一次调用的 input_tokens（int/None）；占分子。窗口
+    由 context_window_for(model, cfg) 决定。latest_input 为 None（无调用记录）
+    或窗口 <=0 时不显示（避免画出「0%」误导成「这一轮是空的」）。
+    """
+    if latest_input is None:
+        return u""
+    try:
+        latest_input = int(latest_input)
+    except (TypeError, ValueError):
+        return u""
+    win = context_window_for(model, cfg)
+    if not win or win <= 0:
+        return u""
+    pct = latest_input / float(win) * 100.0
+    return (u"最近一次调用 input %s 占上下文窗口（%s）%.1f%%。"
+            % (format_tokens_exact(latest_input), format_tokens_exact(win), pct))
+
+
+def estimate_cost(stats, model, cfg):
+    """按 model_prices 单价表估算 stats 的成本（人民币元）；缺单价/开关关返回 None。
+
+    公式：input 成本 + output 成本，各按「每百万 token 单价」折算。返回 float（元）。
+      - cfg["show_cost"] 为假 -> None（调用方不显示）；
+      - model 不在 model_prices / 单价非数 -> None（缺单价不显示、不报错）；
+      - stats 为 None -> None。
+    """
+    if not (cfg or {}).get("show_cost", False):
+        return None
+    if not stats:
+        return None
+    prices = (cfg or {}).get("model_prices")
+    if not model or not isinstance(prices, dict):
+        return None
+    price = _lookup_model_price(model, prices)
+    if price is None:
+        return None
+    inp_cost = (stats.get("inputTokens") or 0) / 1e6 * price["input"]
+    out_cost = (stats.get("outputTokens") or 0) / 1e6 * price["output"]
+    return inp_cost + out_cost
+
+
+def _lookup_model_price(model, prices):
+    """model_prices 查价：精确匹配 -> 最长前缀匹配；查不到/值非法返回 None。"""
+    model = str(model)
+    cand = None
+    if model in prices:
+        cand = prices[model]
+    else:
+        best = None
+        for k in prices:
+            k = str(k)
+            if model.startswith(k) and (best is None or len(k) > len(best)):
+                best = k
+        if best is not None:
+            cand = prices[best]
+    if not isinstance(cand, dict):
+        return None
+    try:
+        inp = float(cand.get("input"))
+        out = float(cand.get("output"))
+    except (TypeError, ValueError):
+        return None
+    if inp < 0 or out < 0:
+        return None
+    return {"input": inp, "output": out}
+
+
+def cost_text(cost):
+    """成本显示文本「≈¥X.XX」；cost 为 None 返回 u""（不显示）。"""
+    if cost is None:
+        return u""
+    return u"≈¥%.2f" % cost
+
+
+def today_text(today, cfg=None):
+    """「今日：in X · out Y · hit Z%」小字段；today 为 None 返回 u""。
+
+    today 为 db_today_stats 的标准 stats dict（全库今日聚合，跨会话）。命中率与
+    主显示同公式（_hit_rate）；输入为 0 时不拼 hit（避免把「今日还没数据」说成
+    「hit 0.0%」）。cfg 保留以便将来扩展（成本等），当前不使用。
+    """
+    if not today:
+        return u""
+    txt = (u"今日：in %s · out %s"
+           % (format_tokens(today.get("inputTokens") or 0),
+              format_tokens(today.get("outputTokens") or 0)))
+    if (today.get("inputTokens") or 0) > 0:
+        txt += u" · hit %.1f%%" % _hit_rate(today)
+    return txt
+
+
+def handle_tip(today=None):
+    """收起把手 tooltip：固定说明（HANDLE_TIP）+ 可选「今日：in X · out Y · hit Z%」。
+
+    收起时用户只能看到把手，今日用量放在这里是唯一可见入口。today 为
+    db_today_stats 的标准 dict；None 时只有固定说明（与旧 HANDLE_TIP 完全一致）。
+    """
+    tt = today_text(today)
+    if not tt:
+        return HANDLE_TIP
+    return HANDLE_TIP + u"\n" + tt
+
+
 def _line_from_stats(stats):
     """由标准 stats dict 生成完整统计行文本（含全部指标）。"""
     return (u"\u23f1%.1fs \u00b7 in %s \u00b7 out %s \u00b7 cache hit %.1f%%"
@@ -786,9 +926,14 @@ def turn_request_profile_text(ts):
             % (cold, int(round(COLD_READ_RATIO * 100))))
 
 
-def turn_tooltip(ts):
+def turn_tooltip(ts, latest_input=None, model=None, cfg=None):
     """本轮段 tooltip：固定说明 + 精确千分位 in/out + 该轮的请求级画像
-    （无计数时只有固定说明）。"""
+    （无计数时只有固定说明）。
+
+    0.11.0 追加（全部可选、缺省不改变旧行为）：
+      - latest_input + cfg 给出时追加「最近一次调用 input 占上下文窗口 N%」；
+      - cfg["show_cost"] 开且能按 model_prices 估价时追加「≈¥X.XX」（本轮成本）。
+    """
     tip = TIP_TURN
     exact = _exact_io_line(ts)
     if exact:
@@ -796,15 +941,32 @@ def turn_tooltip(ts):
     extra = turn_request_profile_text(ts)
     if extra:
         tip += u"\n" + extra
+    occ = context_occupancy_text(latest_input, model, cfg)
+    if occ:
+        tip += u"\n" + occ
+    c = estimate_cost(ts, model, cfg)
+    if c is not None:
+        tip += u"\n" + u"本轮成本 " + cost_text(c) + u"（按单价表估算）。"
     return tip
 
 
-def cum_tooltip(stats):
-    """会话累计 tooltip：固定说明 + 精确千分位 in/out（stats 为 None 只有固定说明）。"""
+def cum_tooltip(stats, today=None, model=None, cfg=None):
+    """会话累计 tooltip：固定说明 + 精确千分位 in/out（stats 为 None 只有固定说明）。
+
+    0.11.0 追加（全部可选、缺省不改变旧行为）：
+      - today 给出时追加「今日：in X · out Y · hit Z%」（全库今日聚合，跨会话）；
+      - cfg["show_cost"] 开且能按 model_prices 估价时追加「≈¥X.XX」（会话累计成本）。
+    """
     tip = TIP_CUM
     exact = _exact_io_line(stats)
     if exact:
         tip += u"\n" + exact
+    tt = today_text(today)
+    if tt:
+        tip += u"\n" + tt
+    c = estimate_cost(stats, model, cfg)
+    if c is not None:
+        tip += u"\n" + u"累计成本 " + cost_text(c) + u"（按单价表估算）。"
     return tip
 
 
@@ -1010,6 +1172,8 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
         "recent_note": False,
         "stats_source": None,
         "error": None,
+        "today_stats": None,
+        "latest_input": None,
     }
     try:
         if sess_state is None:
@@ -1078,6 +1242,11 @@ def resolve_gui_info(rows, data_dir, db_path, cfg=None, cur=None,
         if stats is not None:
             stats["speedTokPerSec"] = spd_recent
             stats["speedAvgTokPerSec"] = spd_avg
+        # 0.11.0：今日用量（全库今日聚合，跨会话）+ 最近一次调用 input（上下文
+        # 占用率分子），供 cum_tooltip / turn_tooltip。会话无关 / 会话内最近一条，
+        # 读取失败均为 None（tooltip 据此不显示对应行，不报错）。
+        info["today_stats"] = db_today_stats(db_path, conn=db_conn)
+        info["latest_input"] = db_latest_model_input(db_path, sid, conn=db_conn)
         if used_sid is not None:
             info["session_id"] = used_sid
     except Exception as e:

@@ -39,7 +39,8 @@ NAMES_DB = [
     "recent_turn_stats", "turn_window_left_edge", "live_turn_stats",
     "db_turn_request_profile", "db_session_model_activity_ts",
     "db_tool_activity", "db_recent_tool_activity", "tool_live_ms",
-    "db_latest_speed",
+    "db_latest_speed", "db_today_stats", "db_latest_model_input",
+    "today_start_ms",
 ]
 
 # Round2 Step 3：statusbar_status（状态机与状态徽标段）
@@ -75,6 +76,7 @@ NAMES_SESSION = [
 NAMES_CONFIG = [
     # 常量
     "DEFAULT_CONFIG", "CONFIG_FILE_NAME", "DATA_DIR_DEFAULT", "SHOW_MENU_ITEMS",
+    "DEFAULT_CONTEXT_WINDOW",
     # 错误日志（配置层与主文件共用，下划线私有名也必须 re-export）
     "_log_err",
     # 配置读写
