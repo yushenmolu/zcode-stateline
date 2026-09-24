@@ -30,6 +30,7 @@ __all__ = [
     "db_turn_request_profile", "db_session_model_activity_ts",
     "db_tool_activity", "db_recent_tool_activity", "tool_live_ms",
     "db_latest_speed", "db_today_stats", "db_latest_model_input",
+    "db_recent_sessions",
     "today_start_ms",
 ]
 
@@ -885,6 +886,68 @@ def db_latest_model_input(db_path, session_id, conn=None):
         return int(row[0])
     except Exception:
         return None
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def db_recent_sessions(db_path, limit=3, conn=None):
+    """最近 N 个活跃主会话速览：按各会话最新一条模型调用时间倒序取前 limit 个。
+
+    每项 {session_id, title, last_started_at, status, last_duration_ms}：
+      - title           session 表标题（无则 ''，调用方兜底显示 session_id）；
+      - last_started_at 该会话最新模型调用 started_at（活跃程度排序键）；
+      - status          最新一行的 status（completed/running/error/...）；
+      - last_duration_ms 最新一行的 duration_ms（「本轮耗时」；running 行按
+        started_at 到现在的已耗时算，没完成的行给 None）。
+    subagent 会话与后台来源行（subagent/compact/session_title）不参与。
+    无数据/失败返回 []。conn 传入时复用（不关闭），否则自开自关。
+    """
+    own = conn is None
+    if own:
+        conn = _db_connect(db_path)
+    if conn is None:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT m.session_id, m.started_at, m.status, m.duration_ms, "
+            "COALESCE(s.title, '') "
+            "FROM model_usage m "
+            "LEFT JOIN session s ON s.id = m.session_id "
+            "JOIN (SELECT session_id, MAX(started_at) AS mx FROM model_usage "
+            "      WHERE session_id LIKE 'sess_%' "
+            "      AND session_id NOT LIKE 'sess_subagent_%' "
+            "      AND COALESCE(query_source,'') NOT IN ('subagent','compact','session_title') "
+            "      GROUP BY session_id) latest "
+            "ON latest.session_id = m.session_id AND latest.mx = m.started_at "
+            "WHERE COALESCE(m.query_source,'') NOT IN ('subagent','compact','session_title') "
+            "GROUP BY m.session_id "
+            "ORDER BY m.started_at DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        now = time_ms()
+        out = []
+        for r in rows:
+            status = r[2] or ""
+            if status == "running":
+                dur = max(0, now - int(r[1] or 0))
+            elif r[3] is not None:
+                dur = int(r[3])
+            else:
+                dur = None
+            out.append({
+                "session_id": r[0],
+                "title": (r[4] or "").strip(),
+                "last_started_at": int(r[1] or 0),
+                "status": status,
+                "last_duration_ms": dur,
+            })
+        return out
+    except Exception:
+        return []
     finally:
         if own:
             try:

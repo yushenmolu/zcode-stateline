@@ -1042,6 +1042,46 @@ def build_report_text(db_path, session_id=None):
         return u"统计报告生成失败：%s" % e
 
 
+def _fmt_round_dur(ms):
+    """「本轮耗时」缩写：<60s 给 x.xs，>=60s 给 xm yys。ms 为 None 返回 u"—"。"""
+    if ms is None:
+        return u"—"
+    try:
+        ms = int(ms)
+    except Exception:
+        return u"—"
+    if ms < 60_000:
+        return u"%.1fs" % (ms / 1000.0)
+    return u"%dm%02ds" % (ms // 60_000, (ms % 60_000) // 1000)
+
+
+def build_sessions_overview_text(db_path, limit=3):
+    """右键「最近会话速览」的文本：最近 N 个活跃主会话（标题 + 状态 + 本轮耗时）。
+
+    数据来自 statusbar_db.db_recent_sessions；无数据/读取失败返回错误说明行
+    （不向上抛——菜单命令直接展示该文本）。纯函数（不碰 tkinter）。
+    """
+    try:
+        rows = db_recent_sessions(db_path, limit=limit)
+    except Exception as e:
+        return u"最近会话速览生成失败：%s" % e
+    head = u"最近 %d 个活跃会话" % int(limit)
+    if not rows:
+        return head + u"\n\n（暂无会话模型调用记录）"
+    status_zh = {
+        "completed": u"已完成", "running": u"生成中", "error": u"出错",
+        "cancelled": u"已取消",
+    }
+    lines = [head, u""]
+    for i, r in enumerate(rows, 1):
+        title = r.get("title") or r.get("session_id") or u"?"
+        st = status_zh.get(r.get("status"), r.get("status") or u"未知")
+        lines.append(u"%d. %s" % (i, title))
+        lines.append(u"   状态：%s · 本轮耗时：%s"
+                     % (st, _fmt_round_dur(r.get("last_duration_ms"))))
+    return u"\n".join(lines)
+
+
 def handle_status_color(info):
     """收起把手 ◐ 图标的颜色：跟随当前状态色（收起态也能看出当前状态）。"""
     status = (info or {}).get("status") or "idle"

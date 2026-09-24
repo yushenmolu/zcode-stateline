@@ -158,6 +158,8 @@ class StatusBarApp(object):
                          command=lambda: self.copy_current_stats())
         menu.add_command(label=u"打开统计报告",
                          command=lambda: self.show_report_window())
+        menu.add_command(label=u"最近会话速览",
+                         command=lambda: self.show_sessions_overview_window())
         menu.add_separator()
 
         # 「显示项」子菜单：每个 show_* 一项，checkbutton 勾选态绑定当前配置；
@@ -384,6 +386,46 @@ class StatusBarApp(object):
         except Exception:
             self.report_win = None
             _log_err(self.data_dir, "show_report_window error:\n%s"
+                     % traceback.format_exc())
+
+    def show_sessions_overview_window(self):
+        """右键「最近会话速览」：最近 3 个活跃主会话（标题+状态+本轮耗时），
+        Toplevel + 滚动文本框（复用统计报告的单实例窗口槽与深底色风格）。
+        任何异常只记日志。"""
+        tk = self._tk
+        deps = self._deps
+        try:
+            text = deps.build_sessions_overview_text(self.db_path, limit=3)
+            if self.report_win is not None:
+                try:
+                    self.report_win.destroy()
+                except Exception:
+                    pass
+                self.report_win = None
+            win = tk.Toplevel(self.root)
+            self.report_win = win
+            win.title(u"最近会话速览")
+            win.configure(bg=deps.BG_SECOND)
+            win.geometry("420x260")
+            txt = tk.Text(win, bg=deps.BG_SECOND, fg=deps.FG, font=deps.FONT_DIM,
+                          relief="flat", wrap="none")
+            sb = tk.Scrollbar(win, command=txt.yview)
+            txt.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            txt.pack(side="left", fill="both", expand=True)
+            txt.insert("1.0", text)
+            txt.configure(state="disabled")
+
+            def _on_close():
+                try:
+                    win.destroy()
+                finally:
+                    self.report_win = None
+
+            win.protocol("WM_DELETE_WINDOW", _on_close)
+        except Exception:
+            self.report_win = None
+            _log_err(self.data_dir, "show_sessions_overview_window error:\n%s"
                      % traceback.format_exc())
 
     def quit_app(self):

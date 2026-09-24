@@ -130,9 +130,98 @@ def query_history_stats(db_path, since_ts=None, days=7):
     agg["per_session"] = [
         {"session_id": r[0], "model_request_count": r[1]} for r in rows
     ]
+    agg["daily"] = query_daily_stats(db_path, since_ts=since)
     agg["window_start_ms"] = since
     agg["window_start_iso"] = _iso(since)
     return agg
+
+
+SPARK_BLOCKS = u"▁▂▃▄▅▆▇█"
+
+
+def _spark_char(value, max_value):
+    """按天聚合迷你柱：value 相对 max_value 的量级映射到 8 档块字符之一。
+    value<=0 或 max_value<=0 -> 最低档 ▁（有行但没量时也能占一格）。"""
+    try:
+        v, m = float(value), float(max_value)
+    except Exception:
+        return SPARK_BLOCKS[0]
+    if m <= 0 or v <= 0:
+        return SPARK_BLOCKS[0]
+    ratio = v / m
+    if ratio > 1.0:
+        ratio = 1.0
+    # 线性 8 档：>0 至少给第二档（▂），让「有量」与「没量」一眼可分
+    idx = int(ratio * (len(SPARK_BLOCKS) - 1) + 0.5)
+    if idx < 1:
+        idx = 1
+    if idx > len(SPARK_BLOCKS) - 1:
+        idx = len(SPARK_BLOCKS) - 1
+    return SPARK_BLOCKS[idx]
+
+
+def query_daily_stats(db_path, since_ts=None, days=7):
+    """按自然日（本地时区）聚合历史窗口内的用量：每天一行
+    {day, input_tokens, output_tokens, cache_read_input_tokens, cache_hit_rate,
+     model_request_count}，按日期升序。口径与 _aggregate 一致：token 聚合仅
+    completed 行，行级排除 subagent。窗口边界含 since（started_at >= since）。"""
+    now_ms = int(time.time() * 1000)
+    since = since_ts if since_ts is not None else now_ms - days * 86400_000
+    # strftime('%m-%d', started_at/1000, 'unixepoch', 'localtime') 按本地时区切日
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT strftime('%m-%d', started_at/1000, 'unixepoch', 'localtime'), "
+            "COALESCE(SUM(CASE WHEN status='completed' THEN input_tokens ELSE 0 END),0), "
+            "COALESCE(SUM(CASE WHEN status='completed' THEN output_tokens ELSE 0 END),0), "
+            "COALESCE(SUM(CASE WHEN status='completed' THEN cache_read_input_tokens ELSE 0 END),0), "
+            "COUNT(*) "
+            "FROM model_usage WHERE started_at >= ? "
+            "AND COALESCE(query_source,'') <> 'subagent' "
+            "GROUP BY strftime('%Y-%m-%d', started_at/1000, 'unixepoch', 'localtime') "
+            "ORDER BY MIN(started_at)",
+            (since,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        inp, cache_rd = r[1] or 0, r[3] or 0
+        hit = round(cache_rd / inp, 4) if inp > 0 else 0.0
+        out.append({
+            "day": r[0],
+            "input_tokens": int(inp),
+            "output_tokens": int(r[2] or 0),
+            "cache_read_input_tokens": int(cache_rd),
+            "cache_hit_rate": hit,
+            "model_request_count": int(r[4] or 0),
+        })
+    return out
+
+
+def _fmt_compact(n):
+    """>=1M -> x.xM；>=1k -> x.xk；否则原值（与状态栏 format_tokens 同款缩写）。"""
+    n = int(n)
+    if n >= 1_000_000:
+        return "%.1fM" % (n / 1_000_000.0)
+    if n >= 1_000:
+        return "%.1fk" % (n / 1_000.0)
+    return str(n)
+
+
+def _fmt_daily(daily):
+    """按天趋势块：`09-20 ▅ in 1.2M hit 63%`——迷你柱（相对窗口内最高日）+
+    in 总量缩写 + 命中率（整数百分比）。空列表返回空串。"""
+    if not daily:
+        return u""
+    max_in = max(d["input_tokens"] for d in daily)
+    lines = []
+    for d in daily:
+        bar = _spark_char(d["input_tokens"], max_in)
+        lines.append(u"  %s %s in %s hit %d%%" % (
+            d["day"], bar, _fmt_compact(d["input_tokens"]),
+            int(round(d["cache_hit_rate"] * 100))))
+    return u"\n".join(lines)
 
 
 def query_model_stats(db_path, since_ts=None):
@@ -243,6 +332,9 @@ def main():
         else:
             print("history: last %d days (window_start_iso=%s)" % (args.days, agg.get("window_start_iso")))
             print(_fmt_table(agg))
+            if agg.get("daily"):
+                print("daily:")
+                print(_fmt_daily(agg["daily"]))
             if agg.get("per_session"):
                 print("per_session:")
                 for s in agg["per_session"][:20]:
