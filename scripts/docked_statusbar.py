@@ -441,12 +441,16 @@ WINDOW_W = 620        # 状态条基准宽度（初始 geometry；实际宽度�
 # WINDOW_H / MARGIN / TIP_EDGE_GAP / HANDLE_H / HANDLE_W_DEFAULT /
 # HANDLE_FALLBACK_MARGIN 已移至 statusbar_layout（经下方 import * re-export）。
 REFRESH_MS_DEFAULT = 1000  # 数据刷新 / 贴边/前台轮询（用户要求默认 1000ms）
-FS_POLL_MS = 50             # 文件事件队列排空间隔（事件驱动刷新的响应上限）
+FS_POLL_MS = 200            # 文件事件队列排空间隔（事件驱动刷新的响应上限）
+                            # 第二轮 Stage5：50→200。50ms 时队列 99%+ 为空转
+                            # （每秒 20 次 after 回调只偶尔有事件）；200ms 仍在
+                            # 1 秒兜底链内（refresh_tick 独立保底），事件响应
+                            # 从 ≤50ms 变 ≤200ms 人无感知，空转 CPU 降到 1/4。
 WATCH_NAMES = ("status-state.json", "current-session.json",
                "token-stats.jsonl", "statusbar-config.json")
 # 目录监听白名单：钩子时序 / 会话标记 / jsonl 兜底 / 配置热加载——
 # 这四个文件任一变化都意味着「下一拍内容会变」，事件驱动即刻刷新，
-# FS_POLL_MS 排空一次队列（响应上限 50ms，替代纯轮询的 1s 延迟）。
+# FS_POLL_MS 排空一次队列（响应上限 200ms，替代纯轮询的 1s 延迟）。
 
 # ---- 暗色主题（AA 对比度）----
 BG = "#14161a"          # 窗口背景（比纯黑有层次）

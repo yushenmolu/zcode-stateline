@@ -220,16 +220,18 @@ class TestImportGuard(unittest.TestCase):
 class TestLatencyBudget(unittest.TestCase):
     """GUI 文件事件刷新的延迟预算算术。"""
 
-    def test_fs_event_latency_budget_within_200ms(self):
-        """去抖 60ms + 队列排空间隔 FS_POLL_MS + Tk 余量 20ms <= 200ms。
+    def test_fs_event_latency_budget_within_300ms(self):
+        """去抖 60ms + 队列排空间隔 FS_POLL_MS + Tk 余量 20ms <= 300ms。
 
         分量来源：GUI 去抖为设计值 60ms（计划口径）；FS_POLL_MS 从
-        docked_statusbar 实际导入（当前 100ms）——将来有人调大 FS_POLL_MS
-        或去抖导致总预算超 200ms 时，本测试报警。
+        docked_statusbar 实际导入。第二轮 Stage5 将 FS_POLL_MS 50→200
+        （空转 CPU 降到 1/4），事件响应上限 130→280ms 仍远低于 1 秒兜底
+        刷新链，无感知变慢；预算上限同步 200→300。将来再调大 FS_POLL_MS
+        或去抖导致总预算超 300ms 时，本测试报警。
         """
         GUI_DEBOUNCE_MS = 60
         TK_MARGIN_MS = 20
-        TOTAL_BUDGET_MS = 200
+        TOTAL_BUDGET_MS = 300
         total = GUI_DEBOUNCE_MS + dsb.FS_POLL_MS + TK_MARGIN_MS
         self.assertLessEqual(
             total, TOTAL_BUDGET_MS,

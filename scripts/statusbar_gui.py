@@ -436,6 +436,11 @@ class StatusBarApp(object):
                 self.watcher.stop()
         except Exception:
             pass
+        # 关闭 DB 单例连接（释放只读句柄；幂等，未建立过时为 no-op）
+        try:
+            _db_close_cached()
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except Exception:
@@ -1298,8 +1303,15 @@ class StatusBarApp(object):
             status_doc = None
             if cfg.get("show_live", True):
                 status_doc = _read_status_state(data_dir)
-            # R4 拍级连接复用：一拍数据组装共用同一只读连接，finally 关闭。
-            tick_conn = _db_connect(db_path)
+            # R4 拍级连接复用：一拍数据组装共用同一只读连接。
+            # 第二轮 Stage5：升级为 GUI 生命周期级单例（_db_connect_cached，
+            # 跨拍复用，每次返回前 rollback 刷新 WAL 读快照，保证读到新
+            # 提交；单例建立失败时返回 None，此处降级为每拍自开自关）。
+            tick_conn = _db_connect_cached(db_path)
+            tick_own = False
+            if tick_conn is None:
+                tick_conn = _db_connect(db_path)
+                tick_own = True
             try:
                 info = deps.resolve_gui_info(rows, data_dir, db_path, cfg=cfg,
                                              cur=cur_cache,
@@ -1321,7 +1333,9 @@ class StatusBarApp(object):
                     db_path, info.get("session_id"),
                     conn=tick_conn)
             finally:
-                if tick_conn is not None:
+                # 单例连接不随拍关闭（跨拍复用，退出时由 quit_app 统一关）；
+                # 仅降级路径（单例建立失败、本拍自开）才在拍末关闭。
+                if tick_own and tick_conn is not None:
                     try:
                         tick_conn.close()
                     except Exception:

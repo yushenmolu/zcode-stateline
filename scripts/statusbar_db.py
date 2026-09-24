@@ -23,7 +23,8 @@ __all__ = [
     # 小工具（被 DB 层与 docked_statusbar 共用，经 re-export 沿用旧名）
     "_num", "time_ms", "_is_subagent_sid",
     # 连接与查询
-    "_db_connect",
+    "_db_connect", "_db_connect_cached", "_db_close_cached",
+    "_db_refresh_snapshot",
     "db_recent_session_activity", "db_latest_session_id", "db_latest_model_id",
     "db_session_title", "db_aggregate_session", "db_session_speed",
     "recent_turn_stats", "turn_window_left_edge", "live_turn_stats",
@@ -99,8 +100,20 @@ def _is_subagent_sid(sid):
 
 
 
-def _db_connect(db_path):
-    """只读打开 db.sqlite；失败返回 None。"""
+def _db_connect(db_path, cached=False):
+    """只读打开 db.sqlite；失败返回 None。
+
+    cached=False（默认）：每次新开连接，调用方负责关闭。
+    cached=True：返回 GUI 生命周期级单例（同一进程同一 db_path 复用同一
+    连接，调用方**不得关闭**，退出前用 _db_close_cached() 释放）。单例
+    带 busy_timeout（写库侧短暂锁表时等待而非立刻 database is locked）。
+    建立失败时按调用方约定降级为每拍 cached=False 自开自关。
+
+    WAL 快照坑（关键）：长持连接在 WAL 模式下，首次读会把快照钉在那个
+    读事务上，之后的新提交**读不到**（数据停在连接首次使用时）。由于
+    本连接 PRAGMA query_only=ON（只读语句不持有读锁，sqlite3 autocommit
+    下每条 SELECT 都是新快照），只需在每次复用前把可能存在的旧事务状态
+    清掉（_db_refresh_snapshot 的 rollback）即可保证读到最新提交。"""
     if not db_path or not os.path.exists(db_path):
         return None
     try:
@@ -109,6 +122,58 @@ def _db_connect(db_path):
         return conn
     except Exception:
         return None
+
+
+_DB_SINGLETON = {"path": None, "conn": None}
+
+
+def _db_connect_cached(db_path):
+    """GUI 生命周期级只读连接单例：首次调用建立，后续复用同一连接。
+
+    每次返回前先 _db_refresh_snapshot 清掉旧读事务快照，保证 WAL 下能
+    读到其他进程的新提交。建立失败返回 None（调用方降级为每拍自开）。
+    """
+    if not db_path or not os.path.exists(db_path):
+        return None
+    if _DB_SINGLETON["conn"] is not None and _DB_SINGLETON["path"] == db_path:
+        conn = _DB_SINGLETON["conn"]
+        _db_refresh_snapshot(conn)
+        return conn
+    conn = _db_connect(db_path)
+    if conn is None:
+        return None
+    try:
+        conn.execute("PRAGMA busy_timeout=2000")
+    except Exception:
+        pass
+    _DB_SINGLETON["path"] = db_path
+    _DB_SINGLETON["conn"] = conn
+    _db_refresh_snapshot(conn)
+    return conn
+
+
+def _db_refresh_snapshot(conn):
+    """清掉连接上可能残留的事务状态，下一条 SELECT 拿新快照。
+
+    query_only 连接不会持有写事务；rollback 在未开启事务时是无害 no-op，
+    若残留了读事务则回滚它让 WAL 读快照前进到最新提交。异常静默
+    （连接断开等场景由上层查询自身的 try/except 兜住）。"""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _db_close_cached():
+    """关闭并清空单例连接（GUI 退出 / db 路径变更时调用）。幂等。"""
+    conn = _DB_SINGLETON["conn"]
+    _DB_SINGLETON["path"] = None
+    _DB_SINGLETON["conn"] = None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 
