@@ -120,6 +120,21 @@ if "%DRY%"=="1" (
 )
 echo.
 
+rem ============================================================
+rem Remove the watchdog scheduled task (registered by install.cmd)
+rem ============================================================
+if "%DRY%"=="1" (
+    echo [DRY] Would delete scheduled task "ZcodeTokenStatsAlive" if present.
+) else (
+    schtasks /delete /tn "ZcodeTokenStatsAlive" /f >nul 2>&1
+    if errorlevel 1 (
+        echo [uninstall] Scheduled task "ZcodeTokenStatsAlive" not present, skip.
+    ) else (
+        echo [uninstall] Scheduled task "ZcodeTokenStatsAlive" deleted.
+    )
+)
+echo.
+
 echo ============================================================
 if "%DRY%"=="1" (
     echo [DRY] Preview finished. Nothing was changed.

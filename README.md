@@ -4,7 +4,7 @@
 
 > English in one sentence: A ZCode plugin that shows real-time token usage, cache hit rate and speed (duration/TTFT) per conversation — as an in-chat stats line plus a docked status bar, with a `/stats` command for full reports.
 
-- 版本：0.11.2
+- 版本：0.12.5
 - 许可：MIT
 - 平台：Windows（ZCode 桌面版 + Python 3.10+，仅标准库，无第三方依赖）
 
@@ -115,6 +115,21 @@
 - **退出 statusbar**：关闭状态条。
 
 ## 变更日志
+
+### 0.12.5
+- 状态栏 UI 四项调整：①底部渐变带由"左深→右浅"改为"中间深→两边各一半深"（`_draw_gradient_band` 新增 `center` 参数，两端只到 base 与 bg 各一半的中点色，不淡到背景色）；②把手加高 18→24px，消除 ◐ 图标/命中率数字与底部色带的视觉重叠，文字中心 cy 公式同步微调；③把手与展开条贴工作区底边 0 间隙（新增独立常量 `DOCK_BOTTOM_GAP=0`，不再用 MARGIN=6 留白；用户拖动过的记忆位置仍保留）；④展开态新增"贴底吸附"——ZCode 窗口下沿距工作区底 ≤40px 时完整条直接吸附贴屏幕底，窗口悬在中间时仍按原逻辑跟随窗口下沿。
+
+### 0.12.1
+- 修复 v0.12.0 引入的反复裸崩溃：EnumWindows 的 ctypes 回调委托由函数内临时创建提升为模块级单例，消除枚举窗口期间委托被 Python GC 回收、回调跳入已释放内存导致的进程无迹崩溃；拉起路径统一收口看门狗——新增每 5 分钟计划任务心跳（ZcodeTokenStatsAlive）+ statusbar.lock 文件互斥锁防双开/重叠心跳，拉起前自动清场残留实例、拉起后校验新实例存活。
+
+### 0.12.0
+- UI 精致化——窗口级圆角（Win32 SetWindowRgn）、整窗 95% 半透明、右下角模拟阴影、顶部状态色带加厚 5px 并左深→右浅渐变、第二行 4 段数字卡片化（圆角 BG_SECOND 卡片）、把手 hover 微亮、展开/收起 150ms 淡入淡出（含单例帧循环/代际令牌/强制终值防护）。
+
+### 0.11.4
+- 状态色带加厚至 4px 并移至顶部（展开态与收起把手一致，贴 1px 分隔线之下），提升辨识度；徽标/把手文字随之下移避让。
+
+### 0.11.3
+- 状态栏底部新增 2px 状态色横线（展开态与收起把手都有），颜色跟随当前会话状态（生成中绿 / 工具中蓝 / 空闲灰 / 出错红 / 已中断灰蓝），数字仍按命中率档位配色。
 
 ### 0.11.2
 - tooltip 彻底删去垫底口径说明行，只留数字行；无数据时不再弹空气泡。

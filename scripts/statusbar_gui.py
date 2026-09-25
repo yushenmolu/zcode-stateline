@@ -42,6 +42,29 @@ __all__ = [
 ]
 
 
+def _log_throttled(data_dir, cache_dict, exc):
+    """poll 等热路径异常的节流日志：同 key（异常类型名+稳定消息前80字符）
+    60 秒内只写一条；cache_dict 超 100 项按最旧淘汰。写盘失败忽略。"""
+    import re as _re
+    import time as _time
+    try:
+        raw = "%s: %s" % (type(exc).__name__, exc)
+        stable = _re.sub(r"0x[0-9a-fA-F]+", "0x*", raw)
+        stable = _re.sub(r"\b\d{6,}\b", "*", stable)
+        key = stable[:80]
+        now = _time.time()
+        last = cache_dict.get(key)
+        if last is not None and now - last < 60:
+            return
+        if len(cache_dict) >= 100 and key not in cache_dict:
+            oldest = min(cache_dict, key=lambda k: cache_dict[k])
+            del cache_dict[oldest]
+        cache_dict[key] = now
+        _log_err(data_dir, "poll recurring error: %s" % raw)
+    except Exception:
+        pass
+
+
 def _run_gui_impl(deps, data_dir, db_path, refresh_ms, cfg, config_path=None,
                   interval_fixed=False):
     """docked_statusbar.run_gui 的薄封装目标：创建 StatusBarApp 并进入主循环。
@@ -92,6 +115,8 @@ class StatusBarApp(object):
         self.f_num = None
         self.f_icon = None
         self.show_vars = None
+        # poll 异常节流日志缓存（key->上次写盘时间戳），_log_throttled 用
+        self._poll_err_cache = {}
 
     # -- 依赖快捷访问（主文件注入，避免反向 import dsb）--
     @property
@@ -133,6 +158,12 @@ class StatusBarApp(object):
         root.configure(bg=deps.BG)
         root.resizable(False, False)
         root.geometry("%dx%d+0+0" % (deps.WINDOW_W, deps.WINDOW_H))
+        # Stage 1 半透明：整条 95% 不透明（含收起把手——同一 root 窗口两态复用，
+        # 一次设置两态生效；内容文字略受影响但 0.95 足够近不透明）。
+        try:
+            root.attributes("-alpha", 0.95)
+        except Exception:
+            pass
 
         # ---- 单 Canvas 绘制层（徽标圆角胶囊 + 两行分段文字 + close 小块）----
         canvas = tk.Canvas(root, bg=deps.BG, highlightthickness=0,
@@ -244,6 +275,14 @@ class StatusBarApp(object):
             # ---- 生命周期绑定（0.9.3）----
             "zcode_gone_since": None,  # ZCode 进程首次被判缺席的时刻（epoch 毫秒）；
                                        # 进程一恢复立即清零（升级/重装的短空窗不退出）
+            # ---- Stage 1 窗口级圆角（SetWindowRgn）----
+            "last_region": None,      # (w, h, radius) 上次生效的 region 参数；
+                                      # 相同则跳过重建成 GDI 对象（每秒重画防抖）
+            # ---- Stage 4 把手 hover 微亮 ----
+            "handle_hovered": False,  # 把手 hover 状态：True=微亮（BG_SECOND 底）
+            # ---- Stage 4 展开/收起淡入淡出 ----
+            "anim_after_id": None,    # 单例帧循环 after id（新动画启动前 cancel 旧 id）
+            "anim_gen": 0,            # 代际令牌：每次启动新动画递增，帧回调比对代际
         }
         self.state = state
 
@@ -493,15 +532,32 @@ class StatusBarApp(object):
         self._sync_cfg_mtime()
 
     def _after(self, ms, fn):
-        """root.after 包装：回调异常写 err 日志后继续，绝不断刷新/轮询循环。"""
+        """root.after 包装：回调异常写 err 日志并退避重排（断路器 10 次熔断）。"""
+        fails = [0]
+
         def _wrapped():
             try:
                 fn()
+                fails[0] = 0
             except Exception:
                 try:
                     _log_err(self.data_dir,
                              "statusbar after-callback error:\n%s"
                              % traceback.format_exc())
+                except Exception:
+                    pass
+                fails[0] += 1
+                if fails[0] >= 10:
+                    try:
+                        _log_err(self.data_dir,
+                                 "statusbar after-callback circuit open: %s"
+                                 % getattr(fn, "__name__", repr(fn)))
+                    except Exception:
+                        pass
+                    return
+                backoff = max(ms, 1000) * min(2 ** fails[0], 30)
+                try:
+                    self.root.after(int(backoff), _wrapped)
                 except Exception:
                     pass
         try:
@@ -719,6 +775,51 @@ class StatusBarApp(object):
             pass
         return new_w
 
+    def _apply_window_region(self, w, h, radius):
+        """Stage 1 窗口级圆角：ctypes 调 CreateRoundRectRgn + SetWindowRgn。
+
+        生命周期约束（总计划写死）：
+          - SetWindowRgn 成功（返回非 0）-> region 所有权移交系统，**禁止**
+            DeleteObject；
+          - 失败（返回 0）-> 必须立即 DeleteObject，防 GDI 句柄泄漏；
+          - 尺寸/半径与上次相同（state["last_region"] 命中）-> 不重建（每秒
+            重画时每帧新建 GDI 对象会泄漏）。
+        坐标用 Tk 逻辑像素（与 create_* 同坐标系）。
+        TODO(高 DPI)：winfo 像素与 Win32 物理像素不一致时乘
+        winfo_fpixels('1i')/96 缩放修正——当前按 100% DPI 实现，待验证。
+        任一环节抛异常静默吞掉（圆角失败不影响功能，只是视觉退回直角）。
+        """
+        state = self.state
+        params = (int(w), int(h), int(radius))
+        if state.get("last_region") == params:
+            return
+        if not self.hwnd:
+            return
+        rgn = None
+        try:
+            rgn = self._win().create_round_rect_rgn(
+                0, 0, params[0] + 1, params[1] + 1,
+                params[2] * 2, params[2] * 2)
+            if not rgn:
+                return
+            ok = self._win().set_window_rgn(self.hwnd, rgn, True)
+            if ok == 0:
+                # 失败：region 所有权未移交，立即回收
+                try:
+                    self._win().delete_object(rgn)
+                except Exception:
+                    pass
+                return
+            # 成功：region 归系统，只记参数不再触碰句柄
+            state["last_region"] = params
+        except Exception:
+            # 创建途中抛异常且 rgn 已出：兜底回收（此时 set_window_rgn 未调）
+            if rgn:
+                try:
+                    self._win().delete_object(rgn)
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # 靠边收起：小把手（collapsed 模式）
     # ------------------------------------------------------------------
@@ -780,6 +881,8 @@ class StatusBarApp(object):
         # 指针下也不会 500ms 后自展开；需 leave->enter 且过冷却后才恢复悬停展开。
         state["hover_grace_until"] = time_ms() + self._deps.COLLAPSE_HOVER_GRACE_MS
         state["handle_armed"] = False
+        # Stage 4 hover 微亮：收起后把手未 hover（几何/内容已切换）
+        state["handle_hovered"] = False
         # 完整态默认贴边（manual_position 是完整态拖动记忆；收起态不沿用）
         state["manual_position"] = False
         state["manual_xy"] = None
@@ -795,6 +898,105 @@ class StatusBarApp(object):
                          % traceback.format_exc())
             except Exception:
                 pass
+        # Stage 4 淡出：几何/内容已切换，alpha 从 0.95 渐隐到 0.0 再恢复
+        # （收起后窗口仍可见——把手也是可见窗口的一部分，不做全隐；
+        #  淡出只作为视觉过渡，终值恢复 0.95）。
+        # 注：淡出终值不是 0.0，而是 0.95——把手本身需要可见。
+        # 视觉效果 = 先闪一下再稳定，等同于"眨眼"提示切换完成。
+        self._start_alpha_anim(0.95, 0.95)
+
+    # ------------------------------------------------------------------
+    # Stage 4 展开/收起淡入淡出（150ms alpha 过渡）
+    # ------------------------------------------------------------------
+    def _cancel_alpha_anim(self):
+        """取消进行中的 alpha 动画：递增代际（已排队回调失效）+ 立即写终值。
+
+        任何路径结束后 alpha ∈ {0.95, 0.0→隐藏}。取消时窗口保持当前几何
+        不变（几何已在动画前一次性切好），只把 alpha 一步写到位。"""
+        state = self.state
+        state["anim_gen"] = state.get("anim_gen", 0) + 1
+        try:
+            if state.get("anim_after_id") is not None:
+                self.root.after_cancel(state["anim_after_id"])
+        except Exception:
+            pass
+        state["anim_after_id"] = None
+        # 立即写当前目标终值：展开=0.95，收起=0.95（把手也可见）
+        # （淡出到 0.0 的动画只用于视觉过渡，实际终值始终 0.95）
+        try:
+            self.root.attributes("-alpha", 0.95)
+        except Exception:
+            pass
+
+    def _start_alpha_anim(self, from_alpha, to_alpha):
+        """启动 150ms alpha 过渡帧循环（展开/收起共用）。
+
+        五条防护落点：
+          1. 单例帧循环：state["anim_after_id"] 单槽位登记；新动画启动前
+             after_cancel 旧 id。
+          2. 代际令牌：state["anim_gen"] 每次启动递增并闭包进帧回调；帧回调
+             先比对代际，不等直接退出（不写 alpha、不排下一帧）。
+          3. 目标态快照：启动时把终值快照进闭包（_to_alpha 局部变量），动画
+             途中目标不可变。
+          4. 强制终值 finally：帧循环尾部 finally 段——若当前代际仍是自己
+             则写终值 alpha；若已被取代则不写（新代际会写它自己的）。
+          5. 取消语义：_cancel_alpha_anim 递增代际 + 立即写终值。
+
+        帧循环只改 -alpha，不调 SetWindowRgn、不改几何（几何已在动画前一次
+        性切好）。动画结束后 anim_after_id=None，每秒重画链路不触碰 alpha。
+        """
+        state = self.state
+        # 防护 1：单例帧循环——cancel 旧动画
+        try:
+            if state.get("anim_after_id") is not None:
+                self.root.after_cancel(state["anim_after_id"])
+        except Exception:
+            pass
+        state["anim_after_id"] = None
+
+        # 防护 2：代际令牌递增
+        state["anim_gen"] = state.get("anim_gen", 0) + 1
+        my_gen = state["anim_gen"]
+
+        # 防护 3：目标态快照（闭包捕获，动画途中不可变）
+        _from = from_alpha
+        _to = to_alpha
+
+        FRAMES = 10         # 150ms / 16ms ≈ 10 帧（写死）
+        FRAME_MS = 16       # 每帧间隔 ~16ms（60fps）
+
+        def _frame(frame_idx):
+            # 防护 2：代际比对——已被取代直接退出（不写 alpha、不排下一帧）
+            if state.get("anim_gen") != my_gen:
+                return
+            t = min(frame_idx / float(FRAMES), 1.0)
+            alpha = _from + (_to - _from) * t
+            try:
+                self.root.attributes("-alpha", alpha)
+            except Exception:
+                pass
+            if frame_idx < FRAMES:
+                # 防护 1：单槽位登记下一帧
+                try:
+                    state["anim_after_id"] = self.root.after(
+                        FRAME_MS, lambda: _frame(frame_idx + 1))
+                except Exception:
+                    state["anim_after_id"] = None
+            else:
+                # 最后一帧：防护 4 强制终值
+                state["anim_after_id"] = None
+                # 防护 4：finally 段——代际仍是自己才写终值
+                if state.get("anim_gen") == my_gen:
+                    try:
+                        self.root.attributes("-alpha", _to)
+                    except Exception:
+                        pass
+
+        # 启动第一帧
+        try:
+            state["anim_after_id"] = self.root.after(0, lambda: _frame(0))
+        except Exception:
+            state["anim_after_id"] = None
 
     def expand_bar(self, source=None):
         """展开：把手 -> 完整状态条（重新贴边 ZCode 底部，不还原收起前的
@@ -829,6 +1031,8 @@ class StatusBarApp(object):
             self.canvas.config(height=deps.WINDOW_H)  # 恢复完整条高度
         except Exception:
             pass
+        # Stage 4 展开时清把手 hover 标志（把手已不存在）
+        state["handle_hovered"] = False
         try:
             self.render_ui(state.get("last_info") or {
                 "text": None, "line1": None, "session_id": None,
@@ -839,6 +1043,8 @@ class StatusBarApp(object):
                          % traceback.format_exc())
             except Exception:
                 pass
+        # Stage 4 淡入：几何/内容已切换，alpha 从 0.0 渐入到 0.95
+        self._start_alpha_anim(0.0, 0.95)
 
     def _apply_handle_geometry(self, new_w):
         """收起把手尺寸落地：cur_w 直接生效（把手宽稳定，无需防抖），窗口
@@ -877,7 +1083,25 @@ class StatusBarApp(object):
         w = deps.BLOCK_PAD * 2 + self.f_icon.measure(deps.ICON_HIT) + 5 \
             + self.f_num.measure(hit_txt)
         self._apply_handle_geometry(w)
+        # Stage 1 窗口级圆角（把手 radius=8：小半径保 round 感又不裁字）。
+        self._apply_window_region(w, deps.HANDLE_H, 8)
+        # Stage 4 hover 微亮：hover 时在内容之下画 BG_SECOND 底的圆角背景层
+        # （z 序最低——最先创建，其余内容叠在上面），未 hover 时画 BG 底（与
+        # 窗口同色，视觉无变化）。radius=8 与 SetWindowRgn 一致。
+        handle_bg = deps.BG_SECOND if state.get("handle_hovered") else deps.BG
+        deps.round_rect(canvas, 0, 0, w, deps.HANDLE_H, 8,
+                        fill=handle_bg, outline="")
         canvas.create_rectangle(0, 0, w, 1, fill=deps.EDGE_LINE, outline="")
+        # 底部 5px 状态色带（Stage 2：4px→5px + 渐变）：自 v0.12.4
+        # 起由顶部挪到底部，与展开态一致——顶部色带与 ◐ 图标 / × 视觉重叠。
+        # v0.12.5：渐变改为中间深→两边各一半深（center=True）；HANDLE_H
+        # 18→24 拉开文字与色带间距。贴把手底缘（y=HANDLE_H-5..HANDLE_H，
+        # 即 19..24）；文字中心 cy=12（HANDLE_H/2，size 10 字体实际高 ~12px，
+        # 字形范围 ~6..18），文字底 18 与色带顶 19 留 1px 净距不重叠。
+        # base_color 与 ◐ 图标同源 icon_color。
+        deps._draw_gradient_band(canvas, 0, deps.HANDLE_H - 5, w,
+                                 deps.HANDLE_H, icon_color, deps.BG,
+                                 tags=("hdl",), center=True)
         tx = deps.BLOCK_PAD
         cy = deps.HANDLE_H / 2.0
         canvas.create_text(tx, cy, text=deps.ICON_HIT, font=deps.ICON_FONT,
@@ -891,6 +1115,13 @@ class StatusBarApp(object):
         handle_tip_txt = deps.handle_tip((info or {}).get("today_stats"))
 
         def _enter(_e):
+            if state.get("handle_hovered"):
+                return  # 幂等守卫：已是 hover 态，delete("all") 重建会再触发 <Enter>，防自激振荡
+            # Stage 4 hover 微亮：即时反馈（不等 500ms 展开计时器）
+            state["handle_hovered"] = True
+            self.render_ui(state.get("last_info") or {
+                "text": None, "line1": None, "session_id": None,
+                "model": None, "session_label": None, "stats": None})
             # 仅当已武装（leave->enter 后）才排悬停展开；冷却期内的 enter
             # 因冷却守卫不排程，小幅度移动不重复武装。
             if state.get("handle_armed", False):
@@ -904,6 +1135,13 @@ class StatusBarApp(object):
                 self.show_tooltip(handle_tip_txt, e.x_root, e.y_root)
 
         def _leave(_e):
+            if not state.get("handle_hovered"):
+                return  # 幂等守卫：已非 hover 态，防 delete("all") 触发的伪 <Leave> 引发重画振荡
+            # Stage 4 hover 微亮：离开恢复 BG 底
+            state["handle_hovered"] = False
+            self.render_ui(state.get("last_info") or {
+                "text": None, "line1": None, "session_id": None,
+                "model": None, "session_label": None, "stats": None})
             self._cancel_hover_expand()
             state["handle_armed"] = True      # 离开把手 -> 重新武装
             self.tooltip_leave()
@@ -940,48 +1178,115 @@ class StatusBarApp(object):
         _fmap = {deps.FONT_MAIN: self.f_main, deps.FONT_NUM: self.f_num,
                  deps.FONT_DIM: self.f_dim, deps.ICON_FONT: self.f_icon}
 
+        # 卡片段内边距（左右）与卡片间距（Stage 3：第二行 4 段数字装进圆角
+        # 小卡片；卡片高 20px = ROW2_TURN_Y 上下各 10，圆角半径 5）。
+        CARD_PAD_X = 6
+        CARD_GAP = 6
+        CARD_RADIUS = 5
+        CARD_HALF_H = 10
+
         def _turn_segments(ts):
-            """本轮统计分段（(text, font, fg) 列表）；无数据返回单段占位。
-            生成中时尾部追加实时速度或「生成中…」；数字来源三态标注——
-            live / stale_turn（上一轮）/ 无标记（本轮权威行）。"""
-            if not ts:
-                segs = [(deps.TURN_PENDING, deps.FONT_MAIN, deps.FG_DIM)]
-            else:
+            """本轮统计分段，返回 (cards, trailing)：
+            - cards：4 张圆角小卡片（耗时 / in / out / cache hit），每张是
+              [(text, font, fg), ...] 子段列表（标签灰 + 数字原色/档位色）；
+              无数据时为空列表。
+            - trailing：卡片组之后的裸文字段（工具 N / 实时 / ⚡tok/s /
+              （数据异常）等），平铺 (text, font, fg) 列表；无数据时单段
+              占位（本轮统计待更新）。
+            数字来源三态标注——live / stale_turn（上一轮）/ 无标记（本轮
+            权威行）。"""
+            cards = []
+            if ts:
                 inp = int(ts.get("inputTokens") or 0)
                 cache_rd = int(ts.get("cacheReadTokens") or 0)
                 hit = (cache_rd / float(inp) * 100.0) if inp > 0 else 0.0
-                segs = [
+                # 卡片 1：◷ 耗时（图标 + 秒数）
+                cards.append([
                     (deps.ICON_DUR, deps.ICON_FONT, deps.FG_DIM),
                     (u"%.1fs" % ((ts.get("durationMs") or 0) / 1000.0),
                      deps.FONT_NUM, deps.FG),
-                    (u" · in ", deps.FONT_MAIN, deps.FG_DIM),
+                ])
+                # 卡片 2：in
+                cards.append([
+                    (u"in ", deps.FONT_MAIN, deps.FG_DIM),
                     (deps.format_tokens(inp), deps.FONT_NUM, deps.FG),
-                    (u" · out ", deps.FONT_MAIN, deps.FG_DIM),
-                    (deps.format_tokens(ts.get("outputTokens") or 0), deps.FONT_NUM,
-                     deps.FG),
-                    (u" · cache hit ", deps.FONT_MAIN, deps.FG_DIM),
-                    (u"%.1f%%" % hit, deps.FONT_NUM, deps.FG),
-                ]
+                ])
+                # 卡片 3：out
+                cards.append([
+                    (u"out ", deps.FONT_MAIN, deps.FG_DIM),
+                    (deps.format_tokens(ts.get("outputTokens") or 0),
+                     deps.FONT_NUM, deps.FG),
+                ])
+                # 卡片 4：cache hit（数字用档位色）
+                cards.append([
+                    (u"cache hit ", deps.FONT_MAIN, deps.FG_DIM),
+                    (u"%.1f%%" % hit, deps.FONT_NUM,
+                     deps.cache_hit_color(hit)),
+                ])
+            trailing = []
+            if not ts:
+                trailing.append((deps.TURN_PENDING, deps.FONT_MAIN,
+                                 deps.FG_DIM))
+            else:
                 # 本轮工具调用数（0.9.2）
-                segs.extend(deps.turn_tool_segments(ts))
+                trailing.extend(deps.turn_tool_segments(ts))
                 if ts.get("live"):
-                    segs.append((u" · 实时", deps.FONT_MAIN, deps.ACCENT_GREEN))
+                    trailing.append((u" · 实时", deps.FONT_MAIN,
+                                     deps.ACCENT_GREEN))
                 elif ts.get("stale_turn"):
-                    segs.append((u" · 上一轮", deps.FONT_MAIN, deps.FG_DIM))
+                    trailing.append((u" · 上一轮", deps.FONT_MAIN,
+                                     deps.FG_DIM))
             # 速度段扩到整个 busy 族，并在轮次收尾后短时保留最后已知值。
-            segs.extend(speed_display(
+            trailing.extend(speed_display(
                 status, speed, info.get("status_speed_held"),
                 cfg.get("show_live", True), cfg.get("show_speed", True)))
             # 数据异常标注：info["error"] 有值时第二行尾部追加「（数据异常）」。
             if info.get("error"):
-                segs.append((deps.DATA_ANOMALY_NOTE, deps.FONT_MAIN,
-                             deps.FG_DIM))
-            return segs
+                trailing.append((deps.DATA_ANOMALY_NOTE, deps.FONT_MAIN,
+                                 deps.FG_DIM))
+            return cards, trailing
+
+        def _card_text_w(card):
+            """一张卡片内所有子段的文字总宽（字体实测）。"""
+            return sum(_fmap[f].measure(t) for t, f, _ in card)
+
+        def _turn_total_w(cards, trailing):
+            """第二行内容总宽：各卡片（文字宽+内边距×2）+ 卡片间距 +
+            尾部裸文字宽。"""
+            w = 0
+            for card in cards:
+                w += _card_text_w(card) + CARD_PAD_X * 2 + CARD_GAP
+            if cards and trailing:
+                # 卡片组与尾部裸文字之间留一个段间距（原平铺段首自带
+                # 前导空格/「 · 」，此处补 2px 视觉呼吸位）
+                w += 2
+            for t, f, _ in trailing:
+                w += _fmap[f].measure(t)
+            return w
 
         def _draw_turn_stats(x, y, ts):
-            """第二行：本轮统计分段绘制（数字等宽防跳字）+ 整行悬停 tooltip。"""
-            segs = _turn_segments(ts)
-            for t, f, c in segs:
+            """第二行：4 段数字装进圆角小卡片（耗时/in/out/cache hit），
+            尾部可选段裸文字平铺；整行悬停 tooltip。数字等宽防跳字。"""
+            cards, trailing = _turn_segments(ts)
+            x0 = x
+            for card in cards:
+                tw = _card_text_w(card)
+                cw = tw + CARD_PAD_X * 2
+                # 卡片底（先画底再画字，z 序由创建顺序决定）
+                deps.round_rect(canvas, x, y - CARD_HALF_H, x + cw,
+                                y + CARD_HALF_H, CARD_RADIUS,
+                                fill=deps.BG_SECOND, outline="",
+                                tags=("m_turn",))
+                # 卡片内文字（左对齐依次排，垂直中心与卡片中心对齐）
+                tx = x + CARD_PAD_X
+                for t, f, c in card:
+                    canvas.create_text(tx, y, text=t, font=f, fill=c,
+                                       anchor="w", tags=("m_turn",))
+                    tx += _fmap[f].measure(t)
+                x += cw + CARD_GAP
+            if cards and trailing:
+                x += 2
+            for t, f, c in trailing:
                 canvas.create_text(x, y, text=t, font=f, fill=c,
                                    anchor="w", tags=("m_turn",))
                 x += _fmap[f].measure(t)
@@ -990,8 +1295,8 @@ class StatusBarApp(object):
 
         # ---- 文本拼装 ----
         badge_txt = status_badge_text(status, turn)
-        turn_segs = _turn_segments(turn)
-        turn_w = sum(_fmap[f].measure(t) for t, f, _ in turn_segs)
+        turn_cards, turn_trailing = _turn_segments(turn)
+        turn_w = _turn_total_w(turn_cards, turn_trailing)
         cum_txt = deps.cumulative_text(cum, cfg.get("show_cache_hit", True))
         has_note = bool(cum and info.get("recent_note"))
 
@@ -1017,8 +1322,28 @@ class StatusBarApp(object):
         show_cum_now = bool(plan["show_cum"] and cum_txt)
         show_note_now = bool(plan["show_note"] and has_note)
 
+        # Stage 1 窗口级圆角（展开态 radius=10）：尺寸变化才重建（函数内防抖）。
+        self._apply_window_region(win_w, deps.WINDOW_H, 10)
+
+        # Stage 1 阴影（仅展开态）：主矩形底部错位 2px、右偏 1px 画深色矩形
+        # 模拟投影。先画阴影（在所有内容之下），区域 y=WINDOW_H-3..WINDOW_H-1
+        # （WINDOW_H 已含底部 3px 阴影带，此带内不放任何内容）。
+        canvas.create_rectangle(3, deps.WINDOW_H - 3, win_w + 3,
+                                deps.WINDOW_H - 1,
+                                fill="#0a0c0f", outline="")
+
         # 顶部 1px 分隔线（提质感）
         canvas.create_rectangle(0, 0, win_w, 1, fill=deps.EDGE_LINE, outline="")
+        # 底部 5px 状态色带（Stage 2：4px→5px + 左深→右浅渐变）：自 v0.12.4
+        # 起由顶部挪到底部——顶部色带与第一行徽标/对话名/右上角 × 视觉重叠，
+        # 用户反馈放底部更干净。贴底部 3px 阴影带正上方（y=WINDOW_H-8..
+        # WINDOW_H-3，即 51..56），与第二行文字（中心 ROW2_TURN_Y=40，底
+        # ~50）相切不重叠。取色口径与状态徽标一致（STATUS_COLORS.get(status,
+        # idle)）；即使 show_status=False 也画，否则关徽标后会丢失状态指示。
+        deps._draw_gradient_band(
+            canvas, 0, deps.WINDOW_H - 8, win_w, deps.WINDOW_H - 3,
+            STATUS_COLORS.get(status, STATUS_COLORS["idle"]), deps.BG,
+            center=True)
 
         # ---- 第一行：状态徽标（色块 + 深色粗体字）+ 模型名（蓝）+ 对话名 ----
         x = 12
@@ -1152,10 +1477,17 @@ class StatusBarApp(object):
         deps = self._deps
         state = self.state
         if state.get("collapsed"):
+            # 调用前快照：motion() 内部会在越过阈值时把 dragging 置 True，
+            # 用"调用前未在拖动态 + 调用后返回 DRAG"判定"本帧首次进入拖动态"。
+            was_dragging = bool(self.hand_gesture.dragging)
             act = self.hand_gesture.motion({"x_root": event.x_root,
                                             "y_root": event.y_root})
             if act != deps.E_ACTION_DRAG:
                 return
+            if not was_dragging:
+                # 防护 5：进入拖动态的瞬间取消一切进行中的 alpha 动画——
+                # 拖动中不应有动画在跑（动画写 alpha 会与拖动视觉冲突）。
+                self._cancel_alpha_anim()
             # 拖动态：目标坐标 clamp_to_work_area，防止拖出屏幕无法自救。
             bar_w = state.get("cur_w") or deps.HANDLE_W_DEFAULT
             bar_h = deps.HANDLE_H
@@ -1204,6 +1536,8 @@ class StatusBarApp(object):
             # 双击尾巴遮蔽：收起后 DOUBLE_CLICK_TAIL_MS 内到达的释放事件直接
             # 取消待定并丢弃，不喂手势机（防收起被残余 release 弹回）。
             if time_ms() < state.get("ignore_click_until", 0):
+                # 防护 5：动画途中被打断（双击快速收起尾巴），立即收敛到终值。
+                self._cancel_alpha_anim()
                 self.hand_gesture.cancel_click()
                 state["last_drag_xy"] = None
                 return
@@ -1517,6 +1851,7 @@ class StatusBarApp(object):
                 foreground=deps.is_foreground_zcode,
                 dock=deps.dock_rect,
                 clamp=deps.clamp_to_work_area,
+                work_area=deps.work_area_of_rect,
             )
             if not visible:
                 self.set_visible(False)
@@ -1529,10 +1864,11 @@ class StatusBarApp(object):
                                         deps.WINDOW_H, True)
                 state["last_xy"] = xy
             self.set_visible(True)
-        except Exception:
+        except Exception as e:
             # 任何异常只隐藏或保持现状，绝不让小条抢焦点、绝不弹错。
             # 仅隐藏本拍，下一拍 poll 仍会重新判定显示（异常多为瞬时，
             # fail-closed 防抢焦点但不可把条永远藏没）。
+            _log_throttled(self.data_dir, self._poll_err_cache, e)
             try:
                 self.set_visible(False)
             except Exception:

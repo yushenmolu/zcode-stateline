@@ -10,17 +10,18 @@ tooltip 摆放、把手默认/夹取坐标、收起/完整两态 poll 裁决、�
 """
 
 # ---- 布局常量（被本模块纯函数引用；docked_statusbar 其他部分经 re-export 沿用）----
-WINDOW_H = 56         # 状态条高度（1px 顶线 + 信息行 ~20px + 指标行 ~30px）
+WINDOW_H = 59         # 状态条高度（1px 顶线 + 信息行 ~20px + 指标行 ~30px + 底部 3px 阴影带）
 MARGIN = 6            # 贴边留白
 # tooltip 与小条 / 工作区边缘的最小间距（摆放纯函数 tooltip_placement 用）
 TIP_EDGE_GAP = 6
-HANDLE_H = 18            # 收起把手高度（小条 ~72x18）
+HANDLE_H = 24            # 收起把手高度（v0.12.5：18→24，拉开文字与底部色带间距消除重叠）
 HANDLE_W_DEFAULT = 72    # 收起把手宽度估算（内容自适应渲染；记忆位置/越界回退用）
 HANDLE_FALLBACK_MARGIN = 8  # 越界回退右下角时距工作区右/下缘的留白
+DOCK_BOTTOM_GAP = 0      # 把手/展开条与工作区底边的间隙（v0.12.5：贴底 0 间隙，独立于 MARGIN）
 
 __all__ = [
     "WINDOW_H", "MARGIN", "TIP_EDGE_GAP",
-    "HANDLE_H", "HANDLE_W_DEFAULT", "HANDLE_FALLBACK_MARGIN",
+    "HANDLE_H", "HANDLE_W_DEFAULT", "HANDLE_FALLBACK_MARGIN", "DOCK_BOTTOM_GAP",
     "tooltip_placement", "default_handle_xy", "valid_and_clamped_handle_xy",
     "hidden_skip_refresh", "collapsed_poll_decision", "expanded_poll_decision",
     "hover_expand_should_schedule", "drag_target_xy", "drag_grab_offset",
@@ -70,7 +71,8 @@ def default_handle_xy(work_area, handle_w=HANDLE_W_DEFAULT, handle_h=HANDLE_H):
         return None
     x = wl + (wr - wl - handle_w) // 2
     x = max(x, wl + MARGIN)
-    y = wb - handle_h - MARGIN
+    # v0.12.5：默认停靠贴工作区底边 0 间隙（DOCK_BOTTOM_GAP），不再用 MARGIN 留白
+    y = wb - handle_h - DOCK_BOTTOM_GAP
     return x, y
 
 
@@ -185,7 +187,9 @@ def collapsed_poll_decision(state, cfg, bar_w, alive, zcode_hwnd,
 
 def expanded_poll_decision(state, bar_w, zcode_hwnd, is_iconic, rect_of,
                            foreground, dock, clamp,
-                           window_h=WINDOW_H, margin=MARGIN):
+                           window_h=WINDOW_H, margin=MARGIN,
+                           work_area=None, snap_thresh=40,
+                           bottom_gap=DOCK_BOTTOM_GAP):
     """完整态 poll 显隐/贴边判定（0.9.6 抽为模块级纯函数，可独立重放测试；
     副作用 show/move 仍由调用方 run_gui.poll 执行，本函数只做裁决）。
 
@@ -193,6 +197,12 @@ def expanded_poll_decision(state, bar_w, zcode_hwnd, is_iconic, rect_of,
     + 未最小化 + 窗口矩形可得」三条，**切到其他程序不隐藏**——前台判定只让
     贴边锚点退一级，不作为隐藏条件（旧逻辑这里 SW_HIDE 会把完整条藏没，
     表现为「点一下小条它就自己消失」）。
+
+    v0.12.5 贴底吸附：ZCode 窗口下沿距工作区底边 ≤ snap_thresh（默认 40px）
+    时，完整条直接吸附到工作区底边（y = wb - window_h - bottom_gap），不再
+    按 zrect.bottom + margin 跟随——窗口贴底时小条也贴屏幕底（0 间隙）；
+    窗口悬在中间时仍按原逻辑跟随窗口下沿。work_area 为 None 时退回旧跟随
+    行为（向后兼容，测试可不传）。
 
     参数（全部显式注入，不隐式依赖闭包/全局）：
       - state:          run_gui state（读 manual_position）
@@ -204,6 +214,9 @@ def expanded_poll_decision(state, bar_w, zcode_hwnd, is_iconic, rect_of,
       - dock(zrect, bar_w, bar_h):         前台贴边坐标
       - clamp(xy, bar_w, bar_h, zrect):    工作区夹取；xy 为 None 时返回 None
       - window_h / margin: 条高与非前台贴边的额外留白
+      - work_area(zrect): 矩形所在显示器工作区；None -> 跳过贴底吸附
+      - snap_thresh:    ZCode 窗口下沿距工作区底多少 px 内吸附贴底
+      - bottom_gap:     吸附后与工作区底边的间隙（默认 DOCK_BOTTOM_GAP=0）
 
     返回 (visible, xy)：
       - (False, None)   -> 调用方 SW_HIDE
@@ -222,6 +235,21 @@ def expanded_poll_decision(state, bar_w, zcode_hwnd, is_iconic, rect_of,
     # 存在/最小化/矩形可得显示逻辑控制）。
     if state.get("manual_position"):
         return True, None
+
+    # v0.12.5 贴底吸附：ZCode 窗口下沿距工作区底边 ≤ snap_thresh 时，
+    # 完整条直接吸附到工作区底（0 间隙），不再跟随窗口下沿。
+    if work_area is not None:
+        try:
+            wa = work_area(zrect)
+        except Exception:
+            wa = None
+        if wa and len(wa) == 4:
+            wl, wt, wr, wb = wa
+            if wb - zrect[3] <= snap_thresh:
+                x = zrect[0] + max((zrect[2] - zrect[0] - bar_w) // 2, margin)
+                x = min(max(x, wl + margin), max(wl, wr - bar_w - margin))
+                return True, (x, wb - window_h - bottom_gap)
+
     if foreground():
         xy = dock(zrect, bar_w, window_h)
     else:

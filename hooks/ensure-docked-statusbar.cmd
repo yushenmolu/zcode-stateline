@@ -67,10 +67,14 @@ if not defined PYW_CMD (
 )
 if not defined PYW_CMD set "PYW_CMD=%PY_CMD%"
 
-rem Launch only when no live instance. statusbar_alive.py reads statusbar.pid:
-rem exit 0 = the recorded pid is alive (skip, avoid duplicate bars); otherwise
-rem it deletes any stale pid file and exits 1 -> `||` starts a fresh bar.
-%PY_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\statusbar_alive.py" || start "" %PYW_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\docked_statusbar.py"
+rem Launch only via the watchdog (0.12.1+). All start paths - this SessionStart
+rem hook AND the 5-minute scheduled heartbeat "ZcodeTokenStatsAlive" registered
+rem by install.cmd - funnel through scripts\statusbar_alive.py, which takes a
+rem file mutex (statusbar.lock, msvcrt LK_NBLCK) so overlapping launches can
+rem never double-start, kills residual docked_statusbar pythonw instances,
+rem respawns detached via pythonw and verifies the new pidfile + live pid.
+rem `start` keeps it fire-and-forget so SessionStart never blocks.
+start "" %PYW_CMD% "%ZCODE_PLUGIN_ROOT%\scripts\statusbar_alive.py"
 
 :done
 rem Always emit valid JSON to the hook runner and never block.

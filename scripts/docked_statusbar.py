@@ -417,7 +417,7 @@ except Exception:
 # 常量
 # ---------------------------------------------------------------------------
 
-STATUSBAR_VERSION = "0.11.2"  # 自证版本：肉眼可确认状态条运行的是本版代码
+STATUSBAR_VERSION = "0.12.5"  # 自证版本：肉眼可确认状态条运行的是本版代码
 # DATA_DIR_DEFAULT / LOG_DIR_DEFAULT / MARK_FILE_NAME / CONFIG_FILE_NAME
 # 已移至 statusbar_config / statusbar_session（经上方 import * re-export）。
 DB_DEFAULT = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "db", "db.sqlite")
@@ -487,7 +487,7 @@ TIP_MAX_CHARS = 200
 
 # ---- 第二行分段排布（Canvas 直接画文字，无块底）----
 BLOCK_PAD = 9            # 段左右留白
-ROW1_CY = 13             # 第一行（模型/会话）文字垂直中心
+ROW1_CY = 15             # 第一行（模型/会话）文字垂直中心（13→15：避让顶部 4px 状态色带）
 
 # ---- 自适应宽度（窗口宽按内容实测伸缩；指标块永不因宽度丢块）----
 LABEL_MAX_STEPS = (16, 12, 10, 8, 6, 4)  # 会话标题截断上限档位（超宽时优先收紧）
@@ -1429,6 +1429,61 @@ def plan_statusbar_layout_3zone(badge_w, title_w_fn, turn_w, cum_w, note_w,
             "show_cum": sc, "show_note": False}
 
 
+def _hex_rgb(c):
+    """#rrggbb -> (r, g, b) 整数元组（0-255）。"""
+    c = c.lstrip("#")
+    return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+
+
+def _rgb_hex(rgb):
+    """(r, g, b) 整数元组 -> #rrggbb。"""
+    return "#%02x%02x%02x" % (rgb[0], rgb[1], rgb[2])
+
+
+def _draw_gradient_band(cv, x0, y0, x1, y1, base_color, bg_color,
+                        segments=None, tags=None, center=False):
+    """水平渐变色带（Stage 2）：垂直方向不渐变（高度太小看不出）。
+
+    水平分 N 段（默认 24）。RGB 用整数元组插值，每段画一条无描边矩形。
+    性能：N 固定 24，与宽度无关（把手 ~70px / 展开 ~600px 都 24 段，
+    段宽 ~25px 视觉无差），不逐像素列画。
+    tags 可选：传入则每段矩形挂同一 tag（收起把手靠 "hdl" tag 绑 hover）。
+
+    两种渐变模式（v0.12.5 起）：
+      - center=False（默认，向后兼容）：左深→右浅，段 i 颜色 = base_color 与
+        bg_color 按 t=i/(N-1) 线性插值（t=0 全 base 即左端饱和状态色；
+        t=1 全 bg 即右端淡入背景）。
+      - center=True：中间深→两边各一半深。中间 t=0（全 base 状态色），
+        向两端渐深到 t=0.5（即 base 与 bg 各一半的中点色，不到背景色）。
+        映射公式：d = abs(i - (N-1)/2.0) / ((N-1)/2.0)（中间 0、两端 1），
+        然后 t = d * 0.5。
+    """
+    n = segments if segments else 24
+    if n < 2:
+        n = 2
+    w = float(x1 - x0)
+    if w <= 0:
+        return
+    br, bg_, bb = _hex_rgb(base_color)
+    er, eg, eb = _hex_rgb(bg_color)
+    seg_w = w / n
+    half = (n - 1) / 2.0
+    for i in range(n):
+        if center:
+            d = abs(i - half) / half if half > 0 else 0.0
+            t = d * 0.5
+        else:
+            t = i / float(n - 1)
+        r = int(round(br + (er - br) * t))
+        g = int(round(bg_ + (eg - bg_) * t))
+        b = int(round(bb + (eb - bb) * t))
+        sx0 = x0 + seg_w * i
+        # 最后一段收齐到 x1，避免浮点累加露出 1px 缝
+        sx1 = x1 if i == n - 1 else (x0 + seg_w * (i + 1))
+        cv.create_rectangle(sx0, y0, sx1, y1, fill=_rgb_hex((r, g, b)),
+                            outline="", tags=tags)
+
+
 def round_rect(cv, x0, y0, x1, y1, radius=6, **kwargs):
     """近似圆角矩形（tkinter 无原生圆角：create_polygon + smooth=True）。"""
     r = min(radius, (x1 - x0) / 2.0, (y1 - y0) / 2.0)
@@ -1611,6 +1666,26 @@ class _WinApi(object):
         self.process32_first = kernel32.Process32FirstW
         self.process32_next = kernel32.Process32NextW
 
+        # ---- Stage 1 窗口级圆角：CreateRoundRectRgn + SetWindowRgn + DeleteObject
+        # （gdi32；CreateRoundRectRgn 六参 int，HRGN 返回；SetWindowRgn 成功后
+        # region 所有权移交系统，**禁止**再 DeleteObject；失败（返回 0）必须
+        # 立即 DeleteObject 防 GDI 句柄泄漏）。
+        gdi32 = ctypes.windll.gdi32
+        gdi32.CreateRoundRectRgn.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        gdi32.CreateRoundRectRgn.restype = wintypes.HRGN
+        self.create_round_rect_rgn = gdi32.CreateRoundRectRgn
+
+        gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        gdi32.DeleteObject.restype = wintypes.BOOL
+        self.delete_object = gdi32.DeleteObject
+
+        user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
+        user32.SetWindowRgn.restype = wintypes.INT
+        self.set_window_rgn = user32.SetWindowRgn
+
 
 class MONITORINFO(ctypes.Structure):
     _fields_ = [
@@ -1643,36 +1718,87 @@ def find_zcode_window():
         return 0
 
 
+# ---------------------------------------------------------------------------
+# 模块级 EnumWindows 回调委托单例（0.12.1 裸崩溃修复）
+#
+# 根因：此前 EnumWindowsProc(_enum_cb) 在函数内临时创建，委托对象只在
+# EnumWindows 这一次调用期间被局部引用，poll 每秒一次的高频调用下台，
+# Windows 正在枚举窗口、即将回调时若 Python GC 回收了该委托，回调跳到已
+# 释放内存，进程无 traceback 直接裸崩溃（v0.12.0 每 6-7 分钟一次）。
+# 修复：委托提升为模块级单例，由模块级变量常驻持有强引用，进程存活期内
+# 永远不会被 GC。
+#
+# 两组回调逻辑不同，各持一个委托（找窗 _ENUM_CB_FIND / 判活 _ENUM_CB_ALIVE），
+# 结果经各自模块级状态格传入；EnumWindows 同步执行、状态条单 GUI 线程调用，
+# 无并发/重入，每次枚举前由调用方重置状态格。
+# ---------------------------------------------------------------------------
+
+_EnumWindowsProc = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+_find_zcode_result = {"hwnd": 0}
+
+
+def _enum_find_zcode_cb(hwnd, _lparam):
+    try:
+        user32 = ctypes.windll.user32
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.GetParent(hwnd):
+            return True   # 只取顶层窗口
+        pid = pid_of(hwnd)
+        if not pid:
+            return True
+        exe = process_exe_path(pid).replace("\\", "/").lower()
+        if "zcode" in os.path.basename(exe):
+            _find_zcode_result["hwnd"] = hwnd
+            return False   # 找到即停
+    except Exception:
+        pass
+    return True
+
+
+_ENUM_CB_FIND = _EnumWindowsProc(_enum_find_zcode_cb)
+
+_zcode_alive_found = {"alive": False}
+
+
+def _enum_zcode_alive_cb(hwnd, _lparam):
+    try:
+        if _zcode_alive_found["alive"]:
+            return False
+        user32 = ctypes.windll.user32
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.GetParent(hwnd):
+            return True   # 只取顶层窗口
+        pid = pid_of(hwnd)
+        if not pid:
+            return True
+        exe = process_exe_path(pid).replace("\\", "/").lower()
+        if "zcode" in exe:
+            _zcode_alive_found["alive"] = True
+            return False   # 找到即停
+    except Exception:
+        return True
+    return True
+
+
+_ENUM_CB_ALIVE = _EnumWindowsProc(_enum_zcode_alive_cb)
+
+
 def _find_zcode_window_by_exe():
     """按 exe 名枚举兜底：遍历顶层可见窗口，进程 exe 名含 zcode（小写）即
-    返回其句柄；未找到返回 0（绝不抛——兜底失败等价找不到）。"""
-    user32 = ctypes.windll.user32
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    result = {"hwnd": 0}
+    返回其句柄；未找到返回 0（绝不抛——兜底失败等价找不到）。
 
-    def _enum_cb(hwnd, _lparam):
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            if user32.GetParent(hwnd):
-                return True   # 只取顶层窗口
-            pid = pid_of(hwnd)
-            if not pid:
-                return True
-            exe = process_exe_path(pid).replace("\\", "/").lower()
-            if "zcode" in os.path.basename(exe):
-                result["hwnd"] = hwnd
-                return False   # 找到即停
-        except Exception:
-            pass
-        return True
-
+    回调委托用模块级单例 _ENUM_CB_FIND（函数内临时委托可能在枚举中途被
+    GC 回收导致进程裸崩溃），结果经模块级 _find_zcode_result 传入。"""
+    _find_zcode_result["hwnd"] = 0
     try:
-        user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+        ctypes.windll.user32.EnumWindows(_ENUM_CB_FIND, 0)
     except Exception:
         return 0
-    return result["hwnd"]
+    return _find_zcode_result["hwnd"]
 
 
 def window_rect_of(hwnd):
@@ -1739,36 +1865,17 @@ def _zcode_process_alive():
     OpenProcess 失败按「存活」处理（不误藏——收起态把手宁可多显示一拍，
     也不在 ZCode 真退出前被藏掉；进程表轮询下一拍自然会收敛）。
     任何异常返回 True（同样的不误藏原则），绝不抛。
+
+    回调委托用模块级单例 _ENUM_CB_ALIVE（函数内临时委托可能在枚举中途被
+    GC 回收导致进程裸崩溃，见 _ENUM_CB_FIND 处注释），结果经模块级
+    _zcode_alive_found 传入。
     """
-    user32 = ctypes.windll.user32
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    found = {"alive": False}
-
-    def _enum_cb(hwnd, _lparam):
-        try:
-            if found["alive"]:
-                return False
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            if user32.GetParent(hwnd):
-                return True   # 只取顶层窗口
-            pid = pid_of(hwnd)
-            if not pid:
-                return True
-            exe = process_exe_path(pid).replace("\\", "/").lower()
-            if "zcode" in exe:
-                found["alive"] = True
-                return False   # 找到即停
-        except Exception:
-            return True
-        return True
-
+    _zcode_alive_found["alive"] = False
     try:
-        user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+        ctypes.windll.user32.EnumWindows(_ENUM_CB_ALIVE, 0)
     except Exception:
         return True
-    return found["alive"]
+    return _zcode_alive_found["alive"]
 
 
 def zcode_app_running():
